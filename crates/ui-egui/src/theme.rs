@@ -430,6 +430,10 @@ fn candidates(role: &str) -> Vec<(String, u32)> {
     // ChromeOS's Linux container (Crostini) mounts the host's fonts under `chromeos/` (#1762).
     let lin = ["/usr/share/fonts/truetype", "/usr/share/fonts", "/usr/local/share/fonts", "/usr/share/fonts/TTF", "/usr/share/fonts/chromeos"];
     let mut v: Vec<(String, u32)> = Vec::new();
+    // fontconfig is the source of truth on Linux; the hard-coded paths below stay as a fallback
+    // for systems where it is missing or returns nothing usable.
+    #[cfg(target_os = "linux")]
+    v.extend(linux_fontconfig_candidates(role));
     let mut add = |s: String, i: u32| v.push((s, i));
     match role {
         "ui" => {
@@ -542,6 +546,52 @@ fn candidates(role: &str) -> Vec<(String, u32)> {
         _ => {}
     }
     v
+}
+
+/// Fontconfig matches for a Linux font role, tried before the hard-coded paths.
+///
+/// The patterns describe intent (a family and optional weight/slant), not filesystem locations, so
+/// distribution-specific font directories no longer need to be known here. `fc-match` always
+/// returns its closest match, including a substitute for a missing family; `try_load` still
+/// validates the file and face before using it.
+#[cfg(target_os = "linux")]
+fn linux_fontconfig_candidates(role: &str) -> Vec<(String, u32)> {
+    let patterns: &[&str] = match role {
+        "ui" => &["Cantarell", "Liberation Sans", "DejaVu Sans", "Noto Sans", "sans-serif"],
+        "ui-bold" => &["Cantarell:weight=bold", "Liberation Sans:weight=bold", "DejaVu Sans:weight=bold", "sans-serif:weight=bold"],
+        "cell" => &["Calibri", "Carlito", "Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
+        "cell-bold" => &["Calibri:weight=bold", "Carlito:weight=bold", "Arial:weight=bold", "Liberation Sans:weight=bold", "DejaVu Sans:weight=bold"],
+        "cell-italic" => {
+            &["Calibri:slant=italic", "Carlito:slant=italic", "Arial:slant=italic", "Liberation Sans:slant=italic", "DejaVu Sans:slant=italic"]
+        }
+        "cell-bold-italic" => &[
+            "Calibri:weight=bold:slant=italic",
+            "Carlito:weight=bold:slant=italic",
+            "Arial:weight=bold:slant=italic",
+            "Liberation Sans:weight=bold:slant=italic",
+            "DejaVu Sans:weight=bold:slant=italic",
+        ],
+        "serif" => &["Liberation Serif", "DejaVu Serif", "serif"],
+        "mono" => &["Liberation Mono", "DejaVu Sans Mono", "Noto Sans Mono", "monospace"],
+        _ => &[],
+    };
+    fc_match_candidates(patterns)
+}
+
+/// Matches `patterns` in order, dropping duplicate file/face pairs. A missing family still yields
+/// fontconfig's substitute, so this is a candidate list, not a guarantee that the named family is
+/// installed.
+#[cfg(target_os = "linux")]
+fn fc_match_candidates(patterns: &[&str]) -> Vec<(String, u32)> {
+    let mut candidates = Vec::new();
+    for pattern in patterns {
+        if let Some(font) = fc_match(pattern)
+            && !candidates.contains(&font)
+        {
+            candidates.push(font);
+        }
+    }
+    candidates
 }
 
 /// Builds the font set from system fonts (with egui's defaults as fallback), with the default
@@ -695,10 +745,12 @@ fn fallback_faces(han: HanOrder) -> Vec<(&'static str, Vec<(String, u32)>)> {
 
 /// Linux directories that hold CJK fonts across distributions: Debian/Ubuntu (`opentype/noto`,
 /// `truetype/wqy`), Fedora (`google-noto-cjk`), Arch (`noto-cjk`, `wenquanyi`), ChromeOS's Linux
-/// container (`chromeos/notocjk`, #1762), plus local and
-/// flat layouts. Flatpak exposes the same host layouts through read-only font mounts.
+/// Linux directories that hold CJK fonts across distributions: Debian/Ubuntu (`opentype/noto`,
+/// `truetype/wqy`), Fedora (`google-noto-cjk`), Arch (`noto-cjk`, `wenquanyi`), ChromeOS's Linux
+/// container (`chromeos/notocjk`, #1762), plus local and flat layouts. These are fallbacks used
+/// only after fontconfig has been asked.
 #[cfg(not(target_arch = "wasm32"))]
-const LINUX_CJK_DIRS: [&str; 22] = [
+const LINUX_CJK_FALLBACK_DIRS: [&str; 22] = [
     // Flatpak mounts host fonts here without a broad filesystem permission. Keep the same
     // distribution layouts as below; /usr/share/fonts inside the sandbox belongs to the runtime.
     "/run/host/fonts/opentype/noto",
@@ -738,11 +790,37 @@ fn cjk_han_japanese() -> Vec<(String, u32)> {
     v.push((format!("{win}\\YuGothR.ttc"), 0)); // Yu Gothic
     v.push((format!("{win}\\msgothic.ttc"), 0)); // MS Gothic
     v.push((format!("{mac}/ヒラギノ角ゴシック W3.ttc"), 0)); // Hiragino Sans
-    for d in LINUX_CJK_DIRS {
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=ja", "serif:lang=ja"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
         v.push((format!("{d}/NotoSansCJKjp-Regular.otf"), 0));
         v.push((format!("{d}/NotoSansCJK-Regular.ttc"), 0)); // JP face
     }
     v
+}
+
+/// Asks fontconfig (`fc-match`, part of the standard Linux font stack) for the best face for
+/// `pattern`. Distributions install fonts in different directories, so fontconfig is the primary
+/// source; the [`LINUX_CJK_FALLBACK_DIRS`] list remains as a fallback for systems where it is
+/// missing or returns nothing usable. `fc-match` also returns the collection index for the
+/// locale-specific face (for example SC = 2 in `NotoSansCJK-Regular.ttc`) instead of guessing it
+/// from the file name.
+#[cfg(target_os = "linux")]
+fn fc_match(pattern: &str) -> Option<(String, u32)> {
+    let output = std::process::Command::new("fc-match").args(["-f", "%{file}\n%{index}\n", pattern]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut lines = stdout.lines();
+    let file = lines.next()?.trim();
+    if file.is_empty() || !std::path::Path::new(file).is_file() {
+        return None;
+    }
+    // fontconfig stores a named instance in the high 16 bits and the face index in the low 16.
+    // egui's FontData::index is a face index, so a variable font's 262144 must become face 0.
+    let index = lines.next().and_then(|line| line.trim().parse().ok()).unwrap_or(0) & 0xFFFF;
+    Some((file.to_owned(), index))
 }
 
 /// Simplified Chinese Han faces. Loaded apart from the Japanese ones so a glyph one family lacks
@@ -757,11 +835,13 @@ fn cjk_han_simplified() -> Vec<(String, u32)> {
     v.push((format!("{win}\\simhei.ttf"), 0)); // SimHei
     v.push((format!("{mac}/Hiragino Sans GB.ttc"), 0)); // ships on every recent macOS
     v.push((format!("{mac}/PingFang.ttc"), 0)); // older macOS only; now a downloadable asset
-    for d in LINUX_CJK_DIRS {
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=zh-cn", "serif:lang=zh-cn"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
         v.push((format!("{d}/NotoSansCJKsc-Regular.otf"), 0));
         v.push((format!("{d}/NotoSansCJK-Regular.ttc"), 2)); // SC face
     }
-    for d in LINUX_CJK_DIRS {
+    for d in LINUX_CJK_FALLBACK_DIRS {
         v.push((format!("{d}/wqy/wqy-microhei.ttc"), 0));
         v.push((format!("{d}/wenquanyi/wqy-microhei.ttc"), 0));
         v.push((format!("{d}/wqy-microhei.ttc"), 0));
@@ -778,7 +858,9 @@ fn cjk_hangul() -> Vec<(String, u32)> {
     let mut v: Vec<(String, u32)> = Vec::new();
     v.push((format!("{win}\\malgun.ttf"), 0)); // Malgun Gothic
     v.push((format!("{mac}/AppleSDGothicNeo.ttc"), 0));
-    for d in LINUX_CJK_DIRS {
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=ko", "serif:lang=ko"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
         v.push((format!("{d}/NotoSansCJKkr-Regular.otf"), 0));
         v.push((format!("{d}/NotoSansCJK-Regular.ttc"), 1)); // KR face
     }
@@ -805,6 +887,8 @@ fn thai() -> Vec<(String, u32)> {
     v.push((format!("{win}\\micross.ttf"), 0)); // Microsoft Sans Serif
     v.push((format!("{mac_sup}/Thonburi.ttc"), 0));
     v.push((format!("{mac_sys}/SukhumvitSet.ttc"), 0));
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=th"]));
     for d in lin {
         v.push((format!("{d}/NotoSansThai-Regular.ttf"), 0));
         v.push((format!("{d}/tlwg/Garuda.ttf"), 0));
@@ -859,6 +943,8 @@ fn hebrew() -> Vec<(String, u32)> {
     v.push((format!("{mac_sup}/David.ttf"), 0));
     v.push((format!("{mac_sys}/LucidaGrande.ttc"), 0));
     v.push((format!("{mac_sys}/Lucida Grande.ttc"), 0));
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=he"]));
     for d in lin {
         v.push((format!("{d}/NotoSansHebrew-Regular.ttf"), 0));
         v.push((format!("{d}/dejavu/DejaVuSans.ttf"), 0));
@@ -877,6 +963,8 @@ fn hebrew() -> Vec<(String, u32)> {
 fn symbols() -> Vec<(String, u32)> {
     let win = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
     let mut v: Vec<(String, u32)> = vec![(format!("{win}\\seguisym.ttf"), 0), ("/System/Library/Fonts/Apple Symbols.ttf".into(), 0)];
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["DejaVu Sans", "Symbola", "Noto Sans Symbols 2", "Noto Sans Symbols"]));
     for d in [
         "/usr/share/fonts/truetype/dejavu",
         "/usr/share/fonts/dejavu-sans-fonts",
@@ -896,6 +984,8 @@ fn symbols() -> Vec<(String, u32)> {
 #[cfg(not(target_arch = "wasm32"))]
 fn symbols_more() -> Vec<(String, u32)> {
     let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["Noto Sans Symbols 2", "Symbola", "Noto Sans Symbols"]));
     for d in [
         "/usr/share/fonts/noto",
         "/usr/share/fonts/truetype/noto",
@@ -1220,17 +1310,24 @@ mod tests {
         // Real render check, per script: the proportional family (what cells and the UI use) must
         // resolve a sample string to a real glyph, not the tofu replacement char. Skips a script
         // whose face is absent (a minimal machine) and fails if a face is present but not wired in.
-        let cases: [(&str, Vec<(String, u32)>, &str); 8] = [
-            ("sys-cjk-han-ja", cjk_han_japanese(), "カテゴリ"),
-            ("sys-cjk-han-zh", cjk_han_simplified(), "页面布局 客户端配置"),
-            ("sys-cjk-hangul", cjk_hangul(), "한글"),
-            ("sys-thai", thai(), "ทดสอบ"),
-            ("sys-lao", lao(), "ພາສາລາວ"),
-            ("sys-hebrew", hebrew(), "עברית"),
-            ("ui", candidates(UI), "Русский"),
+        let cases: [(&str, Vec<(String, u32)>, &str, Option<&str>); 7] = [
+            ("sys-cjk-han-ja", cjk_han_japanese(), "カテゴリ", Some("ja")),
+            ("sys-cjk-han-zh", cjk_han_simplified(), "页面布局 客户端配置", Some("zh-cn")),
+            ("sys-cjk-hangul", cjk_hangul(), "한글", Some("ko")),
+            ("sys-thai", thai(), "ทดสอบ", Some("th")),
+            ("sys-lao", lao(), "ພາສາລາວ", Some("lo")),
+            ("sys-hebrew", hebrew(), "עברית", Some("he")),
+            ("ui", candidates(UI), "Русский", None),
             // Czech interface labels: every Czech accented letter, in both cases.
-            ("ui", candidates(UI), "Příliš žluťoučký kůň úpěl ďábelské ódy ŘŠČŽÝÁÍÉÚŮĚŤĎŇÓ"),
+            ("ui", candidates(UI), "Příliš žluťoučký kůň úpěl ďábelské ódy ŘŠČŽÝÁÍÉÚŮĚŤĎŇÓ", None),
         ];
+        let has_language = |lang: &str| {
+            let pattern = format!(":lang={lang}");
+            std::process::Command::new("fc-list")
+                .args(["-f", "%{file}\n", &pattern])
+                .output()
+                .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+        };
         for language in [Language::En, Language::Ja] {
             let ctx = egui::Context::default();
             ctx.set_fonts(font_definitions_for_language(language));
@@ -1246,7 +1343,12 @@ mod tests {
                     galley.rows.iter().flat_map(|r| r.glyphs.iter().filter(|g| g.chr != ' ').map(|g| g.uv_rect)).collect::<Vec<_>>()
                 };
                 let tofu = glyphs("\u{25FB}");
-                for (key, cands, sample) in &cases {
+                for (key, cands, sample, lang) in &cases {
+                    if let Some(lang) = *lang
+                        && !has_language(lang)
+                    {
+                        continue; // fontconfig has no face for this language on this machine
+                    }
                     if !cands.iter().any(|(p, _)| std::path::Path::new(p).exists()) {
                         continue; // no face for this script on this machine; nothing to assert
                     }
@@ -1275,6 +1377,27 @@ mod tests {
         assert!(probes(symbols_more(), &format!("{cros}/noto/NotoSansSymbols2-Regular.ttf")));
         assert!(probes(candidates(UI), &format!("{cros}/noto/NotoSans-Regular.ttf")));
         assert!(probes(candidates(CELL), &format!("{cros}/crosextra/Carlito-Regular.ttf")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fontconfig_candidates_are_ordered_and_deduplicated() {
+        // No CJK needed: any fontconfig installation can answer `sans-serif`.
+        // The first match must stay first, and the same match must not be added twice.
+        let Some(expected) = fc_match("sans-serif") else { return };
+        let candidates = fc_match_candidates(&["sans-serif", "sans-serif"]);
+        assert_eq!(candidates.first(), Some(&expected));
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fontconfig_serif_match_precedes_hard_coded_paths() {
+        // The hard-coded paths remain as a fallback, but a fontconfig answer must win first.
+        let Some((path, index)) = fc_match("Liberation Serif") else { return };
+        let candidates = candidates(SERIF);
+        assert!(candidates.first().is_some_and(|(p, i)| p == &path && *i == index));
+        assert!(candidates.iter().any(|(p, _)| p == "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf"));
     }
 
     #[test]
