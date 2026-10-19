@@ -174,8 +174,9 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - No iOS, iPadOS or Android layout. **Estimate:** 30–60 h.
 
 ### 24. Fonts and look (U)
-- Font weights beyond regular/bold (#168), system font list (#4), Calibri metrics (#29), macOS
-  chrome (#169, #170), Linux title bar (#54), icon consistency across apps (#173). **Estimate:** 7–12 h.
+- Font weights beyond regular/bold (#168), system font list on macOS/Windows (#4; Linux uses
+  fontconfig), Calibri metrics (#29), macOS chrome (#169, #170), Linux title bar (#54), icon
+  consistency across apps (#173). **Estimate:** 7–12 h.
 
 ## Revision history
 
@@ -184,10 +185,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 | 2026-10-24 | minor | §8: PivotTable Enable show details: `pivot.options` `enableShowDetails` turns Show Details off for a PivotTable, read and written in XLSX as `enableDrill` |
 | 2026-10-23 | minor | §8: PivotTable Show Details: double-clicking a value cell lists its source records on a new sheet (#2364) |
 | 2026-10-20 | minor | §11: the Japanese catalog covers the dialogs, messages and menus — 943 keys (~43%), matching the pt-BR coverage; a test keeps the two catalogs in step |
+| 2026-10-19 | minor | §24: Linux font discovery uses `fc-list` and the ribbon lists installed families; directory scanning remains the fallback (#1231) |
 | 2026-10-17 | minor | §6: the five reports it tracked are closed and their PRs merged (#57, #133, #139, #140, #134; PRs #148, #155, #156, #157); the entry stays open for §15's oracle suite |
 | 2026-10-15 | minor | §13: Solver prepares reports before committing the solution, model and report sheets together; report refusal preserves the workbook and Undo/Redo (#1050) |
 | 2026-10-13 | trivial | §4: multi-level category axes landed |
 | 2026-10-12 | minor | §9: next/previous sheet commands retain the current visible sheet and selection when there is no visible destination |
+| 2026-10-19 | minor | §24: Linux font discovery uses `fc-list` and the ribbon lists installed families; directory scanning remains the fallback (#1231) |
 | 2026-10-12 | minor | rows auto-fit oversized fonts on open and whole-row/column formatting (#833) |
 | 2026-10-12 | minor | Page Layout view: dragging margins on the rulers (#792) removed from the §14 remainder |
 | 2026-10-12 | minor | §13: Forecast Sheet Forecast Start (hindcast) landed (#785) |

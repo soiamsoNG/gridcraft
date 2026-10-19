@@ -2,20 +2,26 @@
 //! them (#4).
 //!
 //! egui has no font discovery of its own and panics when asked for a family that was never bound
-//! to font data. So we do both halves: scan the platform's font folders for family names (a read
-//! of each font file's `name` table — damaged or unreadable files yield nothing, never a panic),
-//! and bind the files a workbook actually uses into the families
+//! to font data. So we do both halves: discover installed faces for family names (a read of each
+//! font file's `name` table — damaged or unreadable files yield nothing, never a panic), and bind
+//! the files a workbook actually uses into the families
 //! [`theme::font_definitions`](crate::theme::font_definitions) assembles.
+//!
+//! On Linux the file list comes from fontconfig (`fc-list`), which is part of the standard Linux
+//! font stack and knows the distribution's font directories. Other platforms scan their known font
+//! folders.
 //!
 //! Native only: on wasm there are no system fonts, every function here reports "nothing", and the
 //! font list is the standard [`crate::ribbon::FONTS`] set.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// A font file is skipped by the scan past this size: a catalog only needs each face's name, and a
-/// damaged or enormous file must not turn startup into a long read.
+/// A font file is skipped by the directory fallback past this size: a catalog only needs each
+/// face's name, and a damaged or enormous file must not turn startup into a long read. Files that
+/// `fc-list` reports are read through the same limit in this commit.
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_FONT_FILE: u64 = 64 << 20;
 
@@ -43,7 +49,7 @@ pub struct Face {
     pub italic: bool,
 }
 
-/// The font folders of the platform (the system's and the user's). Empty on wasm.
+/// The platform's font folders, used as a fallback when fontconfig is unavailable. Empty on wasm.
 pub fn system_font_dirs() -> Vec<PathBuf> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -146,6 +152,42 @@ fn file_faces(data: &[u8]) -> Vec<(u32, String, Vec<String>, String)> {
         .collect()
 }
 
+/// Whether `path` names a font format the scanner understands.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_font_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc"))
+}
+
+/// Every face in `path` appended to `out`. Unsupported, unreadable, oversized or damaged files
+/// contribute nothing.
+#[cfg(not(target_arch = "wasm32"))]
+fn scan_file(path: &Path, out: &mut Vec<Face>) {
+    if !is_font_path(path) {
+        return;
+    }
+    if std::fs::metadata(path).map(|metadata| metadata.len() > MAX_FONT_FILE).unwrap_or(true) {
+        return;
+    }
+    let Ok(data) = std::fs::read(path) else { return };
+    for (index, family, style) in file_faces(&data) {
+        out.push(Face { family, path: path.to_path_buf(), index, weight: style_weight(&style), italic: style_italic(&style) });
+    }
+}
+
+/// Catalog every face in `files`, reading each path once. Only the Linux catalog and tests use
+/// this; other targets discover files by walking their font folders.
+#[cfg(any(target_os = "linux", all(test, not(target_arch = "wasm32"))))]
+fn scan_files(files: &[PathBuf]) -> Vec<Face> {
+    let mut out: Vec<Face> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for path in files {
+        if seen.insert(path.clone()) {
+            scan_file(path, &mut out);
+        }
+    }
+    out
+}
+
 /// Catalog every face under `dirs`, recursing into subfolders. A folder reached twice (through a
 /// symlink) is read once, so a link back to a parent ends the walk.
 #[cfg(not(target_arch = "wasm32"))]
@@ -163,20 +205,42 @@ pub fn scan_dirs(dirs: &[PathBuf]) -> Vec<Face> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-                continue;
-            }
-            let is_font =
-                path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc"));
-            if !is_font || std::fs::metadata(&path).map(|m| m.len() > MAX_FONT_FILE).unwrap_or(true) {
-                continue;
-            }
-            let Ok(data) = std::fs::read(&path) else { continue };
-            for (index, family, names, style) in file_faces(&data) {
-                out.push(Face { family, names, path: path.clone(), index, weight: style_weight(&style), italic: style_italic(&style) });
+            } else {
+                scan_file(&path, &mut out);
             }
         }
     }
     out
+}
+
+/// Font files known to fontconfig, in the order it reports them. `fc-list` is the usual Linux
+/// font source and covers distribution-specific directories that [`system_font_dirs`] cannot
+/// know.
+#[cfg(target_os = "linux")]
+fn fontconfig_files() -> Vec<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(output) = std::process::Command::new("fc-list").args(["-f", "%{file}\n"]).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        // Keep paths byte-exact: a font path need not be valid UTF-8.
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(OsStr::from_bytes(line));
+        if path.is_file() && is_font_path(&path) && seen.insert(path.clone()) {
+            files.push(path);
+        }
+    }
+    files
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -184,11 +248,27 @@ pub fn scan_dirs(_dirs: &[PathBuf]) -> Vec<Face> {
     Vec::new()
 }
 
+/// The installed faces, preferring fontconfig's list on Linux and falling back to the platform's
+/// font folders when fontconfig is unavailable or empty.
+fn scan_installed() -> Vec<Face> {
+    #[cfg(target_os = "linux")]
+    {
+        let files = fontconfig_files();
+        if !files.is_empty() {
+            let faces = scan_files(&files);
+            if !faces.is_empty() {
+                return faces;
+            }
+        }
+    }
+    scan_dirs(&system_font_dirs())
+}
+
 static CATALOG: OnceLock<Vec<Face>> = OnceLock::new();
 
 /// The catalog of installed faces, scanned on first use. Blocks until the scan finishes.
 pub fn catalog() -> &'static [Face] {
-    CATALOG.get_or_init(|| scan_dirs(&system_font_dirs()))
+    CATALOG.get_or_init(scan_installed)
 }
 
 /// The catalog if the scan has finished, else `None` — never blocks, for use while painting.
@@ -419,6 +499,39 @@ mod tests {
         assert!(file_faces(b"ttcf\x00\x01\x00\x00\xff\xff\xff\xff").is_empty());
         assert!(file_faces(b"not a font at all").is_empty());
         assert!(file_faces(&[]).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fontconfig_files_are_existing_supported_fonts() {
+        let files = fontconfig_files();
+        // A minimal container may not have fontconfig or any fonts; the folder scan is the
+        // fallback in that case. When fc-list does answer, every path must be usable.
+        if files.is_empty() {
+            return;
+        }
+        assert!(files.iter().all(|path| path.is_file() && is_font_path(path)));
+        let unique: HashSet<&PathBuf> = files.iter().collect();
+        assert_eq!(unique.len(), files.len(), "fc-list duplicates are removed");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn scan_files_catalogs_supported_fonts_once() {
+        let dir = std::env::temp_dir().join(format!("gridcraft-fonts-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let ubuntu = dir.join("Ubuntu-Light.ttf");
+        std::fs::write(&ubuntu, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
+        std::fs::write(dir.join("damaged.ttf"), b"ttcf\x00\x01\x00\x00\xff\xff\xff\xff").expect("write");
+        std::fs::write(dir.join("readme.txt"), b"not a font").expect("write");
+
+        // The same path twice is read once; damaged and non-font files contribute nothing.
+        let faces = scan_files(&[ubuntu.clone(), dir.join("damaged.ttf"), dir.join("readme.txt"), ubuntu]);
+        assert_eq!(faces.len(), 1, "one face from one supported, readable file");
+        assert_eq!(faces[0].family, "Ubuntu");
+        assert_eq!(faces[0].weight, 300.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
