@@ -365,18 +365,6 @@ pub(crate) fn font_parses(bytes: &[u8], index: u32) -> bool {
     skrifa::FontRef::from_index(bytes, index).is_ok_and(|font| font.charmap().has_map())
 }
 
-/// Whether the face's OS/2 panose declares a serif style: latin-text family (2) with a serif style
-/// in 2..=10. A face without OS/2 or with panose (2, 11) is sans, which is the old behaviour.
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code, reason = "used when picking serif script faces (next commit)")]
-pub(crate) fn face_is_serif(bytes: &[u8], index: u32) -> bool {
-    use skrifa::raw::TableProvider;
-    let Ok(font) = skrifa::FontRef::from_index(bytes, index) else { return false };
-    let Ok(os2) = font.os2() else { return false };
-    let p = os2.panose_10();
-    p.len() >= 2 && p[0] == 2 && (2..=10).contains(&p[1])
-}
-
 /// Loads the first candidate that exists and parses. A file that exists but can't be parsed is
 /// skipped with a warning and the next candidate is tried.
 #[cfg(not(target_arch = "wasm32"))]
@@ -659,7 +647,13 @@ pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[Stri
     let mut bound: Vec<String> = Vec::new();
     // The non-Latin fallback faces have to sit at the end of each chain: a Latin font owns Latin,
     // and epaint picks the first face that has the glyph, so they only catch their own scripts.
-    let fallback = load_fallback(&mut fonts, HanOrder::of(language));
+    let han = HanOrder::of(language);
+    let fallback = load_fallback(&mut fonts, han, false);
+    // Serif companions (Noto Serif CJK alone is ~55 MB) are loaded only when something asks for a
+    // serif face: a workbook font whose name reads as serif, or the serif role. A serif face
+    // chained to the sans faces would draw CJK in the wrong style (Times New Roman → sans CJK).
+    let want_serif = used.iter().any(|name| family_name_is_serif(name));
+    let serif_fallback = if want_serif { load_fallback(&mut fonts, han, true) } else { Vec::new() };
     for role in [UI, UI_BOLD, CELL, CELL_BOLD, CELL_ITALIC, CELL_BOLD_ITALIC, SERIF, MONO] {
         let paths = candidates(role);
         let refs: Vec<(&str, u32)> = paths.iter().map(|(p, i)| (p.as_str(), *i)).collect();
@@ -679,14 +673,16 @@ pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[Stri
             chain.push(format!("sys-{CELL}"));
         }
         chain.extend(if role == MONO { base_mono.clone() } else { base_prop.clone() });
-        chain.extend(fallback.iter().cloned());
+        let role_fallback = if role == SERIF && want_serif { &serif_fallback } else { &fallback };
+        chain.extend(role_fallback.iter().cloned());
         chain.retain(|k| fonts.font_data.contains_key(k));
         fonts.families.insert(FontFamily::Name(role.into()), chain);
         bound.push(role.to_string());
     }
     // Installed workbook fonts, so a cell's chosen font actually renders in it. Each bound family
-    // carries the same script fallbacks as the roles; step 2 will split them into sans/serif.
-    let script_fallbacks = crate::fonts::ScriptFallbacks { sans: fallback.clone(), serif: fallback.clone() };
+    // carries the script fallbacks for its own face: sans for upright faces, serif for serif ones.
+    let script_fallbacks =
+        crate::fonts::ScriptFallbacks { sans: fallback.clone(), serif: if want_serif { serif_fallback.clone() } else { fallback.clone() } };
     for family in crate::fonts::installed_among(used) {
         bound.extend(crate::fonts::bind_family(&mut fonts, &family, &script_fallbacks));
     }
@@ -714,20 +710,43 @@ pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[Stri
     (fonts, bound)
 }
 
+/// One script's fallback faces: the sans list, plus a serif list where the script ships a serif
+/// companion design (CJK, Thai, Lao, Khmer, Hebrew, Arabic, Devanagari). Scripts with a single
+/// design (Myanmar, Tibetan, Yi) or only symbols have no serif list; a serif cell keeps that
+/// script's sans face, which is still the right script (only the style differs).
+#[cfg(not(target_arch = "wasm32"))]
+struct ScriptFace {
+    key: &'static str,
+    sans: Vec<(String, u32)>,
+    serif: Option<(&'static str, Vec<(String, u32)>)>,
+}
+
 /// Loads the system non-Latin fallback faces (one file per script family) and returns their keys so
 /// every family can carry them as fallback. egui's bundled fonts have no coverage beyond Latin, so
 /// without this a Thai, Hebrew, Japanese or Chinese workbook shows tofu boxes even though the text
 /// was read correctly. With a face installed those scripts get real glyphs instead of tofu; nothing
 /// is bundled, and a machine without the face keeps the old behaviour.
+///
+/// `serif` loads the serif companion faces instead of the sans ones. The caller loads those only
+/// when a workbook or role actually asks for a serif face: Noto Serif CJK alone is ~55 MB, so
+/// paying for it on startup would be wrong for the common case.
 #[cfg(not(target_arch = "wasm32"))]
-fn load_fallback(fonts: &mut FontDefinitions, han: HanOrder) -> Vec<String> {
+fn load_fallback(fonts: &mut FontDefinitions, han: HanOrder, serif: bool) -> Vec<String> {
     let mut keys = Vec::new();
     // Files already loaded as a fallback face. A file serves at most one key: the region-merged
     // Noto Sans CJK .ttc found for Han also carries Hangul (and Tahoma carries both Thai and
     // Hebrew), so loading it again for a later script would only duplicate tens of MB in memory.
     let mut loaded: Vec<String> = Vec::new();
-    for (key, cands) in fallback_faces(han) {
-        for (path, index) in &cands {
+    for face in fallback_faces(han) {
+        let (key, cands) = if serif {
+            match &face.serif {
+                Some((key, cands)) => (*key, cands),
+                None => continue,
+            }
+        } else {
+            (face.key, &face.sans)
+        };
+        for (path, index) in cands {
             if loaded.contains(path) {
                 break; // a face loaded for an earlier script already covers this one
             }
@@ -743,18 +762,19 @@ fn load_fallback(fonts: &mut FontDefinitions, han: HanOrder) -> Vec<String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn load_fallback(_fonts: &mut FontDefinitions, _han: HanOrder) -> Vec<String> {
+fn load_fallback(_fonts: &mut FontDefinitions, _han: HanOrder, _serif: bool) -> Vec<String> {
     Vec::new()
 }
 
-/// Every fallback face we look for, in chain order: `(key, candidate files)`. One file per script
-/// family is enough — epaint picks the first face with the glyph, and a script's glyphs live in one
-/// file. Order only matters between faces that both cover a glyph (Japanese vs Chinese kanji), so
-/// the interface language reorders the two Han entries and nothing else.
+/// Every fallback face we look for, in chain order, with its sans and (where it exists) serif
+/// lists. One file per script family is enough — epaint picks the first face with the glyph, and a
+/// script's glyphs live in one file. Order only matters between faces that both cover a glyph
+/// (Japanese vs Chinese kanji), so the interface language reorders the two Han entries and nothing
+/// else.
 #[cfg(not(target_arch = "wasm32"))]
-fn fallback_faces(han: HanOrder) -> Vec<(&'static str, Vec<(String, u32)>)> {
-    let ja = ("sys-cjk-han-ja", cjk_han_japanese());
-    let zh = ("sys-cjk-han-zh", cjk_han_simplified());
+fn fallback_faces(han: HanOrder) -> Vec<ScriptFace> {
+    let ja = ScriptFace { key: "sys-cjk-han-ja", sans: cjk_han_japanese(), serif: Some(("sys-cjk-han-ja-serif", cjk_han_japanese_serif())) };
+    let zh = ScriptFace { key: "sys-cjk-han-zh", sans: cjk_han_simplified(), serif: Some(("sys-cjk-han-zh-serif", cjk_han_simplified_serif())) };
     let (first, second) = match han {
         HanOrder::Japanese => (ja, zh),
         HanOrder::Chinese => (zh, ja),
@@ -762,12 +782,18 @@ fn fallback_faces(han: HanOrder) -> Vec<(&'static str, Vec<(String, u32)>)> {
     vec![
         first,
         second,
-        ("sys-cjk-hangul", cjk_hangul()),
-        ("sys-thai", thai()),
-        ("sys-lao", lao()),
-        ("sys-hebrew", hebrew()),
-        ("sys-symbols", symbols()),
-        ("sys-symbols-2", symbols_more()),
+        ScriptFace { key: "sys-cjk-hangul", sans: cjk_hangul(), serif: Some(("sys-cjk-hangul-serif", cjk_hangul_serif())) },
+        ScriptFace { key: "sys-thai", sans: thai(), serif: Some(("sys-thai-serif", thai_serif())) },
+        ScriptFace { key: "sys-lao", sans: lao(), serif: Some(("sys-lao-serif", lao_serif())) },
+        ScriptFace { key: "sys-khmer", sans: khmer(), serif: Some(("sys-khmer-serif", khmer_serif())) },
+        ScriptFace { key: "sys-hebrew", sans: hebrew(), serif: Some(("sys-hebrew-serif", hebrew_serif())) },
+        ScriptFace { key: "sys-arabic", sans: arabic(), serif: Some(("sys-arabic-serif", arabic_serif())) },
+        ScriptFace { key: "sys-devanagari", sans: devanagari(), serif: Some(("sys-devanagari-serif", devanagari_serif())) },
+        ScriptFace { key: "sys-myanmar", sans: myanmar(), serif: None },
+        ScriptFace { key: "sys-tibetan", sans: tibetan(), serif: None },
+        ScriptFace { key: "sys-yi", sans: yi(), serif: None },
+        ScriptFace { key: "sys-symbols", sans: symbols(), serif: None },
+        ScriptFace { key: "sys-symbols-2", sans: symbols_more(), serif: None },
     ]
 }
 
@@ -1001,6 +1027,154 @@ fn hebrew() -> Vec<(String, u32)> {
         v.push((format!("{d}/freefont/FreeSans.ttf"), 0));
     }
     v.push(("/usr/share/fonts/google-noto-vf/NotoSansHebrew[wght].ttf".into(), 0));
+    v
+}
+
+/// Fallback candidates for a script's sans face: fontconfig first (distributions place fonts
+/// differently), then the common file names in the standard Noto layouts.
+#[cfg(not(target_arch = "wasm32"))]
+fn script_face(lang: &str, files: &[&str]) -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let pattern = format!("sans-serif:lang={lang}");
+        v.extend(fc_match_candidates(&[pattern.as_str()]));
+    }
+    for d in ["/usr/share/fonts/google-noto-vf", "/usr/share/fonts/truetype/noto", "/usr/share/fonts/opentype/noto", "/usr/share/fonts"] {
+        for file in files {
+            v.push((format!("{d}/{file}"), 0));
+        }
+    }
+    v
+}
+
+/// Same for a script's serif face. Asking fontconfig for `serif:lang=…` picks the serif design
+/// (Noto Serif Thai, Naskh Arabic, …) where the plain name would return the sans one.
+#[cfg(not(target_arch = "wasm32"))]
+fn script_serif(lang: &str, files: &[&str]) -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let pattern = format!("serif:lang={lang}");
+        v.extend(fc_match_candidates(&[pattern.as_str()]));
+    }
+    for d in ["/usr/share/fonts/google-noto-vf", "/usr/share/fonts/truetype/noto", "/usr/share/fonts/opentype/noto", "/usr/share/fonts"] {
+        for file in files {
+            v.push((format!("{d}/{file}"), 0));
+        }
+    }
+    v
+}
+
+/// Lao faces: Noto Sans Lao where installed, plus the usual Debian/Arch names.
+#[cfg(not(target_arch = "wasm32"))]
+fn lao() -> Vec<(String, u32)> {
+    script_face("lo", &["NotoSansLao-Regular.ttf", "NotoSansLao[wght].ttf"])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn lao_serif() -> Vec<(String, u32)> {
+    script_serif("lo", &["NotoSerifLao-Regular.ttf", "NotoSerifLao[wght].ttf"])
+}
+
+/// Khmer faces.
+#[cfg(not(target_arch = "wasm32"))]
+fn khmer() -> Vec<(String, u32)> {
+    script_face("km", &["NotoSansKhmer-Regular.ttf", "NotoSansKhmer[wght].ttf"])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn khmer_serif() -> Vec<(String, u32)> {
+    script_serif("km", &["NotoSerifKhmer-Regular.ttf", "NotoSerifKhmer[wght].ttf"])
+}
+
+/// Arabic faces. The serif companion is Naskh (the traditional book design), not a Latin serif.
+#[cfg(not(target_arch = "wasm32"))]
+fn arabic() -> Vec<(String, u32)> {
+    script_face("ar", &["NotoSansArabic-Regular.ttf", "NotoSansArabic[wdth,wght].ttf"])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn arabic_serif() -> Vec<(String, u32)> {
+    script_serif("ar", &["NotoNaskhArabic-Regular.ttf", "NotoNaskhArabic[wght].ttf"])
+}
+
+/// Devanagari faces.
+#[cfg(not(target_arch = "wasm32"))]
+fn devanagari() -> Vec<(String, u32)> {
+    script_face("hi", &["NotoSansDevanagari-Regular.ttf", "NotoSansDevanagari[wdth,wght].ttf"])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn devanagari_serif() -> Vec<(String, u32)> {
+    script_serif("hi", &["NotoSerifDevanagari-Regular.ttf", "NotoSerifDevanagari[wdth,wght].ttf"])
+}
+
+/// Myanmar faces (Padauk is the common one; it has no serif companion).
+#[cfg(not(target_arch = "wasm32"))]
+fn myanmar() -> Vec<(String, u32)> {
+    script_face("my", &["Padauk-Regular.ttf"])
+}
+
+/// Tibetan faces (Jomolhari is the common one; no serif companion).
+#[cfg(not(target_arch = "wasm32"))]
+fn tibetan() -> Vec<(String, u32)> {
+    script_face("bo", &["Jomolhari-Regular.ttf"])
+}
+
+/// Yi (Nuosu) faces; Noto Sans Yi has no serif companion.
+#[cfg(not(target_arch = "wasm32"))]
+fn yi() -> Vec<(String, u32)> {
+    script_face("ii", &["NotoSansYi-Regular.ttf"])
+}
+
+/// Thai serif faces (Noto Serif Thai where installed).
+#[cfg(not(target_arch = "wasm32"))]
+fn thai_serif() -> Vec<(String, u32)> {
+    script_serif("th", &["NotoSerifThai-Regular.ttf", "NotoSerifThai[wght].ttf"])
+}
+
+/// Hebrew serif faces (Noto Serif Hebrew where installed).
+#[cfg(not(target_arch = "wasm32"))]
+fn hebrew_serif() -> Vec<(String, u32)> {
+    script_serif("he", &["NotoSerifHebrew-Regular.ttf", "NotoSerifHebrew[wght].ttf"])
+}
+
+/// Japanese Han serif faces (Noto Serif CJK JP). The region-merged `NotoSerifCJK-Regular.ttc`
+/// carries one face per locale (JP 0, KR 1, SC 2, TC 3, HK 4).
+#[cfg(not(target_arch = "wasm32"))]
+fn cjk_han_japanese_serif() -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["serif:lang=ja"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
+        v.push((format!("{d}/NotoSerifCJKjp-Regular.otf"), 0));
+        v.push((format!("{d}/NotoSerifCJK-Regular.ttc"), 0));
+    }
+    v
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cjk_han_simplified_serif() -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["serif:lang=zh-cn"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
+        v.push((format!("{d}/NotoSerifCJKsc-Regular.otf"), 0));
+        v.push((format!("{d}/NotoSerifCJK-Regular.ttc"), 2));
+    }
+    v
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cjk_hangul_serif() -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["serif:lang=ko"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
+        v.push((format!("{d}/NotoSerifCJKkr-Regular.otf"), 0));
+        v.push((format!("{d}/NotoSerifCJK-Regular.ttc"), 1));
+    }
     v
 }
 
@@ -1263,7 +1437,7 @@ mod tests {
             let language = if han == HanOrder::Japanese { Language::Ja } else { Language::Zh };
             let fonts = font_definitions_for_language(language);
             let fb_keys: Vec<String> =
-                fallback_faces(han).into_iter().map(|(k, _)| k.to_string()).filter(|k| fonts.font_data.contains_key(k)).collect();
+                fallback_faces(han).into_iter().map(|f| f.key.to_string()).filter(|k| fonts.font_data.contains_key(k)).collect();
             if fb_keys.is_empty() {
                 return; // no fallback face on this machine (minimal Linux)
             }
@@ -1286,21 +1460,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn face_is_serif_reads_the_panose_pair() {
-        // Skips a machine without the sample files; both are present on the development Linux box.
-        for (path, want) in [
-            ("/usr/share/fonts/liberation-serif-fonts/LiberationSerif-Regular.ttf", true),
-            ("/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf", false),
-        ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                assert_eq!(face_is_serif(&bytes, 0), want, "{path}");
-            }
-        }
-        assert!(!face_is_serif(b"not a font", 0), "damaged data is never serif");
-    }
-
     #[test]
     fn interface_families_fall_back_to_the_cell_font() {
         // Structural (#349): the formula bar, name box and dialogs draw every script the cells can,
@@ -1310,7 +1469,7 @@ mod tests {
         if !fonts.font_data.contains_key(&cell) {
             return; // no system cell font on this machine
         }
-        let fb: Vec<String> = fallback_faces(HanOrder::Chinese).into_iter().map(|(k, _)| k.to_string()).collect();
+        let fb: Vec<String> = fallback_faces(HanOrder::Chinese).into_iter().map(|f| f.key.to_string()).collect();
         for family in [FontFamily::Proportional, FontFamily::Name(UI.into()), FontFamily::Name(UI_BOLD.into()), FontFamily::Name(MONO.into())] {
             let chain = fonts.families.get(&family).cloned().unwrap_or_default();
             let at = chain.iter().position(|k| *k == cell);
@@ -1322,14 +1481,44 @@ mod tests {
 
     #[test]
     fn language_reorders_only_the_han_faces() {
-        let keys = |han| fallback_faces(han).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        let keys = |han| fallback_faces(han).into_iter().map(|f| f.key).collect::<Vec<_>>();
         assert_eq!(
             keys(HanOrder::Japanese),
-            ["sys-cjk-han-ja", "sys-cjk-han-zh", "sys-cjk-hangul", "sys-thai", "sys-lao", "sys-hebrew", "sys-symbols", "sys-symbols-2"]
+            [
+                "sys-cjk-han-ja",
+                "sys-cjk-han-zh",
+                "sys-cjk-hangul",
+                "sys-thai",
+                "sys-lao",
+                "sys-khmer",
+                "sys-hebrew",
+                "sys-arabic",
+                "sys-devanagari",
+                "sys-myanmar",
+                "sys-tibetan",
+                "sys-yi",
+                "sys-symbols",
+                "sys-symbols-2"
+            ]
         );
         assert_eq!(
             keys(HanOrder::Chinese),
-            ["sys-cjk-han-zh", "sys-cjk-han-ja", "sys-cjk-hangul", "sys-thai", "sys-lao", "sys-hebrew", "sys-symbols", "sys-symbols-2"]
+            [
+                "sys-cjk-han-zh",
+                "sys-cjk-han-ja",
+                "sys-cjk-hangul",
+                "sys-thai",
+                "sys-lao",
+                "sys-khmer",
+                "sys-hebrew",
+                "sys-arabic",
+                "sys-devanagari",
+                "sys-myanmar",
+                "sys-tibetan",
+                "sys-yi",
+                "sys-symbols",
+                "sys-symbols-2"
+            ]
         );
         assert_eq!(HanOrder::of(Language::Ja), HanOrder::Japanese);
         for l in [Language::En, Language::Zh, Language::Ko, Language::Ru, Language::PtBr, Language::De, Language::Cs, Language::Fr, Language::Tr] {
@@ -1365,13 +1554,51 @@ mod tests {
     }
 
     #[test]
+    fn serif_fallbacks_are_a_separate_set() {
+        let faces = fallback_faces(HanOrder::Chinese);
+        for face in &faces {
+            if let Some((key, _)) = &face.serif {
+                assert_ne!(*key, face.key, "serif key must differ from the sans key");
+            }
+        }
+        let mut keys: Vec<&str> = faces.iter().map(|f| f.key).collect();
+        keys.extend(faces.iter().filter_map(|f| f.serif.as_ref().map(|(k, _)| *k)));
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(keys.len(), sorted.len(), "fallback keys must be unique");
+    }
+
+    #[test]
+    fn serif_workbook_fonts_load_the_serif_fallbacks() {
+        let (fonts, _) = font_definitions_with_bound(Language::En, &["Times New Roman".into()]);
+        if !cjk_han_simplified_serif().iter().any(|(p, _)| std::path::Path::new(p).is_file()) {
+            return; // no serif CJK face on this machine
+        }
+        assert!(fonts.font_data.contains_key("sys-cjk-han-zh-serif"), "serif CJK face was not loaded");
+        let chain = fonts.families.get(&FontFamily::Name(SERIF.into())).cloned().unwrap_or_default();
+        assert!(
+            chain.iter().any(|k| k == "sys-cjk-han-zh-serif" || k == "sys-cjk-han-ja-serif"),
+            "serif role must carry the serif fallbacks: {chain:?}"
+        );
+    }
+
+    #[test]
+    fn sans_workbook_fonts_skip_the_serif_fallbacks() {
+        // Noto Serif CJK is ~55 MB; a workbook that asks for no serif face must not load it.
+        let (fonts, _) = font_definitions_with_bound(Language::En, &["Arial".into()]);
+        let serif_keys = ["sys-cjk-han-zh-serif", "sys-cjk-han-ja-serif", "sys-thai-serif"];
+        assert!(!serif_keys.iter().any(|k| fonts.font_data.contains_key(*k)), "sans-only workbook loaded serif faces");
+    }
+
+    #[test]
     fn fallback_faces_load_each_file_once() {
         // The region-merged Noto Sans CJK .ttc serves Japanese, Chinese and Hangul; it must be loaded
         // once, not once per script (tens of MB each).
         for language in [Language::En, Language::Ja] {
             let fonts = font_definitions_for_language(language);
             let present: Vec<&Arc<FontData>> =
-                fallback_faces(HanOrder::of(language)).into_iter().filter_map(|(k, _)| fonts.font_data.get(k)).collect();
+                fallback_faces(HanOrder::of(language)).into_iter().filter_map(|f| fonts.font_data.get(f.key)).collect();
             for (i, a) in present.iter().enumerate() {
                 for b in present.iter().skip(i + 1) {
                     assert!(a.font != b.font, "the same font file is loaded for two fallback scripts");

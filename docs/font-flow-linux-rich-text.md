@@ -5,6 +5,7 @@ Status: design note and implementation map.
 - Repository: `storytold/gridcraft`
 - Branch: `fix/linux-fontconfig`
 - HEAD at the start of this rewrite: `775a14a docs: add Linux font flow design note (#1231)`
+- Last updated: 2026-10-22 (serif script fallbacks and lazy loading)
 - Related issue: `#1231`
 - Current PR: `#1972` (open; remote branch is older than this local branch)
 
@@ -247,25 +248,36 @@ instance in the high 16 bits and the face index in the low 16 bits. egui's
 
 ### 3.5 Font definitions and script fallback
 
-`font_definitions_with_bound()` (`theme.rs:448`) builds the egui font set and
+`font_definitions_with_bound()` (`theme.rs:454`) builds the egui font set and
 returns `(FontDefinitions, Vec<String>)`.
 
 It:
 
 1. starts from egui's defaults;
-2. loads script fallback faces via `load_fallback()`;
-3. for each role (`ui`, `ui-bold`, `cell`, `cell-bold`, `cell-italic`,
+2. loads the sans script fallback faces with `load_fallback(fonts, han, false)`;
+3. decides whether serif faces are needed: `want_serif` is true when a workbook
+   family in `used` reads as serif (`family_name_is_serif()`: Times, Georgia,
+   Cambria, Garamond, any `*Serif*` that is not a `*Sans*` name). Only then does
+   it call `load_fallback(fonts, han, true)`. Noto Serif CJK alone is ~55 MB, so
+   a sans-only workbook must not pay for it;
+4. for each role (`ui`, `ui-bold`, `cell`, `cell-bold`, `cell-italic`,
    `cell-bold-italic`, `serif`, `mono`):
    - resolves candidates;
    - loads the first parseable face with `try_load()`;
    - inserts it as `sys-{role}`;
    - falls back to `sys-ui` or `sys-cell` for missing bold/italic roles;
    - extends the chain with egui's base proportional/monospace chain and the
-     script fallback keys;
-4. binds installed workbook families with `bind_family()`;
-5. inserts the cell face before script fallback faces in interface chains;
-6. sets `FontFamily::Proportional` to the UI chain;
-7. drops unparseable faces with `drop_unparseable_fonts()`.
+     script fallback keys; the `serif` role uses the serif set when `want_serif`,
+     every other role uses the sans set;
+5. binds installed workbook families with `bind_family()`; each bound role chain
+   ends with the fallbacks that match its primary face — `ScriptFallbacks::serif`
+   for a serif face, `ScriptFallbacks::sans` otherwise. The keys are explicit
+   because at this point `FontFamily::Proportional` may still be egui's bundled
+   Latin-only fonts, so a Latin family such as DejaVu Sans would otherwise show
+   tofu for CJK (#1231);
+6. inserts the cell face before script fallback faces in interface chains;
+7. sets `FontFamily::Proportional` to the UI chain;
+8. drops unparseable faces with `drop_unparseable_fonts()`.
 
 `font_definitions_with()` (`theme.rs:439`) is the non-deferred wrapper: it calls
 `font_definitions_with_bound()` and immediately publishes `set_bound(bound)`.
@@ -274,35 +286,39 @@ It:
 the next pass. Publishing the roles immediately would let `cell_family()` name a
 family that the current pass has not installed yet.
 
-`fallback_faces()` (`theme.rs:541`) returns, in chain order:
+`fallback_faces()` (`theme.rs:581`) returns `ScriptFace { key, sans, serif }`
+entries in chain order:
 
-1. `sys-cjk-han-zh` or `sys-cjk-han-ja` depending on `HanOrder`
-2. the other Han face
-3. `sys-cjk-hangul`
-4. `sys-thai`
-5. `sys-hebrew`
-6. `sys-symbols`
-7. `sys-symbols-2`
+| Key | Script | Serif companion |
+|---|---|---|
+| `sys-cjk-han-zh` / `sys-cjk-han-ja` | Han (SC / JP; order from `HanOrder`) | `sys-cjk-han-zh-serif` / `sys-cjk-han-ja-serif` |
+| `sys-cjk-hangul` | Hangul | `sys-cjk-hangul-serif` |
+| `sys-thai` | Thai | `sys-thai-serif` |
+| `sys-lao` | Lao | `sys-lao-serif` |
+| `sys-khmer` | Khmer | `sys-khmer-serif` |
+| `sys-hebrew` | Hebrew | `sys-hebrew-serif` |
+| `sys-arabic` | Arabic | `sys-arabic-serif` (Naskh) |
+| `sys-devanagari` | Devanagari | `sys-devanagari-serif` |
+| `sys-myanmar` | Myanmar | — (Padauk has one design) |
+| `sys-tibetan` | Tibetan | — (Jomolhari has one design) |
+| `sys-yi` | Yi | — (Noto Sans Yi) |
+| `sys-symbols` / `sys-symbols-2` | symbols | — |
 
-Each script function adds fontconfig candidates first on Linux:
+Each script function asks fontconfig first on Linux (`sans-serif:lang=…` for
+the sans list, `serif:lang=…` for the serif list; Arabic's serif companion is
+Noto Naskh Arabic), then appends the hard-coded paths in
+`LINUX_CJK_FALLBACK_DIRS` (`theme.rs:564`) and the platform-specific paths.
 
-- Japanese: `sans-serif:lang=ja`, `serif:lang=ja`
-- Simplified Chinese: `sans-serif:lang=zh-cn`, `serif:lang=zh-cn`
-- Korean: `sans-serif:lang=ko`, `serif:lang=ko`
-- Thai: `sans-serif:lang=th`
-- Hebrew: `sans-serif:lang=he`
-- Symbols: DejaVu Sans, Symbola, Noto Sans Symbols 2, Noto Sans Symbols
-- Symbols 2: Noto Sans Symbols 2, Symbola, Noto Sans Symbols
+`load_fallback()` (`theme.rs:540`) loads at most one file per key and records
+loaded paths **within one call**. Sans and serif are two independent calls, so
+the region-merged Sans CJK TTC and the Serif CJK TTC each load once, and a
+script whose serif companion is missing simply has no serif key. A serif face
+whose script has no serif companion (Myanmar, Tibetan, Yi) keeps the sans key:
+the script still renders, only the style is not distinct.
 
-Then it appends the hard-coded paths in `LINUX_CJK_FALLBACK_DIRS`
-(`theme.rs:564`) and the platform-specific paths.
-
-`load_fallback()` (`theme.rs:509`) loads at most one file per script key and
-records loaded paths. It currently deduplicates by **path only** and uses
-`break` when a path is already loaded. That is correct for a region-merged TTC
-that covers several scripts, but wrong when the same TTC contains different
-faces for different scripts: the later script never tries another face. This is
-a known issue.
+`bind_faces()` (`fonts.rs:598`) selects the column from the face's OS/2 panose
+(`Face.serif`, `(2, 2..=10)`), so no separate `serif_variant()` mapping is
+needed: a serif family never inherits the sans script set.
 
 ### 3.6 Binding workbook fonts
 
@@ -317,13 +333,17 @@ sorts it, and deduplicates it.
 
 For each installed family, `bind_family()` calls `bind_faces()`.
 
-`bind_faces()` (`fonts.rs:557`):
+`bind_faces()` (`fonts.rs:598`):
 
 - returns no roles for an empty face list;
 - for each `(bold, italic)` combination, calls `pick_face()`;
 - chains the primary face with the family's regular face;
 - reads the whole file with `std::fs::read()` if the key is not already present;
 - inserts `FontData` with the face index;
+- picks the script fallback column from the primary face (`ScriptFallbacks::serif`
+  when its panose says serif, `ScriptFallbacks::sans` otherwise) and appends those
+  keys before egui's base chain; a key without data is dropped so egui never
+  names a missing face;
 - extends the chain with egui's base proportional chain;
 - inserts a `FontFamily::Name("fnt:{family}:{b|n}{i|n}")`;
 - returns the bound role keys.
@@ -392,12 +412,13 @@ Consequences:
 | `list_fonts`/`fc-list` subprocess | No direct fontconfig library access; extra process and parsing. |
 | First bind reads whole font | Large CJK font can read 56 MiB; cold page cache can take seconds. |
 | `pending_bound` solves flash, not atlas cost | First frame after a large new font can still freeze. |
-| `load_fallback` dedupes by path only | Same TTC with different faces for different scripts is not fully used. |
+| `load_fallback` dedupes by path within one call | Sans and serif are separate calls: the Serif CJK TTC loads only when a serif face is actually needed. |
+| Serif companions load on demand | A serif workbook font pays ~55 MB for Noto Serif CJK; a sans-only workbook never loads it. |
 | `try_load` checks parseability, not script coverage | `fc-match` substitute may be chosen even if it lacks the script. |
 | `families()` rebuilds the list on every call | Ribbon calls it per frame; potentially wasteful. |
 | Missing italic face binds regular | Italic button may look ineffective for fonts without an italic face. |
 | No cache invalidation | Fonts installed while running are not picked up until restart. |
-| Host/Flatpak fontconfig differs | Generic `serif`/`monospace`/Thai/Hebrew results can differ. |
+| Host/Flatpak fontconfig differs | The Flatpak ships `65-lang.conf`, `70-noto-cjk.conf` and `75-noto-color-emoji.conf`; the 28 East/Southeast Asian `lang` probes now match the host exactly. |
 | No rich-text model | Per-character formatting is lost; XLSX runs are flattened. |
 
 ---
@@ -1159,6 +1180,12 @@ Current relevant tests:
   - `fallback_faces_are_appended_to_every_family`
   - `fallback_faces_load_each_file_once`
   - `fallback_covers_its_script`
+  - `serif_family_names_route_to_the_serif_role`
+  - `serif_fallbacks_are_a_separate_set`
+  - `serif_workbook_fonts_load_the_serif_fallbacks`
+  - `sans_workbook_fonts_skip_the_serif_fallbacks`
+  - `a_bound_family_carries_its_sans_script_fallbacks`
+  - `a_serif_face_uses_the_serif_fallbacks`
   - `fontconfig_candidates_are_ordered_and_deduplicated`
   - `fontconfig_serif_match_precedes_hard_coded_paths`
   - `chromeos_font_layout_is_probed`
@@ -1190,7 +1217,7 @@ Current test result:
 
 ```text
 cargo +1.95.0 test -p gridcraft-ui-egui --lib
-106 passed, 0 failed
+112 passed, 0 failed
 ```
 
 Full `cargo xtask ci` is currently blocked by a pre-existing unrelated clippy
@@ -1455,6 +1482,7 @@ Current app behavior:
 | `crates/xlsx/src/sheet_read.rs` | Shared-string import; currently flattens rich text. |
 | `crates/xlsx/src/xml.rs` | XML helpers, including `rich_text(...)`. |
 | `Cargo.toml` | `unsafe_code = "forbid"` at line 59. |
+| `packaging/linux/flatpak/fontconfig/` | Flatpak snippets: `65-lang.conf`, `70-noto-cjk.conf`, `75-noto-color-emoji.conf`. |
 
 ### Commands
 
@@ -1527,3 +1555,27 @@ sans-serif:lang=he          DejaVu Sans             index 0
 The important difference is not just the path (`/usr/share/fonts` vs
 `/run/host/fonts`), but the alias configuration: generic `serif`, `monospace`,
 Thai, and Hebrew can resolve differently inside the sandbox.
+
+After the fontconfig snippets (65-lang, 70-noto-cjk, 75-noto-color-emoji) are
+installed in the Flatpak, the 28 East and Southeast Asian `lang` probes
+(`bo, cmn, fil, hak, id, ii, ja, jv, km, ko, lo, lzh, mag, mn-mn, ms, my, nan,
+su, th, tl, ug, vi, yue, zh-cn, zh-hk, zh-mo, zh-sg, zh-tw`, each with
+`sans-serif` and `serif`) are identical inside and outside. The sandbox's
+`serif` and `monospace` now also resolve to Noto Serif / Noto Sans Mono CJK, and
+`emoji` resolves to Noto Color Emoji on both sides.
+
+### Serif fallback for CJK (Times New Roman → 中 / 国)
+
+`fc-match 'Times New Roman:lang=zh-cn'` returns Liberation Serif in both host and
+sandbox, which does not explain the glyph fallback. The coverage query does:
+
+```text
+fc-match -f '%{file}\t%{index}\t%{family}\n' 'Times New Roman:charset=4e2d'
+host     /usr/share/fonts/google-noto-serif-cjk-vf-fonts/NotoSerifCJK-VF.ttc   196610  Noto Serif CJK SC
+sandbox  /run/host/fonts/google-noto-serif-cjk-vf-fonts/NotoSerifCJK-VF.ttc    196610  Noto Serif CJK SC
+```
+
+Fontconfig was already right; the application appended only the sans script
+faces to a serif family, so the CJK glyphs came from Noto Sans CJK.
+`bind_faces()` now appends `ScriptFallbacks::serif` for serif faces, and the
+`serif` role carries the serif set when `want_serif` is true (see §3.5).
