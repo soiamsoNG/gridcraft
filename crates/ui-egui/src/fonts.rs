@@ -607,12 +607,14 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
             if chain.contains(&key) {
                 continue;
             }
-            if !fonts.font_data.contains_key(&key) {
-                let Ok(bytes) = std::fs::read(&face.path) else { continue };
-                let mut fd = egui::FontData::from_owned(bytes);
-                fd.index = face.index;
-                fonts.font_data.insert(key.clone(), std::sync::Arc::new(fd));
+            if fonts.font_data.contains_key(&key) {
+                chain.push(key);
+                continue;
             }
+            let Ok(bytes) = std::fs::read(&face.path) else { continue };
+            let mut fd = egui::FontData::from_owned(bytes);
+            fd.index = face.index;
+            fonts.font_data.insert(key.clone(), std::sync::Arc::new(fd));
             chain.push(key);
         }
         if chain.is_empty() {
