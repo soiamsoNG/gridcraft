@@ -365,14 +365,51 @@ pub(crate) fn font_parses(bytes: &[u8], index: u32) -> bool {
     skrifa::FontRef::from_index(bytes, index).is_ok_and(|font| font.charmap().has_map())
 }
 
+/// Splits the index `fc-match` reports into the face index (low 16 bits) and the named instance
+/// (high 16 bits, which fontconfig stores 1-based; 0 means the font's default instance).
+#[cfg(not(target_arch = "wasm32"))]
+fn fc_index_parts(raw: u32) -> (u32, Option<u32>) {
+    (raw & 0xFFFF, (raw >> 16).checked_sub(1))
+}
+
+/// Applies a variable font's named instance through `FontTweak::coords`. `FontData::index` only
+/// selects a face, so without this a variable font always renders its default instance: fontconfig
+/// resolves `Noto Sans:weight=bold` to named instance 3 (wght 700) but the `fc-match` index is 4
+/// (= 1-based instance in the high 16 bits), and Noto Sans CJK's default instance is Thin (100).
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_named_instance(fd: &mut FontData, instance: u32) {
+    use skrifa::MetadataProvider as _;
+    let Ok(font) = skrifa::FontRef::from_index(fd.font.as_ref(), fd.index) else { return };
+    let Some(named) = usize::try_from(instance).ok().and_then(|i| font.named_instances().get(i)) else {
+        log::warn!("font face {:?} has no named instance {instance}", fd.index);
+        return;
+    };
+    let mut coords = egui::epaint::text::VariationCoords::default();
+    for (axis, value) in font.axes().iter().zip(named.user_coords()) {
+        // `u32` is infallible for `IntoTag`; `&str`/`[u8; 4]` would panic on a malformed tag.
+        coords.push(u32::from_be_bytes(axis.tag().into_bytes()), value);
+    }
+    fd.tweak.coords = coords;
+}
+
 /// Loads the first candidate that exists and parses. A file that exists but can't be parsed is
 /// skipped with a warning and the next candidate is tried.
 #[cfg(not(target_arch = "wasm32"))]
 fn try_load(paths: &[(&str, u32)]) -> Option<FontData> {
-    for (p, index) in paths {
-        if let Some(bytes) = font_file(p, *index) {
-            let mut fd = FontData::from_static(bytes);
-            fd.index = *index;
+    for (p, raw) in paths {
+        let (index, instance) = fc_index_parts(*raw);
+        if !std::path::Path::new(p).is_file() {
+            continue;
+        }
+        let Some(bytes) = font_file(p, index) else {
+            log::warn!("skipping font {p} (face {index}): not a font file egui can read");
+            continue;
+        };
+        let mut fd = FontData::from_static(bytes);
+        fd.index = index;
+        if let Some(instance) = instance {
+            apply_named_instance(&mut fd, instance);
+        }
             return Some(fd);
         }
     }
@@ -893,9 +930,10 @@ fn fc_match_uncounted(pattern: &str) -> Option<(String, u32)> {
     if file.is_empty() || !std::path::Path::new(file).is_file() {
         return None;
     }
-    // fontconfig stores a named instance in the high 16 bits and the face index in the low 16.
-    // egui's FontData::index is a face index, so a variable font's 262144 must become face 0.
-    let index = lines.next().and_then(|line| line.trim().parse().ok()).unwrap_or(0) & 0xFFFF;
+    // fontconfig stores a named instance in the high 16 bits (1-based, 0 = default) and the face
+    // index in the low 16. Both are kept: `try_load` splits them, and the instance is applied
+    // through `FontTweak::coords` so a variable font keeps the weight fontconfig matched.
+    let index = lines.next().and_then(|line| line.trim().parse().ok()).unwrap_or(0);
     Some((file.to_owned(), index))
 }
 
@@ -1681,11 +1719,56 @@ mod tests {
         assert!(probes(candidates(CELL), &format!("{cros}/crosextra/Carlito-Regular.ttf")));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn fc_index_parts_splits_named_instance() {
+        // fontconfig's index packs the 1-based named instance in the high 16 bits and the face in
+        // the low 16: a plain face 2 is 2, Noto Serif CJK's Regular instance on face 2 is 196610,
+        // and Noto Sans' Bold instance 3 is 262144.
+        assert_eq!(fc_index_parts(2), (2, None));
+        assert_eq!(fc_index_parts(196610), (2, Some(2)));
+        assert_eq!(fc_index_parts(262144), (0, Some(3)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bold_match_keeps_its_named_instance_weight() {
+        // #1231: a variable font matched as bold must render bold. Masking the index to the face
+        // dropped the named instance, so egui drew the default (often regular or thin) cut. Noto
+        // Sans ships as a variable font (Noto Sans CJK's bold cut is a separate static file); skip
+        // when no variable bold face is installed.
+        let mut chosen = None;
+        for pattern in ["Noto Sans:weight=bold", "sans-serif:weight=bold"] {
+            let Some(answer) = fc_match(pattern) else { continue };
+            if fc_index_parts(answer.1).1.is_some() {
+                chosen = Some(answer);
+                break;
+            }
+        }
+        let Some((path, raw)) = chosen else { return };
+        let Some(fd) = try_load(&[(path.as_str(), raw)]) else { return };
+        let wght = fd.tweak.coords.as_ref().iter().find(|(tag, _)| tag.to_be_bytes() == *b"wght").map(|(_, value)| *value);
+        assert!(
+            wght.is_some_and(|value| value >= 600.0),
+            "fontconfig named a bold instance of {path} (index {raw}) but no wght >= 600 was applied: {wght:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_named_instance_is_ignored() {
+        // A stale or malformed index must not crash or reach egui: the default instance is used.
+        let Some((path, _)) = fc_match("sans-serif") else { return };
+        let Some(fd) = try_load(&[(path.as_str(), 0xFFFF_0000)]) else { return };
+        assert!(fd.tweak.coords.as_ref().is_empty(), "an out-of-range named instance must leave the default coords");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn fontconfig_candidates_are_ordered_and_deduplicated() {
         // No CJK needed: any fontconfig installation can answer `sans-serif`.
-        // The first match must stay first, and the same match must not be added twice.
+        // The first match must stay first, and the same match must not be added twice. The index
+        // keeps fontconfig's named-instance bits; `try_load` splits them.
         let Some(expected) = fc_match("sans-serif") else { return };
         let candidates = fc_match_candidates(&["sans-serif", "sans-serif"]);
         assert_eq!(candidates.first(), Some(&expected));

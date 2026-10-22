@@ -5,7 +5,7 @@ Status: design note and implementation map.
 - Repository: `storytold/gridcraft`
 - Branch: `fix/linux-fontconfig`
 - HEAD at the start of this rewrite: `775a14a docs: add Linux font flow design note (#1231)`
-- Last updated: 2026-10-22 (serif script fallbacks and lazy loading)
+- Last updated: 2026-10-22 (apply fontconfig named instances; variable-font weights)
 - Related issue: `#1231`
 - Current PR: `#1972` (open; remote branch is older than this local branch)
 
@@ -32,6 +32,8 @@ Current Linux implementation:
   the whole font.
 - The resulting `Face` catalog is cached in a process-wide `OnceLock`.
 - `fc-match` resolves role families and script families.
+- Its index is split into face + named instance; the instance is applied through
+  `FontTweak::coords` so variable fonts keep the weight/slant fontconfig matched.
 - `fc-match` results are cached in a thread-local `HashMap`.
 - Selected workbook fonts are bound into egui lazily; binding still reads the
   whole font file.
@@ -203,7 +205,7 @@ It never blocks: if the scan is not done, it returns only the standard names.
 
 ### 3.4 Font roles and `fc-match`
 
-`theme.rs:251 candidates(role)` produces candidate `(path, index)` pairs.
+`theme.rs:288 candidates(role)` produces candidate `(path, index)` pairs.
 
 On Linux, fontconfig candidates are added first:
 
@@ -215,7 +217,7 @@ v.extend(linux_fontconfig_candidates(role));
 The remaining hard-coded paths are a fallback for systems where fontconfig is
 missing or returns nothing usable.
 
-`linux_fontconfig_candidates()` (`theme.rs:369`) maps roles to patterns:
+`linux_fontconfig_candidates()` (`theme.rs:406`) maps roles to patterns:
 
 | Role | Patterns, in order |
 |---|---|
@@ -228,10 +230,10 @@ missing or returns nothing usable.
 | `serif` | Liberation Serif, DejaVu Serif, serif |
 | `mono` | Liberation Mono, DejaVu Sans Mono, Noto Sans Mono, monospace |
 
-`fc_match_candidates()` (`theme.rs:396`) calls `fc_match()` for each pattern,
+`fc_match_candidates()` (`theme.rs:433`) calls `fc_match()` for each pattern,
 drops duplicate `(path, index)` pairs, and returns the candidates.
 
-`fc_match()` (`theme.rs:617`) first checks the thread-local `FC_MATCH_CACHE`.
+`fc_match()` (`theme.rs:695`) first checks the thread-local `FC_MATCH_CACHE`.
 On a miss it runs:
 
 ```text
@@ -242,13 +244,24 @@ Results, including failures, are cached for the rest of the process. There is no
 invalidation: fonts installed while GridCraft is running are picked up only after
 restart.
 
-The fontconfig `index` is masked with `& 0xFFFF`. Fontconfig stores a named
-instance in the high 16 bits and the face index in the low 16 bits. egui's
-`FontData::index` is a face index, not a named-instance selector.
+The fontconfig `index` carries two fields: the face index in the low 16 bits and
+a **1-based named instance** in the high 16 bits (`0` means the font's default
+instance). `try_load()` (`theme.rs:243`) splits them with `fc_index_parts()`,
+keeps the low half in `FontData::index` (a face index, as egui expects) and
+applies the named instance through `FontTweak::coords` (`apply_named_instance()`),
+reading the axis values with `skrifa`. Without that, a variable font always
+rendered its default instance: fontconfig resolves `Noto Sans:weight=bold` to
+named instance 3 (wght 700), whose raw index is `262144`, and Noto Sans CJK's
+default instance is Thin (wght 100) — masking the index made bold text and
+`serif` CJK text render in the wrong weight.
+
+Do not gate this on fontconfig's `%{variable}`: it returns `False` for both
+variable TTFs and named instances inside variable collections on
+fontconfig 2.17, so it cannot distinguish a static face from a named instance.
 
 ### 3.5 Font definitions and script fallback
 
-`font_definitions_with_bound()` (`theme.rs:454`) builds the egui font set and
+`font_definitions_with_bound()` (`theme.rs:485`) builds the egui font set and
 returns `(FontDefinitions, Vec<String>)`.
 
 It:
@@ -279,14 +292,14 @@ It:
 7. sets `FontFamily::Proportional` to the UI chain;
 8. drops unparseable faces with `drop_unparseable_fonts()`.
 
-`font_definitions_with()` (`theme.rs:439`) is the non-deferred wrapper: it calls
+`font_definitions_with()` (`theme.rs:476`) is the non-deferred wrapper: it calls
 `font_definitions_with_bound()` and immediately publishes `set_bound(bound)`.
 
 `font_definitions_with_bound()` is used when egui will activate the new set on
 the next pass. Publishing the roles immediately would let `cell_family()` name a
 family that the current pass has not installed yet.
 
-`fallback_faces()` (`theme.rs:581`) returns `ScriptFace { key, sans, serif }`
+`fallback_faces()` (`theme.rs:612`) returns `ScriptFace { key, sans, serif }`
 entries in chain order:
 
 | Key | Script | Serif companion |
@@ -307,9 +320,9 @@ entries in chain order:
 Each script function asks fontconfig first on Linux (`sans-serif:lang=…` for
 the sans list, `serif:lang=…` for the serif list; Arabic's serif companion is
 Noto Naskh Arabic), then appends the hard-coded paths in
-`LINUX_CJK_FALLBACK_DIRS` (`theme.rs:564`) and the platform-specific paths.
+`LINUX_CJK_FALLBACK_DIRS` (`theme.rs:642`) and the platform-specific paths.
 
-`load_fallback()` (`theme.rs:540`) loads at most one file per key and records
+`load_fallback()` (`theme.rs:571`) loads at most one file per key and records
 loaded paths **within one call**. Sans and serif are two independent calls, so
 the region-merged Sans CJK TTC and the Serif CJK TTC each load once, and a
 script whose serif companion is missing simply has no serif key. A serif face
@@ -514,7 +527,8 @@ not a font-discovery problem.
 ### 4.7 Invariants
 
 1. `cell_family()` only returns an egui family that has data.
-2. `FontData::index` is a face index, never a named-instance encoding.
+2. `FontData::index` is a face index; a fontconfig named instance is applied
+   through `FontTweak::coords`, never by putting it in the index.
 3. A failed font parse costs one fallback, never a panic.
 4. The UI thread never scans font directories.
 5. Normal layout never spawns `fc-match` per character.
@@ -1526,7 +1540,7 @@ Measured on the development host:
 
 ```text
 sans-serif                  Noto Sans CJK SC        index 2
-serif                       Noto Serif CJK SC       index 196610 -> face 2
+serif                       Noto Serif CJK SC       index 196610 -> face 2, named instance 2 (Regular)
 monospace                   Noto Sans Mono CJK SC   index 7
 Calibri                     Carlito                 index 0
 Times New Roman             Liberation Serif        index 0
