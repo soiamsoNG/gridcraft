@@ -5,7 +5,7 @@ Status: design note and implementation map.
 - Repository: `storytold/gridcraft`
 - Branch: `fix/linux-fontconfig`
 - HEAD at the start of this rewrite: `775a14a docs: add Linux font flow design note (#1231)`
-- Last updated: 2026-10-22 (apply fontconfig named instances; variable-font weights)
+- Last updated: 2026-10-22 (fontconfig face metadata; panose read at binding)
 - Related issue: `#1231`
 - Current PR: `#1972` (open; remote branch is older than this local branch)
 
@@ -27,9 +27,10 @@ font-discovery work is a prerequisite, not a replacement for it.
 
 Current Linux implementation:
 
-- `fc-list -f '%{file}\n'` discovers font files.
-- Each file's SFNT/TTC table directory and `name` table are read without loading
-  the whole font.
+- `fc-list` supplies face metadata (file, index, family, style, weight, slant)
+  from fontconfig's cache; startup does not open every font file.
+- Other platforms read each file with `skrifa`, under a 256 MiB per-file cap,
+  and build the same `Face` catalog.
 - The resulting `Face` catalog is cached in a process-wide `OnceLock`.
 - `fc-match` resolves role families and script families.
 - Its index is split into face + named instance; the instance is applied through
@@ -122,66 +123,58 @@ Entry point:
 - `crates/ui-egui/src/lib.rs:348` `setup_context_for_language()`
 - `crates/ui-egui/src/lib.rs:349` `fonts::start_scan()`
 
-`start_scan()` (`crates/ui-egui/src/fonts.rs:460`) starts a named background
+`start_scan()` (`crates/ui-egui/src/fonts.rs:293`) starts a named background
 thread (`font-scan`) once. The thread calls `catalog()`.
 
-`catalog()` (`crates/ui-egui/src/fonts.rs:449`) is a `OnceLock<Vec<Face>>`.
+`catalog()` (`crates/ui-egui/src/fonts.rs:282`) is a `OnceLock<Vec<Face>>`.
 It blocks only the first caller; the background thread normally does that work.
 
-`scan_installed()` (`crates/ui-egui/src/fonts.rs:432`):
+`scan_installed()` (`crates/ui-egui/src/fonts.rs:268`):
 
-1. On Linux, call `fontconfig_files()`.
-2. If it returns files, scan them with `scan_files()`.
-3. If the result is non-empty, use it.
-4. Otherwise fall back to `scan_dirs(system_font_dirs())`.
+1. On Linux, call `fontconfig_faces()`.
+2. If it returns faces, use them.
+3. Otherwise fall back to `scan_dirs(system_font_dirs())`.
 
-`fontconfig_files()` (`crates/ui-egui/src/fonts.rs:399`) runs:
+`fontconfig_faces()` (`fonts.rs:198`) runs:
 
 ```text
-fc-list -f "%{file}\n"
+fc-list -f "%{file}\t%{index}\t%{family[0]}\t%{style[0]}\t%{weight}\t%{slant}\n"
 ```
 
-It parses bytes, strips `\r`, filters existing files with supported extensions
-(`ttf`, `otf`, `ttc`, `otc`), and deduplicates paths. It does not assume UTF-8.
+with `LC_ALL=C` so family and style are the English names. Each record becomes a
+`Face` directly: family, face index, weight mapped from fontconfig's
+`FC_WEIGHT_*` constants to the 100–900 scale, italic from `FC_SLANT_ITALIC`
+(`100`) and up, and the serif hint from the family name. Paths are kept
+byte-exact (a font path need not be valid UTF-8), filtered to existing files
+with supported extensions (`ttf`, `otf`, `ttc`, `otc`), and deduplicated by
+`(path, index)`. A variable font's default-instance range row (`[80 200]`, empty
+style) is not a usable face and is skipped.
 
-`scan_dirs()` (`crates/ui-egui/src/fonts.rs:373`) recursively walks platform
-font folders, canonicalizes directories to avoid symlink loops, and calls
-`scan_file()` for each candidate.
+This is also why startup no longer opens every font: the list arrives as
+metadata from the fontconfig cache. `fc-list` still runs once, on the background
+`font-scan` thread.
 
-### 3.2 Metadata-only face scanning
+`scan_dirs()` (`fonts.rs:172`) recursively walks platform font folders,
+canonicalizes directories to avoid symlink loops, and calls `scan_file()` for
+each candidate.
 
-`scan_file()` (`crates/ui-egui/src/fonts.rs:347`) does **not** read the whole
-font. It calls `file_faces()` (`:331`), which calls `faces_in()` (`:298`).
+### 3.2 Metadata-only face scanning (non-Linux)
 
-`faces_in()`:
+`scan_file()` (`fonts.rs:154`) enforces `MAX_FONT_FILE` (256 MiB) and then calls
+`file_faces()` (`:110`), which uses `skrifa`'s `FileRef`/`FontRef`: `fonts()`
+iterates the faces of a plain sfnt or a collection, `localized_strings` reads
+the typographic family/subfamily (falling back to the legacy name IDs) in
+English or the first available language, and `os2().panose_10()` supplies the
+serif flag. Damaged files, unreadable tables, and out-of-range table offsets
+yield no faces, not a panic.
 
-- reads the 12-byte SFNT/TTC header;
-- detects `ttcf` and iterates TTC face offsets;
-- for each face, calls `face_names()`;
-- `face_names()` validates the SFNT version, reads the table directory, finds the
-  `name` table, and calls `read_name_table()`;
-- `read_name_table()` reads the name records and string storage;
-- `select_name()` prefers Windows Unicode English, then other Windows Unicode,
-  then Unicode, Macintosh, and finally any remaining record;
-- name IDs `16`/`1` are family; `17`/`2` are style.
-
-Bounds:
-
-- `MAX_TTC_FACES = 1024`
-- `MAX_TABLE_RECORDS = 4096`
-- `MAX_NAME_RECORDS = 4096`
-- `MAX_NAME_BYTES = 8192`
-
-All offsets and lengths use checked arithmetic. A damaged file yields no faces,
-not a panic.
-
-There is no file-size limit for the metadata scan. The old 64 MiB
-`MAX_FONT_FILE` limit was removed because metadata reads are bounded and huge
-CJK fonts are legitimate.
+Unlike the Linux path, this reads each candidate file once (peak memory is the
+largest file, not the sum), because `skrifa` needs the bytes. The 256 MiB cap
+bounds that read; it is not a claim that a larger font could not render.
 
 ### 3.3 Face catalog and family list
 
-`Face` (`crates/ui-egui/src/fonts.rs:47`) contains:
+`Face` (`crates/ui-egui/src/fonts.rs:31`) contains:
 
 ```rust
 pub struct Face {
@@ -205,7 +198,7 @@ It never blocks: if the scan is not done, it returns only the standard names.
 
 ### 3.4 Font roles and `fc-match`
 
-`theme.rs:288 candidates(role)` produces candidate `(path, index)` pairs.
+`theme.rs:286 candidates(role)` produces candidate `(path, index)` pairs.
 
 On Linux, fontconfig candidates are added first:
 
@@ -217,7 +210,7 @@ v.extend(linux_fontconfig_candidates(role));
 The remaining hard-coded paths are a fallback for systems where fontconfig is
 missing or returns nothing usable.
 
-`linux_fontconfig_candidates()` (`theme.rs:406`) maps roles to patterns:
+`linux_fontconfig_candidates()` (`theme.rs:404`) maps roles to patterns:
 
 | Role | Patterns, in order |
 |---|---|
@@ -230,10 +223,10 @@ missing or returns nothing usable.
 | `serif` | Liberation Serif, DejaVu Serif, serif |
 | `mono` | Liberation Mono, DejaVu Sans Mono, Noto Sans Mono, monospace |
 
-`fc_match_candidates()` (`theme.rs:433`) calls `fc_match()` for each pattern,
+`fc_match_candidates()` (`theme.rs:431`) calls `fc_match()` for each pattern,
 drops duplicate `(path, index)` pairs, and returns the candidates.
 
-`fc_match()` (`theme.rs:695`) first checks the thread-local `FC_MATCH_CACHE`.
+`fc_match()` (`theme.rs:693`) first checks the thread-local `FC_MATCH_CACHE`.
 On a miss it runs:
 
 ```text
@@ -246,7 +239,7 @@ restart.
 
 The fontconfig `index` carries two fields: the face index in the low 16 bits and
 a **1-based named instance** in the high 16 bits (`0` means the font's default
-instance). `try_load()` (`theme.rs:243`) splits them with `fc_index_parts()`,
+instance). `try_load()` (`theme.rs:241`) splits them with `fc_index_parts()`,
 keeps the low half in `FontData::index` (a face index, as egui expects) and
 applies the named instance through `FontTweak::coords` (`apply_named_instance()`),
 reading the axis values with `skrifa`. Without that, a variable font always
@@ -261,7 +254,7 @@ fontconfig 2.17, so it cannot distinguish a static face from a named instance.
 
 ### 3.5 Font definitions and script fallback
 
-`font_definitions_with_bound()` (`theme.rs:485`) builds the egui font set and
+`font_definitions_with_bound()` (`theme.rs:483`) builds the egui font set and
 returns `(FontDefinitions, Vec<String>)`.
 
 It:
@@ -292,14 +285,14 @@ It:
 7. sets `FontFamily::Proportional` to the UI chain;
 8. drops unparseable faces with `drop_unparseable_fonts()`.
 
-`font_definitions_with()` (`theme.rs:476`) is the non-deferred wrapper: it calls
+`font_definitions_with()` (`theme.rs:474`) is the non-deferred wrapper: it calls
 `font_definitions_with_bound()` and immediately publishes `set_bound(bound)`.
 
 `font_definitions_with_bound()` is used when egui will activate the new set on
 the next pass. Publishing the roles immediately would let `cell_family()` name a
 family that the current pass has not installed yet.
 
-`fallback_faces()` (`theme.rs:612`) returns `ScriptFace { key, sans, serif }`
+`fallback_faces()` (`theme.rs:610`) returns `ScriptFace { key, sans, serif }`
 entries in chain order:
 
 | Key | Script | Serif companion |
@@ -320,18 +313,20 @@ entries in chain order:
 Each script function asks fontconfig first on Linux (`sans-serif:lang=…` for
 the sans list, `serif:lang=…` for the serif list; Arabic's serif companion is
 Noto Naskh Arabic), then appends the hard-coded paths in
-`LINUX_CJK_FALLBACK_DIRS` (`theme.rs:642`) and the platform-specific paths.
+`LINUX_CJK_FALLBACK_DIRS` (`theme.rs:640`) and the platform-specific paths.
 
-`load_fallback()` (`theme.rs:571`) loads at most one file per key and records
+`load_fallback()` (`theme.rs:569`) loads at most one file per key and records
 loaded paths **within one call**. Sans and serif are two independent calls, so
 the region-merged Sans CJK TTC and the Serif CJK TTC each load once, and a
 script whose serif companion is missing simply has no serif key. A serif face
 whose script has no serif companion (Myanmar, Tibetan, Yi) keeps the sans key:
 the script still renders, only the style is not distinct.
 
-`bind_faces()` (`fonts.rs:598`) selects the column from the face's OS/2 panose
-(`Face.serif`, `(2, 2..=10)`), so no separate `serif_variant()` mapping is
-needed: a serif family never inherits the sans script set.
+`bind_faces()` (`fonts.rs:425`) selects the column from the panose of the bytes
+it just loaded (`face_is_serif()`, `(2, 2..=10)`), not from the catalog hint: on
+Linux `Face.serif` comes from the family name because `fc-list` does not expose
+panose, so only the loaded OS/2 table can decide. No separate `serif_variant()`
+mapping is needed: a serif family never inherits the sans script set.
 
 ### 3.6 Binding workbook fonts
 
@@ -341,18 +336,20 @@ needed: a serif family never inherits the sans script set.
 - theme heading/body fonts;
 - shape text fonts.
 
-`installed_among()` (`fonts.rs:488`) filters that list against the catalog,
+`installed_among()` (`fonts.rs:321`) filters that list against the catalog,
 sorts it, and deduplicates it.
 
 For each installed family, `bind_family()` calls `bind_faces()`.
 
-`bind_faces()` (`fonts.rs:598`):
+`bind_faces()` (`fonts.rs:425`):
 
 - returns no roles for an empty face list;
 - for each `(bold, italic)` combination, calls `pick_face()`;
 - chains the primary face with the family's regular face;
-- reads the whole file with `std::fs::read()` if the key is not already present;
-- inserts `FontData` with the face index;
+- loads the primary first, so its real panose is available;
+- calls `load_face()` (`:394`) for a missing key: it reads the file, splits the
+  fontconfig index with `fc_index_parts()`, sets `FontData::index` to the face,
+  and applies the named instance through `apply_named_instance()`;
 - picks the script fallback column from the primary face (`ScriptFallbacks::serif`
   when its panose says serif, `ScriptFallbacks::sans` otherwise) and appends those
   keys before egui's base chain; a key without data is dropped so egui never
@@ -361,7 +358,7 @@ For each installed family, `bind_family()` calls `bind_faces()`.
 - inserts a `FontFamily::Name("fnt:{family}:{b|n}{i|n}")`;
 - returns the bound role keys.
 
-`pick_face()` (`fonts.rs:529`) falls back to the regular face when an exact
+`pick_face()` (`fonts.rs:362`) falls back to the regular face when an exact
 bold/italic face is missing. That means an italic role can be bound to a regular
 face; the italic button may then appear to do nothing for fonts without an
 italic face. This is a known limitation.
@@ -1187,9 +1184,13 @@ Current relevant tests:
 - `crates/ui-egui/src/fonts.rs`:
   - `style_names_map_to_weight_and_slant`
   - `role_keys_are_stable_and_distinct`
-  - metadata/TTC tests
-  - `fontconfig_files_are_existing_supported_fonts`
-  - `scan_files_catalogs_supported_fonts_once`
+  - `file_faces_reads_ttf_name_table`, `file_faces_reads_every_ttc_face`,
+    `file_faces_rejects_out_of_bounds_tables`
+  - `panose_decides_whether_a_face_is_serif`
+  - `scan_dirs_skips_a_font_over_the_file_cap`
+  - `fontconfig_faces_are_existing_supported_fonts`
+  - `fontconfig_records_carry_family_style_and_slant`
+  - `fontconfig_weights_map_to_the_css_scale`
 - `crates/ui-egui/src/theme.rs`:
   - `fallback_faces_are_appended_to_every_family`
   - `fallback_faces_load_each_file_once`

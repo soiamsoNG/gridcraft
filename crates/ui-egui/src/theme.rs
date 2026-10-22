@@ -367,8 +367,7 @@ pub(crate) fn font_parses(bytes: &[u8], index: u32) -> bool {
 
 /// Splits the index `fc-match` reports into the face index (low 16 bits) and the named instance
 /// (high 16 bits, which fontconfig stores 1-based; 0 means the font's default instance).
-#[cfg(not(target_arch = "wasm32"))]
-fn fc_index_parts(raw: u32) -> (u32, Option<u32>) {
+pub(crate) fn fc_index_parts(raw: u32) -> (u32, Option<u32>) {
     (raw & 0xFFFF, (raw >> 16).checked_sub(1))
 }
 
@@ -376,8 +375,7 @@ fn fc_index_parts(raw: u32) -> (u32, Option<u32>) {
 /// selects a face, so without this a variable font always renders its default instance: fontconfig
 /// resolves `Noto Sans:weight=bold` to named instance 3 (wght 700) but the `fc-match` index is 4
 /// (= 1-based instance in the high 16 bits), and Noto Sans CJK's default instance is Thin (100).
-#[cfg(not(target_arch = "wasm32"))]
-fn apply_named_instance(fd: &mut FontData, instance: u32) {
+pub(crate) fn apply_named_instance(fd: &mut FontData, instance: u32) {
     use skrifa::MetadataProvider as _;
     let Ok(font) = skrifa::FontRef::from_index(fd.font.as_ref(), fd.index) else { return };
     let Some(named) = usize::try_from(instance).ok().and_then(|i| font.named_instances().get(i)) else {

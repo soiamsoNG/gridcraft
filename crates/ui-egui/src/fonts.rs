@@ -2,45 +2,29 @@
 //! them (#4).
 //!
 //! egui has no font discovery of its own and panics when asked for a family that was never bound
-//! to font data. So we do both halves: discover installed faces for family names (a read of each
-//! font file's `name` table — damaged or unreadable files yield nothing, never a panic), and bind
-//! the files a workbook actually uses into the families
-//! [`theme::font_definitions`](crate::theme::font_definitions) assembles.
+//! to font data. So we do both halves: discover installed faces for family names (fontconfig
+//! metadata on Linux, a `skrifa` read of each file's `name` table elsewhere — damaged or
+//! unreadable files yield nothing, never a panic), and bind the files a workbook actually uses
+//! into the families [`theme::font_definitions`](crate::theme::font_definitions) assembles.
 //!
-//! On Linux the file list comes from fontconfig (`fc-list`), which is part of the standard Linux
-//! font stack and knows the distribution's font directories. Other platforms scan their known font
-//! folders.
+//! On Linux the face list comes from fontconfig (`fc-list`), which is part of the standard Linux
+//! font stack, knows the distribution's font directories, and already carries the family, style,
+//! weight and slant — in the common case GridCraft never opens a font file just to list it. Other
+//! platforms scan their known font folders.
 //!
 //! Native only: on wasm there are no system fonts, every function here reports "nothing", and the
 //! font list is the standard [`crate::ribbon::FONTS`] set.
 
 use std::collections::HashSet;
 #[cfg(not(target_arch = "wasm32"))]
-use std::io::{Read, Seek, SeekFrom};
-#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// TTC collections are allowed at most this many faces. The limit keeps a damaged header from
-/// making the reader walk an unbounded array; real collections are far smaller.
+/// A font file larger than this is not read for the catalog. Real fonts are far smaller; the cap
+/// keeps a hostile or damaged file from making the scan allocate its size.
 #[cfg(not(target_arch = "wasm32"))]
-const MAX_TTC_FACES: u32 = 1024;
-
-/// SFNT table directories are allowed at most this many records. The format's field is `u16`, but
-/// every real font is far below this bound, and a smaller ceiling keeps a damaged table directory
-/// from allocating a large buffer.
-#[cfg(not(target_arch = "wasm32"))]
-const MAX_TABLE_RECORDS: usize = 4096;
-
-/// A `name` table may contain at most this many records. Again, this is a format sanity bound,
-/// not a font-file size limit.
-#[cfg(not(target_arch = "wasm32"))]
-const MAX_NAME_RECORDS: usize = 4096;
-
-/// A single family or style name longer than this is treated as damaged. Real names are short.
-#[cfg(not(target_arch = "wasm32"))]
-const MAX_NAME_BYTES: usize = 8192;
+const MAX_FONT_FILE: u64 = 256 << 20;
 
 /// A face keeps at most this many family names, so a hostile `name` table can't grow the catalog.
 #[cfg(not(target_arch = "wasm32"))]
@@ -136,247 +120,41 @@ fn style_italic(style: &str) -> bool {
     s.contains("italic") || s.contains("oblique")
 }
 
-/// One name record from an SFNT `name` table.
+/// Every face in `data` as `(index, family, style, serif)`, read with `skrifa` (which parses the
+/// sfnt directory and the `name`/`OS/2` tables), in file order. `data` may be a collection.
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone, Copy)]
-struct NameRecord {
-    platform_id: u16,
-    encoding_id: u16,
-    language_id: u16,
-    name_id: u16,
-    length: u16,
-    offset: u16,
-}
+fn file_faces(data: &[u8]) -> Vec<(u32, String, String, bool)> {
+    use skrifa::raw::{FileRef, TableProvider as _};
+    use skrifa::string::StringId;
 
-/// Read exactly `length` bytes at `offset`, without loading the rest of the file.
-#[cfg(not(target_arch = "wasm32"))]
-fn read_at<R: Read + Seek>(reader: &mut R, offset: u64, length: usize) -> Option<Vec<u8>> {
-    reader.seek(SeekFrom::Start(offset)).ok()?;
-    let mut data = vec![0u8; length];
-    reader.read_exact(&mut data).ok()?;
-    Some(data)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn u16_at(data: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_be_bytes(data.get(offset..offset.checked_add(2)?)?.try_into().ok()?))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(data.get(offset..offset.checked_add(4)?)?.try_into().ok()?))
-}
-
-/// How suitable a `name` record is: English Windows Unicode first, then other Windows Unicode,
-/// other Windows encodings, Unicode, Macintosh, and finally whatever remains.
-#[cfg(not(target_arch = "wasm32"))]
-fn name_rank(record: &NameRecord) -> u8 {
-    if record.platform_id == 3 && (record.encoding_id == 1 || record.encoding_id == 10) && record.language_id == 0x0409 {
-        0
-    } else if record.platform_id == 3 && (record.encoding_id == 1 || record.encoding_id == 10) {
-        1
-    } else if record.platform_id == 3 {
-        2
-    } else if record.platform_id == 0 {
-        3
-    } else if record.platform_id == 1 {
-        4
-    } else {
-        5
-    }
-}
-
-/// Decode one name record. Windows and Unicode records are UTF-16BE; Macintosh Roman is treated as
-/// Latin-1, which covers the ASCII family names that matter for discovery.
-#[cfg(not(target_arch = "wasm32"))]
-fn decode_name<R: Read + Seek>(reader: &mut R, string_base: u64, string_limit: u64, record: &NameRecord) -> Option<String> {
-    let length = record.length as usize;
-    if length == 0 || length > MAX_NAME_BYTES {
-        return None;
-    }
-    let start = string_base.checked_add(record.offset as u64)?;
-    let end = start.checked_add(length as u64)?;
-    if end > string_limit {
-        return None;
-    }
-    let bytes = read_at(reader, start, length)?;
-    let text = match record.platform_id {
-        0 | 3 => {
-            if bytes.len() % 2 != 0 {
-                return None;
-            }
-            let units: Vec<u16> = bytes.chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])).collect();
-            String::from_utf16(&units).ok()?
-        }
-        1 => bytes.iter().map(|byte| *byte as char).collect(),
-        _ => String::from_utf8(bytes).ok()?,
-    };
-    let text = text.trim_matches('\0').trim();
-    if text.is_empty() { None } else { Some(text.to_string()) }
-}
-
-/// Pick the best decodable name for the first matching ID in `ids`, trying IDs in priority order.
-#[cfg(not(target_arch = "wasm32"))]
-fn select_name<R: Read + Seek>(reader: &mut R, string_base: u64, string_limit: u64, records: &[NameRecord], ids: &[u16]) -> Option<String> {
-    for id in ids {
-        let mut candidates: Vec<(u8, usize)> =
-            records.iter().enumerate().filter(|(_, record)| record.name_id == *id).map(|(index, record)| (name_rank(record), index)).collect();
-        candidates.sort_by_key(|(rank, index)| (*rank, *index));
-        for (_, index) in candidates {
-            if let Some(name) = decode_name(reader, string_base, string_limit, records.get(index)?) {
-                return Some(name);
-            }
-        }
-    }
-    None
-}
-
-/// Read family and style from one face's `name` table.
-#[cfg(not(target_arch = "wasm32"))]
-fn read_name_table<R: Read + Seek>(reader: &mut R, table_offset: u64, table_len: u32) -> Option<(String, String)> {
-    let table_len = table_len as usize;
-    if table_len < 6 {
-        return None;
-    }
-    let header = read_at(reader, table_offset, 6)?;
-    let format = u16_at(&header, 0)?;
-    if format > 1 {
-        return None;
-    }
-    let count = u16_at(&header, 2)? as usize;
-    if count == 0 || count > MAX_NAME_RECORDS {
-        return None;
-    }
-    let string_offset = u16_at(&header, 4)? as u64;
-    let records_len = count.checked_mul(12)?;
-    if 6usize.checked_add(records_len)? > table_len {
-        return None;
-    }
-    let records_data = read_at(reader, table_offset.checked_add(6)?, records_len)?;
-    let string_base = table_offset.checked_add(string_offset)?;
-    let table_end = table_offset.checked_add(table_len as u64)?;
-    if string_base > table_end {
-        return None;
-    }
-    let mut records: Vec<NameRecord> = Vec::with_capacity(count);
-    for index in 0..count {
-        let record = records_data.get(index.checked_mul(12)?..index.checked_mul(12)?.checked_add(12)?)?;
-        records.push(NameRecord {
-            platform_id: u16_at(record, 0)?,
-            encoding_id: u16_at(record, 2)?,
-            language_id: u16_at(record, 4)?,
-            name_id: u16_at(record, 6)?,
-            length: u16_at(record, 8)?,
-            offset: u16_at(record, 10)?,
-        });
-    }
-    let family = select_name(reader, string_base, table_end, &records, &[16, 1])?;
-    let style = select_name(reader, string_base, table_end, &records, &[17, 2]).unwrap_or_else(|| "Regular".into());
-    Some((family, style))
-}
-
-/// Read the OS/2 panose byte pair and say whether it declares a serif style: latin-text family
-/// (2) with a serif style in 2..=10. A missing or short table is treated as sans, the old
-/// behaviour for every face.
-#[cfg(not(target_arch = "wasm32"))]
-fn read_os2_serif<R: Read + Seek>(reader: &mut R, file_len: u64, table_offset: u64, table_len: u32) -> bool {
-    const PANOSE_OFFSET: u64 = 32;
-    const PANOSE_END: u64 = 42;
-    if table_len < PANOSE_END as u32 {
-        return false;
-    }
-    let Some(end) = table_offset.checked_add(PANOSE_END) else { return false };
-    if end > file_len {
-        return false;
-    }
-    let Some(panose) = read_at(reader, table_offset + PANOSE_OFFSET, (PANOSE_END - PANOSE_OFFSET) as usize) else {
-        return false;
-    };
-    panose.first() == Some(&2) && matches!(panose.get(1).copied(), Some(2..=10))
-}
-
-/// Read family, style and serif flag from the face whose SFNT offset table starts at `face_offset`.
-#[cfg(not(target_arch = "wasm32"))]
-fn face_names<R: Read + Seek>(reader: &mut R, file_len: u64, face_offset: u64) -> Option<(String, String, bool)> {
-    if face_offset.checked_add(12)? > file_len {
-        return None;
-    }
-    let header = read_at(reader, face_offset, 12)?;
-    let version = u32_at(&header, 0)?;
-    if !matches!(version, 0x0001_0000 | 0x4F54_544F | 0x7472_7565 | 0x7479_7031) {
-        return None;
-    }
-    let num_tables = u16_at(&header, 4)? as usize;
-    if num_tables == 0 || num_tables > MAX_TABLE_RECORDS {
-        return None;
-    }
-    let directory_len = 12usize.checked_add(num_tables.checked_mul(16)?)?;
-    if face_offset.checked_add(directory_len as u64)? > file_len {
-        return None;
-    }
-    let directory = read_at(reader, face_offset, directory_len)?;
-    let mut name_table: Option<(u64, u32)> = None;
-    let mut serif = false;
-    for index in 0..num_tables {
-        let start = 12usize.checked_add(index.checked_mul(16)?)?;
-        let record = directory.get(start..start.checked_add(16)?)?;
-        let tag = record.get(0..4)?;
-        let table_offset = u32_at(record, 8)? as u64;
-        let table_len = u32_at(record, 12)?;
-        if table_offset.checked_add(table_len as u64)? > file_len {
-            continue;
-        }
-        if tag == b"name".as_slice() {
-            name_table = Some((table_offset, table_len));
-        } else if tag == b"OS/2".as_slice() {
-            serif = read_os2_serif(reader, file_len, table_offset, table_len);
-        }
-    }
-    let (table_offset, table_len) = name_table?;
-    let (family, style) = read_name_table(reader, table_offset, table_len)?;
-    Some((family, style, serif))
-}
-
-/// Every face in `reader` as `(index, family, style, serif)`. Damaged data yields nothing, never a
-/// panic.
-#[cfg(not(target_arch = "wasm32"))]
-fn faces_in<R: Read + Seek>(reader: &mut R, file_len: u64) -> Vec<(u32, String, String, bool)> {
-    let mut out: Vec<(u32, String, String, bool)> = Vec::new();
-    if file_len < 12 {
-        return out;
-    }
-    let Some(header) = read_at(reader, 0, 12) else { return out };
-    if u32_at(&header, 0) == Some(0x7474_6366) {
-        let version = u32_at(&header, 4).unwrap_or(0);
-        if version != 0x0001_0000 && version != 0x0002_0000 {
-            return out;
-        }
-        let num_fonts = u32_at(&header, 8).unwrap_or(0);
-        if num_fonts == 0 || num_fonts > MAX_TTC_FACES {
-            return out;
-        }
-        let Some(offsets_len) = (num_fonts as usize).checked_mul(4) else { return out };
-        let Some(offsets) = read_at(reader, 12, offsets_len) else { return out };
-        for index in 0..num_fonts {
-            let Some(offset) = u32_at(&offsets, index as usize * 4) else { continue };
-            if let Some((family, style, serif)) = face_names(reader, file_len, offset as u64) {
-                out.push((index, family, style, serif));
-            }
-        }
-        return out;
-    }
-    if let Some((family, style, serif)) = face_names(reader, file_len, 0) {
-        out.push((0, family, style, serif));
+    let Ok(file) = FileRef::new(data) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (position, font) in file.fonts().enumerate() {
+        let Ok(font) = font else { continue };
+        let Ok(index) = u32::try_from(position) else { continue };
+        let Some(family) = face_name(&font, &[StringId::TYPOGRAPHIC_FAMILY_NAME, StringId::FAMILY_NAME]) else { continue };
+        let style = face_name(&font, &[StringId::TYPOGRAPHIC_SUBFAMILY_NAME, StringId::SUBFAMILY_NAME]).unwrap_or_else(|| "Regular".into());
+        let serif = font.os2().is_ok_and(|os2| is_serif_panose(os2.panose_10()));
+        out.push((index, family, style, serif));
     }
     out
 }
 
-/// Every face in `path` as `(index, family, style, serif)`, read from the file's metadata only.
+/// The best available name for `font` among `ids`, trimmed; `None` when the font has none.
 #[cfg(not(target_arch = "wasm32"))]
-fn file_faces(path: &Path) -> Vec<(u32, String, String, bool)> {
-    let Ok(mut file) = std::fs::File::open(path) else { return Vec::new() };
-    let Ok(file_len) = file.metadata().map(|metadata| metadata.len()) else { return Vec::new() };
-    faces_in(&mut file, file_len)
+fn face_name(font: &skrifa::FontRef<'_>, ids: &[skrifa::string::StringId]) -> Option<String> {
+    use skrifa::MetadataProvider as _;
+    ids.iter()
+        .find_map(|id| font.localized_strings(*id).english_or_first())
+        .map(|name| name.to_string().trim_matches('\0').trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+/// Whether an OS/2 panose classification describes a serif face: Latin "Text and Display" with a
+/// serif family kind, or Latin "Handwritten" with a serif/sans-serif treatment.
+fn is_serif_panose(panose: &[u8]) -> bool {
+    (panose.first() == Some(&2) && matches!(panose.get(1).copied(), Some(2..=10)))
+        || (panose.first() == Some(&3) && matches!(panose.get(1).copied(), Some(3..=10)))
 }
 
 /// Whether `path` names a font format the scanner understands.
@@ -385,31 +163,23 @@ fn is_font_path(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc"))
 }
 
-/// Every face in `path` appended to `out`. Unsupported, unreadable or damaged files contribute
-/// nothing. Only the table directory and `name` table are read; the font data itself is loaded
-/// when a face is bound.
+/// Every face in `path` appended to `out`. Unsupported, unreadable or damaged files, and files
+/// over [`MAX_FONT_FILE`], contribute nothing. The file is read once for its metadata; the bytes
+/// are read again only when a face is bound.
 #[cfg(not(target_arch = "wasm32"))]
 fn scan_file(path: &Path, out: &mut Vec<Face>) {
     if !is_font_path(path) {
         return;
     }
-    for (index, family, style, serif) in file_faces(path) {
+    let Ok(metadata) = std::fs::metadata(path) else { return };
+    if metadata.len() > MAX_FONT_FILE {
+        log::warn!("skipping font {}: larger than {MAX_FONT_FILE} bytes", path.display());
+        return;
+    }
+    let Ok(data) = std::fs::read(path) else { return };
+    for (index, family, style, serif) in file_faces(&data) {
         out.push(Face { family, path: path.to_path_buf(), index, weight: style_weight(&style), italic: style_italic(&style), serif });
     }
-}
-
-/// Catalog every face in `files`, reading each path once. Only the Linux catalog and tests use
-/// this; other targets discover files by walking their font folders.
-#[cfg(any(target_os = "linux", all(test, not(target_arch = "wasm32"))))]
-fn scan_files(files: &[PathBuf]) -> Vec<Face> {
-    let mut out: Vec<Face> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    for path in files {
-        if seen.insert(path.clone()) {
-            scan_file(path, &mut out);
-        }
-    }
-    out
 }
 
 /// Catalog every face under `dirs`, recursing into subfolders. A folder reached twice (through a
@@ -437,34 +207,71 @@ pub fn scan_dirs(dirs: &[PathBuf]) -> Vec<Face> {
     out
 }
 
-/// Font files known to fontconfig, in the order it reports them. `fc-list` is the usual Linux
-/// font source and covers distribution-specific directories that [`system_font_dirs`] cannot
-/// know.
+/// Every face fontconfig knows, in the order it reports them. `fc-list` is the usual Linux font
+/// source and covers distribution-specific directories that [`system_font_dirs`] cannot know. The
+/// metadata avoids opening each file during startup; a file is read only when a family is bound.
 #[cfg(target_os = "linux")]
-fn fontconfig_files() -> Vec<PathBuf> {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-
-    let Ok(output) = std::process::Command::new("fc-list").args(["-f", "%{file}\n"]).output() else {
+fn fontconfig_faces() -> Vec<Face> {
+    let Ok(output) = std::process::Command::new("fc-list")
+        .env("LC_ALL", "C")
+        .args(["-f", "%{file}\t%{index}\t%{family[0]}\t%{style[0]}\t%{weight}\t%{slant}\n"])
+        .output()
+    else {
         return Vec::new();
     };
     if !output.status.success() {
         return Vec::new();
     }
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut files: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<(PathBuf, u32)> = HashSet::new();
+    let mut faces: Vec<Face> = Vec::new();
     for line in output.stdout.split(|byte| *byte == b'\n') {
-        // Keep paths byte-exact: a font path need not be valid UTF-8.
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
-            continue;
-        }
-        let path = PathBuf::from(OsStr::from_bytes(line));
-        if path.is_file() && is_font_path(&path) && seen.insert(path.clone()) {
-            files.push(path);
+        let Some(face) = fontconfig_face(line) else { continue };
+        if face.path.is_file() && seen.insert((face.path.clone(), face.index)) {
+            faces.push(face);
         }
     }
-    files
+    faces
+}
+
+/// One tab-separated `fc-list` record, or `None` for a blank or unusable line.
+#[cfg(target_os = "linux")]
+fn fontconfig_face(line: &[u8]) -> Option<Face> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut fields = line.split(|byte| *byte == b'\t');
+    let file = fields.next()?;
+    let index = fields.next()?;
+    let family = fields.next()?;
+    let style = fields.next()?;
+    let weight = fields.next()?;
+    let slant = fields.next()?;
+    if fields.next().is_some() || file.is_empty() || family.is_empty() {
+        return None;
+    }
+    // A variable font also reports a range row for its default instance (`[80 200]`, empty
+    // style). Only concrete named instances and static faces are usable as catalog entries.
+    if style.is_empty() {
+        return None;
+    }
+    let index: u32 = std::str::from_utf8(index).ok()?.trim().parse().ok()?;
+    let weight = fc_weight(std::str::from_utf8(weight).ok()?.trim().parse().ok()?);
+    let slant: u32 = std::str::from_utf8(slant).ok()?.trim().parse().unwrap_or(0);
+    let family = std::str::from_utf8(family).ok()?.trim();
+    let path = PathBuf::from(OsStr::from_bytes(file));
+    if !is_font_path(&path) {
+        return None;
+    }
+    Some(Face { family: family.to_string(), path, index, weight, italic: slant >= 100, serif: crate::theme::family_name_is_serif(family) })
+}
+
+/// The egui weight for a fontconfig weight. fontconfig's constants follow the OpenType
+/// convention (`FC_WEIGHT_REGULAR` 80, `FC_WEIGHT_BOLD` 200), not CSS numbers.
+#[cfg(any(target_os = "linux", test))]
+fn fc_weight(value: u32) -> f32 {
+    const POINTS: &[(u32, f32)] = &[(0, 100.0), (40, 200.0), (50, 300.0), (80, 400.0), (100, 500.0), (180, 600.0), (200, 700.0), (210, 900.0)];
+    POINTS.iter().min_by_key(|(fc, _)| fc.abs_diff(value)).map(|(_, weight)| *weight).unwrap_or(400.0)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -477,12 +284,9 @@ pub fn scan_dirs(_dirs: &[PathBuf]) -> Vec<Face> {
 fn scan_installed() -> Vec<Face> {
     #[cfg(target_os = "linux")]
     {
-        let files = fontconfig_files();
-        if !files.is_empty() {
-            let faces = scan_files(&files);
-            if !faces.is_empty() {
-                return faces;
-            }
+        let faces = fontconfig_faces();
+        if !faces.is_empty() {
+            return faces;
         }
     }
     scan_dirs(&system_font_dirs())
@@ -622,6 +426,29 @@ pub struct ScriptFallbacks {
     pub serif: Vec<String>,
 }
 
+/// Read one face's file, select its SFNT face, and apply the named instance fontconfig encoded in
+/// [`Face::index`] (`crate::theme::fc_index_parts` explains the packing).
+fn load_face(face: &Face) -> Option<egui::FontData> {
+    let bytes = std::fs::read(&face.path).ok()?;
+    let (index, instance) = crate::theme::fc_index_parts(face.index);
+    let mut fd = egui::FontData::from_owned(bytes);
+    fd.index = index;
+    if let Some(instance) = instance {
+        crate::theme::apply_named_instance(&mut fd, instance);
+    }
+    Some(fd)
+}
+
+/// Whether the loaded face's OS/2 panose declares a serif style. [`Face::serif`] is only a catalog
+/// hint; reading panose from the bytes binding already loaded keeps the script fallback exact
+/// without another file parse.
+fn face_is_serif(fd: &egui::FontData) -> bool {
+    use skrifa::raw::TableProvider as _;
+    let Ok(font) = skrifa::FontRef::from_index(fd.font.as_ref(), fd.index) else { return false };
+    let Ok(os2) = font.os2() else { return false };
+    is_serif_panose(os2.panose_10())
+}
+
 /// Bind one installed family's faces into `fonts`, one egui family per cell role, and return the
 /// role keys that are now bound. A role with no exact face chains to the family's regular face, so
 /// no role is ever left pointing at missing data (egui panics on that). A family with no faces
@@ -640,7 +467,19 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
     let mut bound: Vec<String> = Vec::new();
     for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
         let Some(primary) = pick_face(faces, bold, italic) else { continue };
-        let script = if primary.serif { &fallback.serif } else { &fallback.sans };
+        let primary_key = face_key(family, primary);
+        if !fonts.font_data.contains_key(&primary_key)
+            && let Some(fd) = load_face(primary)
+        {
+            fonts.font_data.insert(primary_key.clone(), std::sync::Arc::new(fd));
+        }
+        // The catalog's flag is only a hint (on Linux it comes from the family name, because
+        // fc-list does not expose panose). Binding already reads the bytes, so use the real value.
+        let serif = match fonts.font_data.get(&primary_key) {
+            Some(fd) => face_is_serif(fd.as_ref()),
+            None => primary.serif,
+        };
+        let script = if serif { &fallback.serif } else { &fallback.sans };
         let mut chain: Vec<String> = Vec::new();
         for face in [Some(primary), pick_face(faces, false, false)] {
             let Some(face) = face else { continue };
@@ -652,9 +491,7 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
                 chain.push(key);
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&face.path) else { continue };
-            let mut fd = egui::FontData::from_owned(bytes);
-            fd.index = face.index;
+            let Some(fd) = load_face(face) else { continue };
             fonts.font_data.insert(key.clone(), std::sync::Arc::new(fd));
             chain.push(key);
         }
@@ -739,17 +576,15 @@ mod tests {
     #[test]
     fn damaged_or_non_font_files_contribute_nothing() {
         let damaged = b"ttcf\x00\x01\x00\x00\xff\xff\xff\xff";
-        assert!(faces_in(&mut std::io::Cursor::new(damaged), damaged.len() as u64).is_empty());
-        let text = b"not a font at all";
-        assert!(faces_in(&mut std::io::Cursor::new(text), text.len() as u64).is_empty());
-        assert!(faces_in(&mut std::io::Cursor::new(Vec::new()), 0).is_empty());
+        assert!(file_faces(damaged).is_empty());
+        assert!(file_faces(b"not a font at all").is_empty());
+        assert!(file_faces(&[]).is_empty());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn faces_in_reads_ttf_name_table() {
-        let font = epaint_default_fonts::UBUNTU_LIGHT;
-        let faces = faces_in(&mut std::io::Cursor::new(font), font.len() as u64);
+    fn file_faces_reads_ttf_name_table() {
+        let faces = file_faces(epaint_default_fonts::UBUNTU_LIGHT);
         assert_eq!(faces, vec![(0, "Ubuntu".into(), "Light".into(), false)]);
     }
 
@@ -781,9 +616,9 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn faces_in_reads_every_ttc_face() {
+    fn file_faces_reads_every_ttc_face() {
         let ttc = ttc_with_two_faces(epaint_default_fonts::UBUNTU_LIGHT);
-        let faces = faces_in(&mut std::io::Cursor::new(&ttc), ttc.len() as u64);
+        let faces = file_faces(&ttc);
         assert_eq!(faces.len(), 2);
         assert_eq!(faces[0], (0, "Ubuntu".into(), "Light".into(), false));
         assert_eq!(faces[1], (1, "Ubuntu".into(), "Light".into(), false));
@@ -791,7 +626,7 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn faces_in_rejects_out_of_bounds_tables() {
+    fn file_faces_rejects_out_of_bounds_tables() {
         let mut font = epaint_default_fonts::UBUNTU_LIGHT.to_vec();
         let num_tables = u16::from_be_bytes([font[4], font[5]]) as usize;
         for index in 0..num_tables {
@@ -800,56 +635,69 @@ mod tests {
                 font[at + 8..at + 12].copy_from_slice(&u32::MAX.to_be_bytes());
             }
         }
-        assert!(faces_in(&mut std::io::Cursor::new(&font), font.len() as u64).is_empty());
+        assert!(file_faces(&font).is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn scan_dirs_reads_large_fonts_without_a_size_cap() {
+    fn scan_dirs_skips_a_font_over_the_file_cap() {
         let dir = std::env::temp_dir().join(format!("gridcraft-fonts-large-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("large.ttf");
         std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
         let file = std::fs::OpenOptions::new().write(true).open(&path).expect("open");
-        file.set_len((64u64 << 20) + 1).expect("extend");
-        let faces = scan_dirs(std::slice::from_ref(&dir));
-        assert_eq!(faces.len(), 1, "the old 64 MiB cap no longer skips the font");
-        assert_eq!(faces[0].family, "Ubuntu");
+        file.set_len(MAX_FONT_FILE + 1).expect("extend");
+        assert!(scan_dirs(std::slice::from_ref(&dir)).is_empty(), "a file over the cap is not read");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fontconfig_weights_map_to_the_css_scale() {
+        assert_eq!(fc_weight(0), 100.0);
+        assert_eq!(fc_weight(40), 200.0);
+        assert_eq!(fc_weight(50), 300.0);
+        assert_eq!(fc_weight(80), 400.0);
+        assert_eq!(fc_weight(100), 500.0);
+        assert_eq!(fc_weight(180), 600.0);
+        assert_eq!(fc_weight(200), 700.0);
+        assert_eq!(fc_weight(210), 900.0);
+        // An unknown value picks the nearest known point instead of failing.
+        assert_eq!(fc_weight(75), 400.0);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn fontconfig_files_are_existing_supported_fonts() {
-        let files = fontconfig_files();
-        // A minimal container may not have fontconfig or any fonts; the folder scan is the
-        // fallback in that case. When fc-list does answer, every path must be usable.
-        if files.is_empty() {
-            return;
-        }
-        assert!(files.iter().all(|path| path.is_file() && is_font_path(path)));
-        let unique: HashSet<&PathBuf> = files.iter().collect();
-        assert_eq!(unique.len(), files.len(), "fc-list duplicates are removed");
+    fn fontconfig_records_carry_family_style_and_slant() {
+        let bold = fontconfig_face(b"/usr/share/fonts/x/NotoSans-Bold.ttf\t2\tNoto Sans\tBold\t200\t0").expect("a concrete face");
+        assert_eq!(bold.family, "Noto Sans");
+        assert_eq!(bold.index, 2);
+        assert_eq!(bold.weight, 700.0);
+        assert!(!bold.italic);
+
+        let italic = fontconfig_face(b"/usr/share/fonts/x/NotoSans-Italic.ttf\t0\tNoto Sans\tItalic\t80\t100").expect("an italic face");
+        assert!(italic.italic);
+
+        // The variable font's default-instance range row has no style and is not a usable face.
+        assert!(fontconfig_face(b"/usr/share/fonts/x/NotoSans[wdth,wght].ttf\t0\tNoto Sans\t\t[80 200]\t0").is_none());
+        // Truncated records and non-font files are ignored.
+        assert!(fontconfig_face(b"/usr/share/fonts/x/NotoSans.ttf\t0\tNoto Sans").is_none());
+        assert!(fontconfig_face(b"/usr/share/fonts/x/README.txt\t0\tNoto Sans\tRegular\t80\t0").is_none());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn scan_files_catalogs_supported_fonts_once() {
-        let dir = std::env::temp_dir().join(format!("gridcraft-fonts-files-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let ubuntu = dir.join("Ubuntu-Light.ttf");
-        std::fs::write(&ubuntu, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
-        std::fs::write(dir.join("damaged.ttf"), b"ttcf\x00\x01\x00\x00\xff\xff\xff\xff").expect("write");
-        std::fs::write(dir.join("readme.txt"), b"not a font").expect("write");
-
-        // The same path twice is read once; damaged and non-font files contribute nothing.
-        let faces = scan_files(&[ubuntu.clone(), dir.join("damaged.ttf"), dir.join("readme.txt"), ubuntu]);
-        assert_eq!(faces.len(), 1, "one face from one supported, readable file");
-        assert_eq!(faces[0].family, "Ubuntu");
-        assert_eq!(faces[0].weight, 300.0);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn fontconfig_faces_are_existing_supported_fonts() {
+        let faces = fontconfig_faces();
+        // A minimal container may not have fontconfig or any fonts; the folder scan is the
+        // fallback in that case. When fc-list does answer, every face must be usable.
+        if faces.is_empty() {
+            return;
+        }
+        assert!(faces.iter().all(|face| face.path.is_file() && is_font_path(&face.path)));
+        assert!(faces.iter().all(|face| (100.0..=900.0).contains(&face.weight)));
+        let unique: HashSet<(&PathBuf, u32)> = faces.iter().map(|face| (&face.path, face.index)).collect();
+        assert_eq!(unique.len(), faces.len(), "fc-list duplicates are removed");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -931,6 +779,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A copy of `font` with its OS/2 panose family kind and serif treatment replaced.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn with_panose(font: &[u8], panose: [u8; 2]) -> Vec<u8> {
+        let num_tables = u16::from_be_bytes([font[4], font[5]]) as usize;
+        let mut out = font.to_vec();
+        for index in 0..num_tables {
+            let at = 12 + index * 16;
+            if &out[at..at + 4] == b"OS/2" {
+                let offset = u32::from_be_bytes(out[at + 8..at + 12].try_into().expect("table offset")) as usize;
+                out[offset + 32] = panose[0];
+                out[offset + 33] = panose[1];
+                break;
+            }
+        }
+        out
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn panose_decides_whether_a_face_is_serif() {
+        let sans = egui::FontData::from_owned(epaint_default_fonts::UBUNTU_LIGHT.to_vec());
+        assert!(!face_is_serif(&sans), "Ubuntu's panose is sans-serif");
+        let serif = egui::FontData::from_owned(with_panose(epaint_default_fonts::UBUNTU_LIGHT, [2, 2]));
+        assert!(face_is_serif(&serif));
+        // A file that is not a font degrades to "not serif", never a panic.
+        assert!(!face_is_serif(&egui::FontData::from_owned(vec![0, 1, 2, 3])));
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_serif_face_uses_the_serif_fallbacks() {
@@ -938,8 +814,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("Ubuntu-Light.ttf");
-        std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
-        let face = Face { family: "Ubuntu".into(), path, index: 0, weight: 300.0, italic: false, serif: true };
+        std::fs::write(&path, with_panose(epaint_default_fonts::UBUNTU_LIGHT, [2, 2])).expect("write");
+        // The catalog hint says sans; the loaded bytes say serif, and binding trusts the bytes.
+        let face = Face { family: "Ubuntu".into(), path, index: 0, weight: 300.0, italic: false, serif: false };
 
         let mut fonts = egui::FontDefinitions::default();
         let data = || std::sync::Arc::new(egui::FontData::from_owned(epaint_default_fonts::UBUNTU_LIGHT.to_vec()));
