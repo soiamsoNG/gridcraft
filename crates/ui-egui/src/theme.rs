@@ -289,6 +289,17 @@ pub fn ui_bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(UI_BOLD.into()))
 }
 
+/// Whether a family name reads as serif. Used both to route an unbound cell font to the serif role
+/// and to decide whether the serif script fallbacks have to be loaded.
+pub(crate) fn family_name_is_serif(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("times")
+        || lower.contains("georgia")
+        || lower.contains("cambria")
+        || lower.contains("serif") && !lower.contains("sans")
+        || lower.contains("garamond")
+}
+
 /// The font family to use for a cell font name and weight.
 ///
 /// When the name is an installed font whose faces were bound by [`font_definitions`], that family
@@ -304,12 +315,7 @@ pub fn cell_family(name: &str, bold: bool, italic: bool) -> FontFamily {
     if lower.contains("courier") || lower.contains("mono") || lower.contains("consolas") {
         return FontFamily::Name(MONO.into());
     }
-    if lower.contains("times")
-        || lower.contains("georgia")
-        || lower.contains("cambria")
-        || lower.contains("serif") && !lower.contains("sans")
-        || lower.contains("garamond")
-    {
+    if family_name_is_serif(name) {
         return FontFamily::Name(SERIF.into());
     }
     FontFamily::Name(
@@ -357,6 +363,18 @@ pub fn cell_text_width(ctx: &egui::Context, text: &str, font: &gridcraft_engine:
 pub(crate) fn font_parses(bytes: &[u8], index: u32) -> bool {
     use skrifa::MetadataProvider;
     skrifa::FontRef::from_index(bytes, index).is_ok_and(|font| font.charmap().has_map())
+}
+
+/// Whether the face's OS/2 panose declares a serif style: latin-text family (2) with a serif style
+/// in 2..=10. A face without OS/2 or with panose (2, 11) is sans, which is the old behaviour.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code, reason = "used when picking serif script faces (next commit)")]
+pub(crate) fn face_is_serif(bytes: &[u8], index: u32) -> bool {
+    use skrifa::raw::TableProvider;
+    let Ok(font) = skrifa::FontRef::from_index(bytes, index) else { return false };
+    let Ok(os2) = font.os2() else { return false };
+    let p = os2.panose_10();
+    p.len() >= 2 && p[0] == 2 && (2..=10).contains(&p[1])
 }
 
 /// Loads the first candidate that exists and parses. A file that exists but can't be parsed is
@@ -666,9 +684,11 @@ pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[Stri
         fonts.families.insert(FontFamily::Name(role.into()), chain);
         bound.push(role.to_string());
     }
-    // Installed workbook fonts, so a cell's chosen font actually renders in it.
+    // Installed workbook fonts, so a cell's chosen font actually renders in it. Each bound family
+    // carries the same script fallbacks as the roles; step 2 will split them into sans/serif.
+    let script_fallbacks = crate::fonts::ScriptFallbacks { sans: fallback.clone(), serif: fallback.clone() };
     for family in crate::fonts::installed_among(used) {
-        bound.extend(crate::fonts::bind_family(&mut fonts, &family));
+        bound.extend(crate::fonts::bind_family(&mut fonts, &family, &script_fallbacks));
     }
     // Interface text (formula bar, name box, dialogs) falls back to the cell font before the
     // script faces: whatever a cell can draw, the formula bar can draw too, even where no script
@@ -1254,6 +1274,31 @@ mod tests {
                 assert_eq!(tail, fb_keys.as_slice(), "{role} must end its chain with the fallback faces");
             }
         }
+    }
+
+    #[test]
+    fn serif_family_names_route_to_the_serif_role() {
+        for name in ["Times New Roman", "Georgia", "Cambria", "Garamond", "Noto Serif", "DejaVu Serif"] {
+            assert!(family_name_is_serif(name), "{name}");
+        }
+        for name in ["Arial", "Calibri", "DejaVu Sans", "Noto Sans", "Source Sans 3"] {
+            assert!(!family_name_is_serif(name), "{name}");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn face_is_serif_reads_the_panose_pair() {
+        // Skips a machine without the sample files; both are present on the development Linux box.
+        for (path, want) in [
+            ("/usr/share/fonts/liberation-serif-fonts/LiberationSerif-Regular.ttf", true),
+            ("/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf", false),
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                assert_eq!(face_is_serif(&bytes, 0), want, "{path}");
+            }
+        }
+        assert!(!face_is_serif(b"not a font", 0), "damaged data is never serif");
     }
 
     #[test]

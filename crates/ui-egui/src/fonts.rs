@@ -64,6 +64,8 @@ pub struct Face {
     pub weight: f32,
     /// Whether the style name reads as italic or oblique.
     pub italic: bool,
+    /// Whether the face's OS/2 panose declares a serif style.
+    pub serif: bool,
 }
 
 /// The platform's font folders, used as a fallback when fontconfig is unavailable. Empty on wasm.
@@ -273,9 +275,29 @@ fn read_name_table<R: Read + Seek>(reader: &mut R, table_offset: u64, table_len:
     Some((family, style))
 }
 
-/// Read family and style from the face whose SFNT offset table starts at `face_offset`.
+/// Read the OS/2 panose byte pair and say whether it declares a serif style: latin-text family
+/// (2) with a serif style in 2..=10. A missing or short table is treated as sans, the old
+/// behaviour for every face.
 #[cfg(not(target_arch = "wasm32"))]
-fn face_names<R: Read + Seek>(reader: &mut R, file_len: u64, face_offset: u64) -> Option<(String, String)> {
+fn read_os2_serif<R: Read + Seek>(reader: &mut R, file_len: u64, table_offset: u64, table_len: u32) -> bool {
+    const PANOSE_OFFSET: u64 = 32;
+    const PANOSE_END: u64 = 42;
+    if table_len < PANOSE_END as u32 {
+        return false;
+    }
+    let Some(end) = table_offset.checked_add(PANOSE_END) else { return false };
+    if end > file_len {
+        return false;
+    }
+    let Some(panose) = read_at(reader, table_offset + PANOSE_OFFSET, (PANOSE_END - PANOSE_OFFSET) as usize) else {
+        return false;
+    };
+    panose.first() == Some(&2) && matches!(panose.get(1).copied(), Some(2..=10))
+}
+
+/// Read family, style and serif flag from the face whose SFNT offset table starts at `face_offset`.
+#[cfg(not(target_arch = "wasm32"))]
+fn face_names<R: Read + Seek>(reader: &mut R, file_len: u64, face_offset: u64) -> Option<(String, String, bool)> {
     if face_offset.checked_add(12)? > file_len {
         return None;
     }
@@ -293,26 +315,33 @@ fn face_names<R: Read + Seek>(reader: &mut R, file_len: u64, face_offset: u64) -
         return None;
     }
     let directory = read_at(reader, face_offset, directory_len)?;
+    let mut name_table: Option<(u64, u32)> = None;
+    let mut serif = false;
     for index in 0..num_tables {
         let start = 12usize.checked_add(index.checked_mul(16)?)?;
         let record = directory.get(start..start.checked_add(16)?)?;
-        if record.get(0..4)? != b"name".as_slice() {
-            continue;
-        }
+        let tag = record.get(0..4)?;
         let table_offset = u32_at(record, 8)? as u64;
         let table_len = u32_at(record, 12)?;
         if table_offset.checked_add(table_len as u64)? > file_len {
-            return None;
+            continue;
         }
-        return read_name_table(reader, table_offset, table_len);
+        if tag == b"name".as_slice() {
+            name_table = Some((table_offset, table_len));
+        } else if tag == b"OS/2".as_slice() {
+            serif = read_os2_serif(reader, file_len, table_offset, table_len);
+        }
     }
-    None
+    let (table_offset, table_len) = name_table?;
+    let (family, style) = read_name_table(reader, table_offset, table_len)?;
+    Some((family, style, serif))
 }
 
-/// Every face in `reader` as `(index, family, style)`. Damaged data yields nothing, never a panic.
+/// Every face in `reader` as `(index, family, style, serif)`. Damaged data yields nothing, never a
+/// panic.
 #[cfg(not(target_arch = "wasm32"))]
-fn faces_in<R: Read + Seek>(reader: &mut R, file_len: u64) -> Vec<(u32, String, String)> {
-    let mut out: Vec<(u32, String, String)> = Vec::new();
+fn faces_in<R: Read + Seek>(reader: &mut R, file_len: u64) -> Vec<(u32, String, String, bool)> {
+    let mut out: Vec<(u32, String, String, bool)> = Vec::new();
     if file_len < 12 {
         return out;
     }
@@ -330,21 +359,21 @@ fn faces_in<R: Read + Seek>(reader: &mut R, file_len: u64) -> Vec<(u32, String, 
         let Some(offsets) = read_at(reader, 12, offsets_len) else { return out };
         for index in 0..num_fonts {
             let Some(offset) = u32_at(&offsets, index as usize * 4) else { continue };
-            if let Some((family, style)) = face_names(reader, file_len, offset as u64) {
-                out.push((index, family, style));
+            if let Some((family, style, serif)) = face_names(reader, file_len, offset as u64) {
+                out.push((index, family, style, serif));
             }
         }
         return out;
     }
-    if let Some((family, style)) = face_names(reader, file_len, 0) {
-        out.push((0, family, style));
+    if let Some((family, style, serif)) = face_names(reader, file_len, 0) {
+        out.push((0, family, style, serif));
     }
     out
 }
 
-/// Every face in `path` as `(index, family, style)`, read from the file's metadata only.
+/// Every face in `path` as `(index, family, style, serif)`, read from the file's metadata only.
 #[cfg(not(target_arch = "wasm32"))]
-fn file_faces(path: &Path) -> Vec<(u32, String, String)> {
+fn file_faces(path: &Path) -> Vec<(u32, String, String, bool)> {
     let Ok(mut file) = std::fs::File::open(path) else { return Vec::new() };
     let Ok(file_len) = file.metadata().map(|metadata| metadata.len()) else { return Vec::new() };
     faces_in(&mut file, file_len)
@@ -364,8 +393,8 @@ fn scan_file(path: &Path, out: &mut Vec<Face>) {
     if !is_font_path(path) {
         return;
     }
-    for (index, family, style) in file_faces(path) {
-        out.push(Face { family, path: path.to_path_buf(), index, weight: style_weight(&style), italic: style_italic(&style) });
+    for (index, family, style, serif) in file_faces(path) {
+        out.push(Face { family, path: path.to_path_buf(), index, weight: style_weight(&style), italic: style_italic(&style), serif });
     }
 }
 
@@ -584,15 +613,26 @@ fn face_key(face: &Face) -> String {
     format!("fnt-src:{}:{}", face.path.display(), face.index)
 }
 
-/// Bind one installed family's faces into `fonts` under `family` (the name the workbook uses), one
-/// egui family per cell role, and return the
+/// The script fallback keys a bound family carries: `sans` for upright faces and `serif` for faces
+/// whose panose says serif. Keys must already have data in `fonts.font_data` (see
+/// `theme::font_definitions_with_bound`).
+#[derive(Clone, Debug, Default)]
+pub struct ScriptFallbacks {
+    pub sans: Vec<String>,
+    pub serif: Vec<String>,
+}
+
+/// Bind one installed family's faces into `fonts`, one egui family per cell role, and return the
 /// role keys that are now bound. A role with no exact face chains to the family's regular face, so
 /// no role is ever left pointing at missing data (egui panics on that). A family with no faces
 /// binds nothing.
 ///
-/// Each role's chain ends with egui's default proportional fonts, so glyphs the installed font
-/// lacks (emoji, a stray script) still render.
-pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face]) -> Vec<String> {
+/// Each role's chain ends with the script fallbacks for its face (`fallback.serif` for a serif
+/// face, otherwise `fallback.sans`), then egui's default proportional fonts. The script keys must
+/// be explicit: at this point `FontFamily::Proportional` may still be egui's bundled fonts, which
+/// cover Latin and emoji only — a Latin-only family such as DejaVu Sans would otherwise show tofu
+/// for CJK (#1231).
+pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face], fallback: &ScriptFallbacks) -> Vec<String> {
     if faces.is_empty() {
         return Vec::new();
     }
@@ -600,6 +640,7 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
     let mut bound: Vec<String> = Vec::new();
     for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
         let Some(primary) = pick_face(faces, bold, italic) else { continue };
+        let script = if primary.serif { &fallback.serif } else { &fallback.sans };
         let mut chain: Vec<String> = Vec::new();
         for face in [Some(primary), pick_face(faces, false, false)] {
             let Some(face) = face else { continue };
@@ -620,7 +661,10 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
         if chain.is_empty() {
             continue;
         }
+        chain.extend(script.iter().cloned());
         chain.extend(base.iter().cloned());
+        // A key without data would make egui panic when it builds the atlas.
+        chain.retain(|k| fonts.font_data.contains_key(k));
         let role = role_key(family, bold, italic);
         fonts.families.insert(egui::FontFamily::Name(role.clone().into()), chain);
         bound.push(role);
@@ -628,9 +672,9 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
     bound
 }
 
-/// Bind every installed face of `family`, found by any of its names (see [`bind_faces`]).
-pub fn bind_family(fonts: &mut egui::FontDefinitions, family: &str) -> Vec<String> {
-    bind_faces(fonts, family, &faces_of(family))
+/// Bind every installed face of `family` (see [`bind_faces`]).
+pub fn bind_family(fonts: &mut egui::FontDefinitions, family: &str, fallback: &ScriptFallbacks) -> Vec<String> {
+    bind_faces(fonts, family, &faces_of(family), fallback)
 }
 
 /// The role families currently bound to font data. `cell_family` consults this, so it never names a
@@ -706,7 +750,7 @@ mod tests {
     fn faces_in_reads_ttf_name_table() {
         let font = epaint_default_fonts::UBUNTU_LIGHT;
         let faces = faces_in(&mut std::io::Cursor::new(font), font.len() as u64);
-        assert_eq!(faces, vec![(0, "Ubuntu".into(), "Light".into())]);
+        assert_eq!(faces, vec![(0, "Ubuntu".into(), "Light".into(), false)]);
     }
 
     /// Wrap one TTF twice in a TTC. Table offsets in a collection are relative to the TTC start,
@@ -741,8 +785,8 @@ mod tests {
         let ttc = ttc_with_two_faces(epaint_default_fonts::UBUNTU_LIGHT);
         let faces = faces_in(&mut std::io::Cursor::new(&ttc), ttc.len() as u64);
         assert_eq!(faces.len(), 2);
-        assert_eq!(faces[0], (0, "Ubuntu".into(), "Light".into()));
-        assert_eq!(faces[1], (1, "Ubuntu".into(), "Light".into()));
+        assert_eq!(faces[0], (0, "Ubuntu".into(), "Light".into(), false));
+        assert_eq!(faces[1], (1, "Ubuntu".into(), "Light".into(), false));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -846,17 +890,68 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("Ubuntu-Light.ttf");
         std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
-        let face = Face { family: "Ubuntu".into(), names: vec!["Ubuntu".into()], path, index: 0, weight: 300.0, italic: false };
+        let face = Face { family: "Ubuntu".into(), names: vec!["Ubuntu".into()], path, index: 0, weight: 300.0, italic: false, serif: false };
 
         let mut fonts = egui::FontDefinitions::default();
-        let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face));
+        let fallback = ScriptFallbacks::default();
+        let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face), &fallback);
         assert_eq!(bound.len(), 4, "regular, bold, italic and bold-italic roles");
         for key in &bound {
             let chain = fonts.families.get(&egui::FontFamily::Name(key.as_str().into())).expect("role family");
             assert!(chain.iter().all(|k| fonts.font_data.contains_key(k)), "every chained key has data");
         }
         // A family with no faces binds nothing and never touches the map.
-        assert!(bind_faces(&mut fonts, "No Such Font", &[]).is_empty());
+        assert!(bind_faces(&mut fonts, "No Such Font", &[], &fallback).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Latin-only family such as DejaVu Sans must keep the CJK/Thai/... fallback keys in its
+    /// chain; without them a Chinese cell in DejaVu Sans shows tofu (#1231).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_bound_family_carries_its_sans_script_fallbacks() {
+        let dir = std::env::temp_dir().join(format!("gridcraft-fonts-sans-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("Ubuntu-Light.ttf");
+        std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
+        let face = Face { family: "Ubuntu".into(), path, index: 0, weight: 300.0, italic: false, serif: false };
+
+        let mut fonts = egui::FontDefinitions::default();
+        let data = || std::sync::Arc::new(egui::FontData::from_owned(epaint_default_fonts::UBUNTU_LIGHT.to_vec()));
+        fonts.font_data.insert("sys-cjk-han-zh".into(), data());
+        fonts.font_data.insert("sys-cjk-han-zh-serif".into(), data());
+        let fallback = ScriptFallbacks { sans: vec!["sys-cjk-han-zh".into()], serif: vec!["sys-cjk-han-zh-serif".into()] };
+        let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face), &fallback);
+        for key in &bound {
+            let chain = fonts.families.get(&egui::FontFamily::Name(key.as_str().into())).expect("role family");
+            assert!(chain.contains(&"sys-cjk-han-zh".to_string()), "sans face keeps the sans fallback");
+            assert!(!chain.contains(&"sys-cjk-han-zh-serif".to_string()), "sans face does not pull the serif fallback");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_serif_face_uses_the_serif_fallbacks() {
+        let dir = std::env::temp_dir().join(format!("gridcraft-fonts-serif-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("Ubuntu-Light.ttf");
+        std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
+        let face = Face { family: "Ubuntu".into(), path, index: 0, weight: 300.0, italic: false, serif: true };
+
+        let mut fonts = egui::FontDefinitions::default();
+        let data = || std::sync::Arc::new(egui::FontData::from_owned(epaint_default_fonts::UBUNTU_LIGHT.to_vec()));
+        fonts.font_data.insert("sys-cjk-han-zh".into(), data());
+        fonts.font_data.insert("sys-cjk-han-zh-serif".into(), data());
+        let fallback = ScriptFallbacks { sans: vec!["sys-cjk-han-zh".into()], serif: vec!["sys-cjk-han-zh-serif".into()] };
+        let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face), &fallback);
+        for key in &bound {
+            let chain = fonts.families.get(&egui::FontFamily::Name(key.as_str().into())).expect("role family");
+            assert!(chain.contains(&"sys-cjk-han-zh-serif".to_string()), "serif face keeps the serif fallback");
+            assert!(!chain.contains(&"sys-cjk-han-zh".to_string()), "serif face does not pull the sans fallback");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
