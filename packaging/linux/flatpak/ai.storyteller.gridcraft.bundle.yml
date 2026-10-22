@@ -11,6 +11,8 @@
 #
 # ai.storyteller.gridcraft.yml (same directory) is the from-source manifest for Flathub. Keep
 # runtime, runtime-version, sdk and finish-args identical in both (packaging-lint checks this).
+# The fontconfig module installs /app/etc/fonts/local.conf and two conf.d snippets; the script
+# copies packaging/linux/flatpak/fontconfig/ next to the manifest in $WORK.
 id: ai.storyteller.gridcraft
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
@@ -33,6 +35,18 @@ finish-args:
   # the sandbox; `flatpak override --user --share=network ai.storyteller.gridcraft` exposes it to
   # host agents) and home/host filesystem access.
 modules:
+  # Font configuration only; the faces themselves come from the runtime or the host
+  # (/run/host/fonts). See fontconfig/70-noto-cjk.conf.
+  - name: fontconfig
+    buildsystem: simple
+    build-commands:
+      - install -pDm644 fonts.conf /app/etc/fonts/local.conf
+      - install -pDm644 65-lang.conf 70-noto-cjk.conf 75-noto-color-emoji.conf -t /app/etc/fonts/conf.d/
+      - fc-cache -fsv || true
+    sources:
+      - type: dir
+        path: fontconfig
+
   - name: gridcraft
     buildsystem: simple
     build-commands:

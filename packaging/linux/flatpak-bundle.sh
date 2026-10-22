@@ -51,6 +51,8 @@ mkdir -p "$WORK/stage"
 tar -xzf "$TARBALL" -C "$WORK/stage" --strip-components=1
 [[ -x "$WORK/stage/bin/gridcraft" ]] || { echo "error: $TARBALL has no bin/gridcraft" >&2; exit 1; }
 cp "$HERE/flatpak/$APP_ID.bundle.yml" "$WORK/$APP_ID.yml"
+# The manifest is copied to $WORK, so its `path: fontconfig` source resolves there too.
+cp -R "$HERE/flatpak/fontconfig" "$WORK/fontconfig"
 
 flatpak remote-add --user --if-not-exists flathub "$FLATHUB"
 # --disable-rofiles-fuse: no FUSE in containers and CI runners.

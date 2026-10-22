@@ -10,6 +10,8 @@
 # For Flathub, replace the `dir` source with a `git` source pinned to a release tag and commit.
 # The single-file .flatpak attached to each release comes from ai.storyteller.gridcraft.bundle.yml,
 # which repackages the prebuilt release binaries. Keep runtime-version and finish-args identical.
+# The fontconfig module installs /app/etc/fonts/local.conf and two conf.d snippets; CJK faces
+# come from the host (/run/host/fonts), the emoji family from the runtime's 45/60-generic.
 id: ai.storyteller.gridcraft
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
@@ -36,6 +38,18 @@ finish-args:
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
 modules:
+  # Font configuration only; the faces themselves come from the runtime or the host
+  # (/run/host/fonts). See fontconfig/70-noto-cjk.conf.
+  - name: fontconfig
+    buildsystem: simple
+    build-commands:
+      - install -pDm644 fonts.conf /app/etc/fonts/local.conf
+      - install -pDm644 65-lang.conf 70-noto-cjk.conf 75-noto-color-emoji.conf -t /app/etc/fonts/conf.d/
+      - fc-cache -fsv || true
+    sources:
+      - type: dir
+        path: fontconfig
+
   - name: gridcraft
     buildsystem: simple
     build-options:
