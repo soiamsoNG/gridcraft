@@ -273,9 +273,12 @@ pub struct SheetApp {
     /// The (doc uid, revision) `fonts_bound` was computed for, so the style table is walked only
     /// when the workbook changes.
     fonts_seen: (u64, u64),
-    /// Set while a font-set change is pending activation: skip this frame's paint, like the
-    /// startup `fonts_ready` gate (egui applies new definitions at the next pass).
+    /// Set while a font-set change is pending activation. The next logic pass publishes
+    /// `pending_bound` once egui is using the new definitions.
     fonts_rebind: bool,
+    /// Role families of the font set waiting for egui to activate it. Publishing them before
+    /// activation would let `cell_family` name families the current pass has not installed yet.
+    pending_bound: Option<Vec<String>>,
     /// Han face order the installed fonts were built with; a language switch rebuilds the fonts
     /// only when it changes this (see `theme::HanOrder`).
     fonts_han: Option<theme::HanOrder>,
@@ -338,6 +341,7 @@ impl SheetApp {
             fonts_bound: Vec::new(),
             fonts_seen: (0, 0),
             fonts_rebind: false,
+            pending_bound: None,
             fonts_han: None,
             effective_dark: false,
             desktop_theme: desktop_theme::DesktopTheme::default(),
@@ -1184,23 +1188,31 @@ impl SheetApp {
                 // The rebuilt set has no workbook fonts yet: bind them again once it is active.
                 self.fonts_bound.clear();
                 self.fonts_seen = (0, 0);
+                self.pending_bound = None;
                 self.fonts_han = Some(theme::HanOrder::of(self.ui.language));
                 ctx.request_repaint();
             }
         } else if self.fonts_rebind {
-            // A font-set change made last frame is active now.
+            // The font set made last frame is active now: publish the roles it bound. Until this
+            // point the previous set stays advertised, so the frame that requested the change can
+            // still paint with the fonts egui actually has.
+            if let Some(bound) = self.pending_bound.take() {
+                crate::fonts::set_bound(bound);
+            }
             self.fonts_rebind = false;
         } else if fonts::scan_done() {
-            // Bind the workbook's installed fonts once the background scan has finished. Adding
-            // fonts re-applies the font set, which egui activates at the next pass, so skip this
-            // frame's paint (same one-frame cost as startup). Only when the workbook changed.
+            // Bind the workbook's installed fonts once the background scan has finished. egui
+            // activates the new set at the next pass, so the current frame keeps painting with the
+            // old set and `pending_bound` is published by the branch above on the next pass.
             let seen = self.session.active().map(|d| (d.uid, d.revision)).unwrap_or((0, 0));
             if seen != self.fonts_seen {
                 let used = self.used_fonts();
                 self.fonts_seen = seen;
                 if used != self.fonts_bound {
-                    ctx.set_fonts(theme::font_definitions_with(self.ui.language, &used));
+                    let (fonts, bound) = theme::font_definitions_with_bound(self.ui.language, &used);
+                    ctx.set_fonts(fonts);
                     self.fonts_bound = used;
+                    self.pending_bound = Some(bound);
                     self.fonts_rebind = true;
                     ctx.request_repaint();
                 }
@@ -1284,7 +1296,7 @@ impl SheetApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll_printing(&ctx);
-        if !self.fonts_ready || self.fonts_rebind {
+        if !self.fonts_ready {
             ctx.request_repaint();
             return;
         }

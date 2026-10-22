@@ -626,6 +626,15 @@ pub fn font_definitions_for_language(language: crate::i18n::Language) -> FontDef
 /// installed, so cells set in them render with them; the rest fall back to the roles. The bound
 /// families are recorded in [`crate::fonts`] so [`cell_family`] only names a family egui has.
 pub fn font_definitions_with(language: crate::i18n::Language, used: &[String]) -> FontDefinitions {
+    let (fonts, bound) = font_definitions_with_bound(language, used);
+    crate::fonts::set_bound(bound);
+    fonts
+}
+
+/// Builds the font set and returns the role families it bound, without publishing them to
+/// [`crate::fonts`]. Used when egui will activate the set on its next pass: publishing the roles
+/// now would let [`cell_family`] name families the current pass has not installed yet.
+pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[String]) -> (FontDefinitions, Vec<String>) {
     let mut fonts = FontDefinitions::default();
     let base_prop: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let base_mono: Vec<String> = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
@@ -682,8 +691,7 @@ pub fn font_definitions_with(language: crate::i18n::Language, used: &[String]) -
     drop_unparseable_fonts(&mut fonts);
     // Only families egui still has data for count as bound (a dropped face can empty a chain).
     bound.retain(|f| fonts.families.get(&FontFamily::Name(f.as_str().into())).is_some_and(|c| !c.is_empty()));
-    crate::fonts::set_bound(bound);
-    fonts
+    (fonts, bound)
 }
 
 /// Loads the system non-Latin fallback faces (one file per script family) and returns their keys so
