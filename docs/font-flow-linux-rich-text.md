@@ -1,40 +1,28 @@
-# Font discovery, fallback, and script routing for Linux
+# Font discovery, fallback, and rich text on Linux
 
 Status: design note and implementation map.
 
 - Repository: `storytold/gridcraft`
 - Branch: `fix/linux-fontconfig`
-- Local HEAD: `09b0d1d perf(ui): reuse bound font data across rebinds (#1231)`
+- HEAD at the start of this rewrite: `775a14a docs: add Linux font flow design note (#1231)`
 - Related issue: `#1231`
+- Current PR: `#1972` (open; remote branch is older than this local branch)
 
 This document has three layers:
 
 1. **Implemented** — what the code does today.
-2. **Target** — the proposed font-catalog and script-run architecture.
+2. **Target** — the proposed font-catalog, rich-text, and shaping architecture.
 3. **Not implemented** — known gaps, API limitations, and migration work.
 
 Do not read a "Target" section as current behavior.
 
----
-
-## 1. Purpose and scope
-
-GridCraft must:
-
-- show every installed font in the font picker;
-- render workbook text in the chosen font;
-- render CJK, Thai, Hebrew, symbols, and emoji without tofu;
-- work on native Linux, Flatpak, macOS, Windows, and wasm;
-- never panic because a font file is damaged or a family is not bound;
-- avoid rescanning the filesystem or spawning fontconfig processes on every frame.
-
-This document describes how fonts are discovered, matched, bound to egui, and
-selected per script. It also records the exact `fontconfig` 0.11 API gaps that
-must be closed, or worked around, before the target architecture can be built.
+Rich text is part of the target architecture, not an appendix. It changes the
+cell data model, the layout pipeline, font binding, editing, and file I/O. The
+font-discovery work is a prerequisite, not a replacement for it.
 
 ---
 
-## 2. Executive summary
+## 1. Summary
 
 Current Linux implementation:
 
@@ -53,21 +41,55 @@ Target implementation:
 
 - Fontconfig is called once at startup to build an in-memory `FontCatalog`.
 - The catalog records, per face, which Unicode scripts it covers.
-- Normal text layout splits text into script runs and selects a covering face
-  from memory.
+- Cell text can be plain or rich: a list of text runs with optional character
+  styles.
+- Layout resolves each run's style, itemizes by script and shaping key, shapes
+  contiguous runs, and paints color/underline spans separately.
 - egui performs per-glyph fallback inside each run.
 - Rare characters are looked up by character, cached, and then reused.
 - No per-frame fontconfig calls and no per-character `font_match`.
 
-Main unresolved issue:
+Main unresolved issues:
 
 - First use of a large, previously unbound family can still freeze the UI for
   roughly 1–2 seconds because egui rebuilds its font atlas and glyph cache. That
-  is separate from font discovery; see §10.
+  is separate from font discovery; see §8.
+- Full rich text requires separating shaping attributes from paint attributes.
+  `LayoutJob`/`LayoutSection` currently couple them.
+- `fontconfig` 0.11 does not expose direct charset introspection; coverage sets
+  or upstream API additions are required.
 
 ---
 
-## 3. Glossary
+## 2. Goals, non-goals, and terminology
+
+### 2.1 Goals
+
+GridCraft must:
+
+- show every installed font in the font picker;
+- render workbook text in the chosen font;
+- render CJK, Thai, Hebrew, symbols, and emoji without tofu;
+- preserve per-character formatting in cell text;
+- work on native Linux, Flatpak, macOS, Windows, and wasm;
+- never panic because a font file is damaged or a family is not bound;
+- avoid rescanning the filesystem or spawning fontconfig processes on every
+  frame.
+
+### 2.2 Non-goals
+
+This document does not define:
+
+- a bundled CJK font set;
+- a new font file format;
+- full CSS-style text layout;
+- arbitrary per-character OpenType feature editing;
+- a replacement for the platform text stack on macOS/Windows.
+
+Fonts remain external assets. GridCraft must not bundle fonts outside the
+`storytold/craft-fonts` policy.
+
+### 2.3 Terminology
 
 | Term | Meaning |
 |---|---|
@@ -75,16 +97,312 @@ Main unresolved issue:
 | Family | Typographic family name, e.g. `Noto Sans CJK SC`. |
 | Role | GridCraft's internal font slot: `ui`, `ui-bold`, `cell`, `cell-bold`, `cell-italic`, `cell-bold-italic`, `serif`, `mono`. |
 | Script | Unicode script class: Latin, Han, Japanese, Korean, Thai, Hebrew, Symbols, Common. |
-| Run | A contiguous span of text with the same script class. |
-| Fallback | A font used when the primary font has no glyph for a character. |
-| Catalog | In-memory list of installed faces with family, style, weight, italic, path, index, and script coverage. |
-| Coverage | Whether a face has glyphs for all sample characters of a script run. |
+| Rich text | A cell text value made of runs, where each run may override the cell's character style. |
+| Text run | A contiguous byte range with the same effective character style. Adjacent equal runs are merged. |
+| Shaping key | The properties that affect glyph selection and positioning: face, size, weight, italic, features, language, script. |
+| Paint span | Properties that affect drawing but not shaping: color, underline, background, border. |
+| Coverage | Whether a face has glyphs for the sample characters of a script run. |
 | `font_match` | Fontconfig best-match operation. It always returns a closest match, even if the font does not cover the requested charset. |
 | `list_fonts` | Fontconfig filtered enumeration. With a charset pattern it returns only candidates matching that pattern. |
 
 ---
 
-## 4. Problem statement
+## 3. Current implementation
+
+This section describes HEAD `09b0d1d` plus the documentation commit `775a14a`.
+Line numbers refer to that code state.
+
+### 3.1 Startup and scan
+
+Entry point:
+
+- `crates/ui-egui/src/lib.rs:348` `setup_context_for_language()`
+- `crates/ui-egui/src/lib.rs:349` `fonts::start_scan()`
+
+`start_scan()` (`crates/ui-egui/src/fonts.rs:460`) starts a named background
+thread (`font-scan`) once. The thread calls `catalog()`.
+
+`catalog()` (`crates/ui-egui/src/fonts.rs:449`) is a `OnceLock<Vec<Face>>`.
+It blocks only the first caller; the background thread normally does that work.
+
+`scan_installed()` (`crates/ui-egui/src/fonts.rs:432`):
+
+1. On Linux, call `fontconfig_files()`.
+2. If it returns files, scan them with `scan_files()`.
+3. If the result is non-empty, use it.
+4. Otherwise fall back to `scan_dirs(system_font_dirs())`.
+
+`fontconfig_files()` (`crates/ui-egui/src/fonts.rs:399`) runs:
+
+```text
+fc-list -f "%{file}\n"
+```
+
+It parses bytes, strips `\r`, filters existing files with supported extensions
+(`ttf`, `otf`, `ttc`, `otc`), and deduplicates paths. It does not assume UTF-8.
+
+`scan_dirs()` (`crates/ui-egui/src/fonts.rs:373`) recursively walks platform
+font folders, canonicalizes directories to avoid symlink loops, and calls
+`scan_file()` for each candidate.
+
+### 3.2 Metadata-only face scanning
+
+`scan_file()` (`crates/ui-egui/src/fonts.rs:347`) does **not** read the whole
+font. It calls `file_faces()` (`:331`), which calls `faces_in()` (`:298`).
+
+`faces_in()`:
+
+- reads the 12-byte SFNT/TTC header;
+- detects `ttcf` and iterates TTC face offsets;
+- for each face, calls `face_names()`;
+- `face_names()` validates the SFNT version, reads the table directory, finds the
+  `name` table, and calls `read_name_table()`;
+- `read_name_table()` reads the name records and string storage;
+- `select_name()` prefers Windows Unicode English, then other Windows Unicode,
+  then Unicode, Macintosh, and finally any remaining record;
+- name IDs `16`/`1` are family; `17`/`2` are style.
+
+Bounds:
+
+- `MAX_TTC_FACES = 1024`
+- `MAX_TABLE_RECORDS = 4096`
+- `MAX_NAME_RECORDS = 4096`
+- `MAX_NAME_BYTES = 8192`
+
+All offsets and lengths use checked arithmetic. A damaged file yields no faces,
+not a panic.
+
+There is no file-size limit for the metadata scan. The old 64 MiB
+`MAX_FONT_FILE` limit was removed because metadata reads are bounded and huge
+CJK fonts are legitimate.
+
+### 3.3 Face catalog and family list
+
+`Face` (`crates/ui-egui/src/fonts.rs:47`) contains:
+
+```rust
+pub struct Face {
+    pub family: String,
+    pub path: PathBuf,
+    pub index: u32,
+    pub weight: f32,
+    pub italic: bool,
+}
+```
+
+Style names are converted to weight and italic flags by `style_weight()` and
+`style_italic()`.
+
+`families()` (`:507`) builds the font picker list:
+
+- standard `ribbon::FONTS` names first;
+- then installed family names, A–Z, case-insensitively deduplicated.
+
+It never blocks: if the scan is not done, it returns only the standard names.
+
+### 3.4 Font roles and `fc-match`
+
+`theme.rs:251 candidates(role)` produces candidate `(path, index)` pairs.
+
+On Linux, fontconfig candidates are added first:
+
+```rust
+#[cfg(target_os = "linux")]
+v.extend(linux_fontconfig_candidates(role));
+```
+
+The remaining hard-coded paths are a fallback for systems where fontconfig is
+missing or returns nothing usable.
+
+`linux_fontconfig_candidates()` (`theme.rs:369`) maps roles to patterns:
+
+| Role | Patterns, in order |
+|---|---|
+| `ui` | Cantarell, Liberation Sans, DejaVu Sans, Noto Sans, sans-serif |
+| `ui-bold` | same with `:weight=bold` |
+| `cell` | Calibri, Carlito, Arial, Liberation Sans, DejaVu Sans, sans-serif |
+| `cell-bold` | same with `:weight=bold` |
+| `cell-italic` | same with `:slant=italic` |
+| `cell-bold-italic` | same with `:weight=bold:slant=italic` |
+| `serif` | Liberation Serif, DejaVu Serif, serif |
+| `mono` | Liberation Mono, DejaVu Sans Mono, Noto Sans Mono, monospace |
+
+`fc_match_candidates()` (`theme.rs:396`) calls `fc_match()` for each pattern,
+drops duplicate `(path, index)` pairs, and returns the candidates.
+
+`fc_match()` (`theme.rs:617`) first checks the thread-local `FC_MATCH_CACHE`.
+On a miss it runs:
+
+```text
+fc-match -f "%{file}\n%{index}\n" <pattern>
+```
+
+Results, including failures, are cached for the rest of the process. There is no
+invalidation: fonts installed while GridCraft is running are picked up only after
+restart.
+
+The fontconfig `index` is masked with `& 0xFFFF`. Fontconfig stores a named
+instance in the high 16 bits and the face index in the low 16 bits. egui's
+`FontData::index` is a face index, not a named-instance selector.
+
+### 3.5 Font definitions and script fallback
+
+`font_definitions_with_bound()` (`theme.rs:448`) builds the egui font set and
+returns `(FontDefinitions, Vec<String>)`.
+
+It:
+
+1. starts from egui's defaults;
+2. loads script fallback faces via `load_fallback()`;
+3. for each role (`ui`, `ui-bold`, `cell`, `cell-bold`, `cell-italic`,
+   `cell-bold-italic`, `serif`, `mono`):
+   - resolves candidates;
+   - loads the first parseable face with `try_load()`;
+   - inserts it as `sys-{role}`;
+   - falls back to `sys-ui` or `sys-cell` for missing bold/italic roles;
+   - extends the chain with egui's base proportional/monospace chain and the
+     script fallback keys;
+4. binds installed workbook families with `bind_family()`;
+5. inserts the cell face before script fallback faces in interface chains;
+6. sets `FontFamily::Proportional` to the UI chain;
+7. drops unparseable faces with `drop_unparseable_fonts()`.
+
+`font_definitions_with()` (`theme.rs:439`) is the non-deferred wrapper: it calls
+`font_definitions_with_bound()` and immediately publishes `set_bound(bound)`.
+
+`font_definitions_with_bound()` is used when egui will activate the new set on
+the next pass. Publishing the roles immediately would let `cell_family()` name a
+family that the current pass has not installed yet.
+
+`fallback_faces()` (`theme.rs:541`) returns, in chain order:
+
+1. `sys-cjk-han-zh` or `sys-cjk-han-ja` depending on `HanOrder`
+2. the other Han face
+3. `sys-cjk-hangul`
+4. `sys-thai`
+5. `sys-hebrew`
+6. `sys-symbols`
+7. `sys-symbols-2`
+
+Each script function adds fontconfig candidates first on Linux:
+
+- Japanese: `sans-serif:lang=ja`, `serif:lang=ja`
+- Simplified Chinese: `sans-serif:lang=zh-cn`, `serif:lang=zh-cn`
+- Korean: `sans-serif:lang=ko`, `serif:lang=ko`
+- Thai: `sans-serif:lang=th`
+- Hebrew: `sans-serif:lang=he`
+- Symbols: DejaVu Sans, Symbola, Noto Sans Symbols 2, Noto Sans Symbols
+- Symbols 2: Noto Sans Symbols 2, Symbola, Noto Sans Symbols
+
+Then it appends the hard-coded paths in `LINUX_CJK_FALLBACK_DIRS`
+(`theme.rs:564`) and the platform-specific paths.
+
+`load_fallback()` (`theme.rs:509`) loads at most one file per script key and
+records loaded paths. It currently deduplicates by **path only** and uses
+`break` when a path is already loaded. That is correct for a region-merged TTC
+that covers several scripts, but wrong when the same TTC contains different
+faces for different scripts: the later script never tries another face. This is
+a known issue.
+
+### 3.6 Binding workbook fonts
+
+`used_fonts()` (`lib.rs:356`) collects the families the workbook actually uses:
+
+- cell styles;
+- theme heading/body fonts;
+- shape text fonts.
+
+`installed_among()` (`fonts.rs:488`) filters that list against the catalog,
+sorts it, and deduplicates it.
+
+For each installed family, `bind_family()` calls `bind_faces()`.
+
+`bind_faces()` (`fonts.rs:557`):
+
+- returns no roles for an empty face list;
+- for each `(bold, italic)` combination, calls `pick_face()`;
+- chains the primary face with the family's regular face;
+- reads the whole file with `std::fs::read()` if the key is not already present;
+- inserts `FontData` with the face index;
+- extends the chain with egui's base proportional chain;
+- inserts a `FontFamily::Name("fnt:{family}:{b|n}{i|n}")`;
+- returns the bound role keys.
+
+`pick_face()` (`fonts.rs:529`) falls back to the regular face when an exact
+bold/italic face is missing. That means an italic role can be bound to a regular
+face; the italic button may then appear to do nothing for fonts without an
+italic face. This is a known limitation.
+
+`bind_faces()` avoids duplicate reads by checking
+`fonts.font_data.contains_key(&key)` before `std::fs::read()`.
+
+### 3.7 Rebind and flicker avoidance
+
+`lib.rs` fields:
+
+- `fonts_rebind: bool`
+- `pending_bound: Option<Vec<String>>`
+
+Flow (`lib.rs:1042`–`1079`):
+
+1. If `!fonts_ready`, rebuild the base font set, clear `pending_bound`, and wait
+   for the next pass.
+2. Else if `fonts_rebind`, egui has activated the set made on the previous pass:
+   publish `pending_bound` with `fonts::set_bound()`, clear the flag.
+3. Else if the scan is done and the workbook revision changed, compute
+   `used_fonts()`. If it differs from `fonts_bound`, build with
+   `font_definitions_with_bound()`, call `ctx.set_fonts()`, store
+   `pending_bound`, set `fonts_rebind`, and request a repaint.
+
+The UI no longer returns early solely because `fonts_rebind` is true. This
+removed the one-frame blank flash. First use of a large unbound family still
+costs the actual font-atlas rebuild.
+
+### 3.8 The current rich-text gap
+
+GridCraft cells currently have one character style per cell. There is no
+per-character text model.
+
+Evidence:
+
+- `crates/ui-egui/src/grid.rs:1215` and `:1320` lay out cell text with
+  `LayoutJob::simple`, which takes one font and one color.
+- `crates/ui-egui/src/formula_bar.rs:266` builds sections only to color
+  formula-reference tokens; this is not a cell rich-text model.
+- XLSX shared strings are flattened to a single string:
+  - `crates/xlsx/src/sheet_read.rs:149`
+  - `crates/xlsx/src/sheet_read.rs:408`
+  - `xml::rich_text(...)` returns `String`, not runs.
+- There is no engine/model type that stores a cell's character runs, and no
+  editing operation that applies a style to a character range.
+
+Consequences:
+
+- a workbook with per-character formatting loses that formatting on import;
+- saving rewrites a single-run string, not the original `<r>` runs;
+- the UI cannot apply bold/italic/color to part of a cell;
+- the layout layer never has to reason about style boundaries, which is why the
+  current architecture looks simpler than it is.
+
+### 3.9 Current limitations
+
+| Limitation | Effect |
+|---|---|
+| `fc-match` for every role pattern | 52 subprocess calls on a cold rebuild; cached afterwards. |
+| `list_fonts`/`fc-list` subprocess | No direct fontconfig library access; extra process and parsing. |
+| First bind reads whole font | Large CJK font can read 56 MiB; cold page cache can take seconds. |
+| `pending_bound` solves flash, not atlas cost | First frame after a large new font can still freeze. |
+| `load_fallback` dedupes by path only | Same TTC with different faces for different scripts is not fully used. |
+| `try_load` checks parseability, not script coverage | `fc-match` substitute may be chosen even if it lacks the script. |
+| `families()` rebuilds the list on every call | Ribbon calls it per frame; potentially wasteful. |
+| Missing italic face binds regular | Italic button may look ineffective for fonts without an italic face. |
+| No cache invalidation | Fonts installed while running are not picked up until restart. |
+| Host/Flatpak fontconfig differs | Generic `serif`/`monospace`/Thai/Hebrew results can differ. |
+| No rich-text model | Per-character formatting is lost; XLSX runs are flattened. |
+
+---
+
+## 4. Constraints and failure modes
 
 ### 4.1 egui has no font discovery
 
@@ -145,280 +463,128 @@ Use one of:
 - `Pattern::sort_fonts(UnicodeCoverage::Trim)` plus explicit verification;
 - after exposing the missing APIs, `Pattern::charset()` + `CharSet::has_char`.
 
+### 4.5 epaint couples shaping and paint
+
+`LayoutSection` is delimited by `TextFormat`. `TextFormat` contains both shaping
+properties (font, size) and paint properties (color, underline, background).
+Changing only the color therefore splits the section and can discard kerning
+that would otherwise be available inside one shaping run.
+
+This is the central layout constraint for rich text:
+
+- per-character font changes work with sections;
+- per-character color changes also work visually, but may lose kerning at color
+  boundaries;
+- full quality requires shaping runs and paint spans to be independent.
+
+### 4.6 Large fonts and atlas rebuilds
+
+The first time a large unbound CJK family is used, GridCraft must:
+
+1. read the whole font file;
+2. add `FontData` to `FontDefinitions`;
+3. call `Context::set_fonts`;
+4. let egui rebuild the font atlas and glyph cache.
+
+Caching avoids repeated `fc-match` and repeated file reads, but it does not make
+the first atlas rebuild free. The remaining freeze is a layout/atlas problem,
+not a font-discovery problem.
+
+### 4.7 Invariants
+
+1. `cell_family()` only returns an egui family that has data.
+2. `FontData::index` is a face index, never a named-instance encoding.
+3. A failed font parse costs one fallback, never a panic.
+4. The UI thread never scans font directories.
+5. Normal layout never spawns `fc-match` per character.
+6. A rich-text run range is valid UTF-8 boundaries and never overlaps another
+   run.
+7. A paint span never changes glyph positions.
+
 ---
 
-## 5. Current implementation
+## 5. Target architecture
 
-This section describes HEAD `09b0d1d`.
-
-### 5.1 Startup and scan
-
-Entry point:
-
-- `crates/ui-egui/src/lib.rs:348` `setup_context_for_language()`
-- `crates/ui-egui/src/lib.rs:349` `fonts::start_scan()`
-
-`start_scan()` (`crates/ui-egui/src/fonts.rs:460`) starts a named background
-thread (`font-scan`) once. The thread calls `catalog()`.
-
-`catalog()` (`crates/ui-egui/src/fonts.rs:449`) is a `OnceLock<Vec<Face>>`.
-It blocks only the first caller; the background thread normally does that work.
-
-`scan_installed()` (`crates/ui-egui/src/fonts.rs:432`):
-
-1. On Linux, call `fontconfig_files()`.
-2. If it returns files, scan them with `scan_files()`.
-3. If the result is non-empty, use it.
-4. Otherwise fall back to `scan_dirs(system_font_dirs())`.
-
-`fontconfig_files()` (`crates/ui-egui/src/fonts.rs:399`) runs:
+### 5.1 Layers
 
 ```text
-fc-list -f "%{file}\n"
+CellText (plain or RichText)
+  → resolve_style: cell style + run overrides
+  → itemize: script + shaping key
+  → shape: one contiguous shaping run at a time
+  → paint spans: color/underline/background
+  → layout cache
+  → egui rendering
 ```
 
-It parses bytes, strips `\r`, filters existing files with supported extensions
-(`ttf`, `otf`, `ttc`, `otc`), and deduplicates paths. It does not assume UTF-8.
+Font discovery is upstream of this pipeline:
 
-`scan_dirs()` (`crates/ui-egui/src/fonts.rs:373`) recursively walks platform
-font folders, canonicalizes directories to avoid symlink loops, and calls
-`scan_file()` for each candidate.
+```text
+fontconfig / fc-list / directory scan
+  → FontCatalog
+  → role selection and script coverage
+  → shaping run fallback
+```
 
-### 5.2 Metadata-only face scanning
-
-`scan_file()` (`crates/ui-egui/src/fonts.rs:347`) does **not** read the whole
-font. It calls `file_faces()` (`:331`), which calls `faces_in()` (`:298`).
-
-`faces_in()`:
-
-- reads the 12-byte SFNT/TTC header;
-- detects `ttcf` and iterates TTC face offsets;
-- for each face, calls `face_names()`;
-- `face_names()` validates the SFNT version, reads the table directory, finds the
-  `name` table, and calls `read_name_table()`;
-- `read_name_table()` reads the name records and string storage;
-- `select_name()` prefers Windows Unicode English, then other Windows Unicode,
-  then Unicode, Macintosh, and finally any remaining record;
-- name IDs `16`/`1` are family; `17`/`2` are style.
-
-Bounds:
-
-- `MAX_TTC_FACES = 1024`
-- `MAX_TABLE_RECORDS = 4096`
-- `MAX_NAME_RECORDS = 4096`
-- `MAX_NAME_BYTES = 8192`
-
-All offsets and lengths use checked arithmetic. A damaged file yields no faces,
-not a panic.
-
-There is no file-size limit for the metadata scan. The old 64 MiB
-`MAX_FONT_FILE` limit was removed because metadata reads are bounded and huge
-CJK fonts are legitimate.
-
-### 5.3 Face catalog and family list
-
-`Face` (`crates/ui-egui/src/fonts.rs:47`) contains:
+### 5.2 Rich-text data model
 
 ```rust
-pub struct Face {
-    pub family: String,
-    pub path: PathBuf,
-    pub index: u32,
-    pub weight: f32,
-    pub italic: bool,
+pub enum CellText {
+    Plain(Arc<str>),
+    Rich(RichText),
+}
+
+pub struct RichText {
+    pub runs: Vec<TextRun>,
+}
+
+pub struct TextRun {
+    /// UTF-8 byte range in the cell's logical text.
+    pub range: Range<usize>,
+    /// None = inherit the cell style.
+    pub style: Option<CharStyle>,
+}
+
+pub struct CharStyle {
+    pub font: Option<String>,
+    pub size: Option<f32>,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<Underline>,
+    pub strike: Option<bool>,
+    pub color: Option<Color32>,
+    pub vert_align: Option<VertAlign>,
+    pub charset: Option<u32>,
+    pub scheme: Option<String>,
 }
 ```
 
-Style names are converted to weight and italic flags by `style_weight()` and
-`style_italic()`.
+Rules:
 
-`families()` (`:507`) builds the font picker list:
+- the cell style is the base;
+- the run style is an override;
+- resolve to an effective `CharStyle` before layout;
+- coalesce adjacent runs with equal effective styles;
+- reject or repair overlapping ranges;
+- empty runs are not stored;
+- ranges are byte ranges, not char indices, so selection and XLSX offsets stay
+  stable.
 
-- standard `ribbon::FONTS` names first;
-- then installed family names, A–Z, case-insensitively deduplicated.
+The exact field set should follow the XLSX `<rPr>` attributes that GridCraft
+supports. Unsupported attributes must either be preserved as raw XML or dropped
+with an explicit test.
 
-It never blocks: if the scan is not done, it returns only the standard names.
-
-### 5.4 Font roles and `fc-match`
-
-`theme.rs:251 candidates(role)` produces candidate `(path, index)` pairs.
-
-On Linux, fontconfig candidates are added first:
-
-```rust
-#[cfg(target_os = "linux")]
-v.extend(linux_fontconfig_candidates(role));
-```
-
-The remaining hard-coded paths are a fallback for systems where fontconfig is
-missing or returns nothing usable.
-
-`linux_fontconfig_candidates()` (`theme.rs:369`) maps roles to patterns:
-
-| Role | Patterns, in order |
-|---|---|
-| `ui` | Cantarell, Liberation Sans, DejaVu Sans, Noto Sans, sans-serif |
-| `ui-bold` | same with `:weight=bold` |
-| `cell` | Calibri, Carlito, Arial, Liberation Sans, DejaVu Sans, sans-serif |
-| `cell-bold` | same with `:weight=bold` |
-| `cell-italic` | same with `:slant=italic` |
-| `cell-bold-italic` | same with `:weight=bold:slant=italic` |
-| `serif` | Liberation Serif, DejaVu Serif, serif |
-| `mono` | Liberation Mono, DejaVu Sans Mono, Noto Sans Mono, monospace |
-
-`fc_match_candidates()` (`theme.rs:396`) calls `fc_match()` for each pattern,
-drops duplicate `(path, index)` pairs, and returns the candidates.
-
-`fc_match()` (`theme.rs:617`) first checks the thread-local `FC_MATCH_CACHE`.
-On a miss it runs:
+### 5.3 Style resolution
 
 ```text
-fc-match -f "%{file}\n%{index}\n" <pattern>
+effective_style(run) = merge(cell_style, run.style)
 ```
 
-Results, including failures, are cached for the rest of the process. There is no
-invalidation: fonts installed while GridCraft is running are picked up only after
-restart.
+Only effective style differences split shaping runs. A run with
+`color = red` and the same font as its neighbor is one shaping run with a paint
+span, not two shaping runs.
 
-The fontconfig `index` is masked with `& 0xFFFF`. Fontconfig stores a named
-instance in the high 16 bits and the face index in the low 16 bits. egui's
-`FontData::index` is a face index, not a named-instance selector.
-
-### 5.5 Font definitions
-
-`font_definitions_with_bound()` (`theme.rs:448`) builds the egui font set and
-returns `(FontDefinitions, Vec<String>)`.
-
-It:
-
-1. starts from egui's defaults;
-2. loads script fallback faces via `load_fallback()`;
-3. for each role (`ui`, `ui-bold`, `cell`, `cell-bold`, `cell-italic`,
-   `cell-bold-italic`, `serif`, `mono`):
-   - resolves candidates;
-   - loads the first parseable face with `try_load()`;
-   - inserts it as `sys-{role}`;
-   - falls back to `sys-ui` or `sys-cell` for missing bold/italic roles;
-   - extends the chain with egui's base proportional/monospace chain and the
-     script fallback keys;
-4. binds installed workbook families with `bind_family()`;
-5. inserts the cell face before script fallback faces in interface chains;
-6. sets `FontFamily::Proportional` to the UI chain;
-7. drops unparseable faces with `drop_unparseable_fonts()`.
-
-`font_definitions_with()` (`theme.rs:439`) is the non-deferred wrapper: it calls
-`font_definitions_with_bound()` and immediately publishes `set_bound(bound)`.
-
-`font_definitions_with_bound()` is used when egui will activate the new set on
-the next pass. Publishing the roles immediately would let `cell_family()` name a
-family that the current pass has not installed yet.
-
-### 5.6 Script fallback
-
-`fallback_faces()` (`theme.rs:541`) returns, in chain order:
-
-1. `sys-cjk-han-zh` or `sys-cjk-han-ja` depending on `HanOrder`
-2. the other Han face
-3. `sys-cjk-hangul`
-4. `sys-thai`
-5. `sys-hebrew`
-6. `sys-symbols`
-7. `sys-symbols-2`
-
-Each script function adds fontconfig candidates first on Linux:
-
-- Japanese: `sans-serif:lang=ja`, `serif:lang=ja`
-- Simplified Chinese: `sans-serif:lang=zh-cn`, `serif:lang=zh-cn`
-- Korean: `sans-serif:lang=ko`, `serif:lang=ko`
-- Thai: `sans-serif:lang=th`
-- Hebrew: `sans-serif:lang=he`
-- Symbols: DejaVu Sans, Symbola, Noto Sans Symbols 2, Noto Sans Symbols
-- Symbols 2: Noto Sans Symbols 2, Symbola, Noto Sans Symbols
-
-Then it appends the hard-coded paths in `LINUX_CJK_FALLBACK_DIRS`
-(`theme.rs:564`) and the platform-specific paths.
-
-`load_fallback()` (`theme.rs:509`) loads at most one file per script key and
-records loaded paths. It currently deduplicates by **path only** and uses
-`break` when a path is already loaded. That is correct for a region-merged TTC
-that covers several scripts, but wrong when the same TTC contains different
-faces for different scripts: the later script never tries another face. This is
-a known issue.
-
-### 5.7 Binding workbook fonts
-
-`used_fonts()` (`lib.rs:356`) collects the families the workbook actually uses:
-
-- cell styles;
-- theme heading/body fonts;
-- shape text fonts.
-
-`installed_among()` (`fonts.rs:488`) filters that list against the catalog,
-sorts it, and deduplicates it.
-
-For each installed family, `bind_family()` calls `bind_faces()`.
-
-`bind_faces()` (`fonts.rs:557`):
-
-- returns no roles for an empty face list;
-- for each `(bold, italic)` combination, calls `pick_face()`;
-- chains the primary face with the family's regular face;
-- reads the whole file with `std::fs::read()` if the key is not already present;
-- inserts `FontData` with the face index;
-- extends the chain with egui's base proportional chain;
-- inserts a `FontFamily::Name("fnt:{family}:{b|n}{i|n}")`;
-- returns the bound role keys.
-
-`pick_face()` (`fonts.rs:529`) falls back to the regular face when an exact
-bold/italic face is missing. That means an italic role can be bound to a regular
-face; the italic button may then appear to do nothing for fonts without an
-italic face. This is a known limitation.
-
-`bind_faces()` avoids duplicate reads by checking
-`fonts.font_data.contains_key(&key)` before `std::fs::read()`.
-
-### 5.8 Rebind and flicker avoidance
-
-`lib.rs` fields:
-
-- `fonts_rebind: bool`
-- `pending_bound: Option<Vec<String>>`
-
-Flow (`lib.rs:1042`–`1079`):
-
-1. If `!fonts_ready`, rebuild the base font set, clear `pending_bound`, and wait
-   for the next pass.
-2. Else if `fonts_rebind`, egui has activated the set made on the previous pass:
-   publish `pending_bound` with `fonts::set_bound()`, clear the flag.
-3. Else if the scan is done and the workbook revision changed, compute
-   `used_fonts()`. If it differs from `fonts_bound`, build with
-   `font_definitions_with_bound()`, call `ctx.set_fonts()`, store
-   `pending_bound`, set `fonts_rebind`, and request a repaint.
-
-The UI no longer returns early solely because `fonts_rebind` is true. This
-removed the one-frame blank flash. First use of a large unbound family still
-costs the actual font-atlas rebuild.
-
-### 5.9 Current limitations
-
-| Limitation | Effect |
-|---|---|
-| `fc-match` for every role pattern | 52 subprocess calls on a cold rebuild; cached afterwards. |
-| `list_fonts`/`fc-list` subprocess | No direct fontconfig library access; extra process and parsing. |
-| First bind reads whole font | Large CJK font can read 56 MiB; cold page cache can take seconds. |
-| `pending_bound` solves flash, not atlas cost | First frame after a large new font can still freeze. |
-| `load_fallback` dedupes by path only | Same TTC with different faces for different scripts is not fully used. |
-| `try_load` checks parseability, not script coverage | `fc-match` substitute may be chosen even if it lacks the script. |
-| `families()` rebuilds the list on every call | Ribbon calls it per frame; potentially wasteful. |
-| Missing italic face binds regular | Italic button may look ineffective for fonts without an italic face. |
-| No cache invalidation | Fonts installed while running are not picked up until restart. |
-| Host/Flatpak fontconfig differs | Generic `serif`/`monospace`/Thai/Hebrew results can differ. |
-
----
-
-## 6. Target architecture
-
-### 6.1 Data model
+### 5.4 Font catalog
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -461,11 +627,13 @@ Rules:
 - Do not store `fontconfig::Pattern`, `CharSet`, or `FontSet` in the catalog;
   they are `!Send`/`!Sync`.
 - `by_script` is sorted by preference, not by fontconfig order alone.
+- A catalog entry may be an explicit family used by a rich-text run; it must not
+  be limited to cell-level `used_fonts()`.
 
-### 6.2 Startup
+### 5.5 Startup and catalog build
 
 1. Create one `Fontconfig` handle per worker thread that needs it.
-2. Call `list_fonts` once with `ObjectSet` including:
+2. Call `list_fonts` once with an `ObjectSet` including:
    - `FC_FAMILY`
    - `FC_STYLE`
    - `FC_FILE`
@@ -493,171 +661,316 @@ Sample characters per script:
 | Hebrew | `א`, `ב` |
 | Symbols | `✓`, `★`, `→` |
 
-### 6.3 Text layout
+If fontconfig is unavailable, keep the current `fc-list`/directory fallback.
+
+### 5.6 Itemization: script and shaping key
 
 Do not query fontconfig per character.
 
 1. `split_runs(text)` classifies each `char`.
 2. `Common` characters attach to the previous run; if there is no previous run,
    attach to the next run; if the whole text is Common, classify as Latin.
-3. For each run, `font_for_script(script)` returns the best `FontEntry`.
-4. Add that face to the run's fallback chain.
-5. Hand the runs to egui:
-   - Option A: append the script face to the global fallback chain;
-   - Option B: use `LayoutJob` + `FontFamily::Name` for exact per-run families.
+3. Resolve each run's effective style.
+4. Split further when the shaping key changes:
 
-Start with A. Use B only when a single global chain cannot express the desired
-mixing.
+```text
+shaping key =
+  font face
+  + size
+  + weight
+  + italic
+  + OpenType features
+  + language
+  + script
+```
 
-### 6.4 Rare characters
+5. Coalesce adjacent runs with the same shaping key.
+6. For each run, choose the primary face:
+   - explicit run font, if present;
+   - otherwise the role/script face from the catalog.
+7. Validate coverage; add a fallback only if the primary face lacks glyphs.
 
-For characters not covered by the selected run font:
+Paint properties are **not** part of the shaping key.
 
-1. Check a character cache.
-2. On a miss, query `list_fonts` with the character's charset.
-3. Store the covering `(path, index)` list, including an empty result.
-4. Choose from the result, or tofu if empty.
+### 5.7 Shaping and fallback
 
-Do not put a non-covering `font_match` result into the fallback chain.
+For each shaping run:
 
-### 6.5 Refresh
+1. shape with the primary face;
+2. if a glyph is missing, try the run's fallback chain;
+3. if a fallback face supplies the glyph, use it for that glyph only;
+4. record every face used in `used_fonts()`;
+5. if no face covers the character, render tofu.
+
+Important distinction:
+
+- explicit run font is the primary face;
+- automatic script fallback is used only for missing glyphs;
+- a Chinese character does not override an explicit Latin font choice unless
+  that font lacks the glyph.
+
+Cross-face boundaries have no shared GPOS kerning. This is a limitation of the
+font data, not a bug in the fallback chain.
+
+### 5.8 Paint spans
+
+```rust
+pub struct PaintSpan {
+    pub range: Range<usize>,
+    pub color: Color32,
+    pub underline: Option<Underline>,
+    pub background: Option<Color32>,
+}
+```
+
+Rules:
+
+- paint spans never change glyph positions;
+- color-only changes should reuse the shaped run;
+- underline/background are painted, not shaped;
+- if the rendering backend cannot paint per glyph, section splitting is a
+  fallback, not the target.
+
+### 5.9 Layout cache
+
+Cache per cell:
+
+```text
+(text revision, style revision, available width, zoom, font generation)
+  → ShapedCell
+```
+
+`font generation` increments after `set_fonts`/rebind. Without it, a font change
+would reuse glyph positions from the old face.
+
+Invalidation:
+
+- text edit;
+- style edit;
+- column width / wrap width;
+- zoom;
+- font generation;
+- language change that alters Han order.
+
+Paint-only changes should invalidate paint, not shaping.
+
+### 5.10 Font binding and rebind
+
+`used_fonts()` must become:
+
+```text
+used_fonts =
+  cell base fonts
+  + every run's explicit font
+  + fallback faces selected for missing glyphs
+  + theme/heading/body fonts
+  + shape fonts
+```
+
+For each family, `bind_faces()` still binds at most four roles: regular, bold,
+italic, bold-italic. `bind_faces()` reads the whole file only when binding, not
+during metadata scanning.
+
+`pending_bound` remains necessary: a new rich-text run can introduce a family
+that egui has not activated yet. Publish bound roles only after the new
+`FontDefinitions` is active.
+
+If a family has no italic face, do not silently bind regular as italic; either
+fall back to the system italic chain or synthesize italic explicitly.
+
+### 5.11 Editing and selection
+
+The editing layer needs:
+
+- cursor and selection as byte ranges;
+- applying bold/italic/font/color to a selection;
+- splitting runs at selection boundaries;
+- merging adjacent equal runs;
+- preserving runs on copy/paste where possible;
+- mapping cell-editor selection to the model.
+
+Suggested module boundaries:
+
+```text
+crates/model/src/rich_text.rs       model, runs, normalization
+crates/ui-egui/src/text_layout.rs   itemization, shaping, layout cache
+crates/ui-egui/src/rich_text_edit.rs selection editing
+```
+
+Do not put rich text into `fonts.rs` or `theme.rs`; those should stay about
+discovery and font binding.
+
+### 5.12 XLSX import and export
+
+XLSX shared strings carry rich text as:
+
+```xml
+<si>
+  <r>
+    <rPr>...</rPr>
+    <t>...</t>
+  </r>
+  ...
+</si>
+```
+
+Required behavior:
+
+- import `<r>` and `<rPr>` into `RichText`;
+- do not flatten runs to one `String`;
+- write runs back with their `<rPr>`;
+- handle shared strings and inline strings;
+- preserve unknown `<rPr>` attributes or explicitly drop them with a test;
+- define whether formula cells can carry rich text; do not assume they can.
+
+Current flattening sites:
+
+- `crates/xlsx/src/sheet_read.rs:149`
+- `crates/xlsx/src/sheet_read.rs:408`
+
+`xml::rich_text(...)` must gain a runs-returning variant or be replaced at those
+call sites.
+
+### 5.13 Refresh
 
 When fonts are installed or removed:
 
 1. clear the catalog;
-2. clear role and script caches;
+2. clear role, script, and character caches;
 3. re-run `list_fonts`;
-4. rebuild egui font definitions if the current workbook uses affected families.
+4. rebuild egui font definitions if the current workbook uses affected families;
+5. invalidate all layout caches that depend on font generation.
+
+### 5.14 egui integration options
+
+Option A (MVP):
+
+- use `LayoutJob` sections for shaping runs;
+- add script/fallback faces to a global chain;
+- accept paint-boundary kerning loss.
+
+Option B (target):
+
+- shape by shaping key independently of paint;
+- produce a pre-shaped glyph run;
+- paint per glyph/span;
+- requires a custom layout module or an epaint extension.
+
+Document A as an MVP and B as the quality target. Do not claim A gives full
+rich-text typography.
 
 ---
 
-## 7. Target sequence diagram
+## 6. Flows
+
+### 6.1 Sequence diagram
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant App as GridCraft
-    participant FC as Fontconfig
+    participant Model as CellText / RichText
+    participant Layout as Style + Itemizer
     participant Cat as FontCatalog
-    participant UI as UI / Text layout
+    participant Shape as Shaper
     participant Egui as egui renderer
 
-    Note over App,FC: Startup: once per catalog
+    Note over App,Cat: Startup: once per catalog
 
-    App->>FC: Fontconfig::new()
-    App->>FC: list_fonts(FAMILY, STYLE, FILE,<br/>INDEX, WEIGHT, SLANT, CHARSET)
-    FC-->>App: FontSet
+    App->>Cat: list_fonts(FAMILY, STYLE, FILE,<br/>INDEX, WEIGHT, SLANT, CHARSET)
+    Cat-->>App: FontSet
+    App->>Cat: compute script masks and coverage
+    Cat-->>App: by_family + by_script
 
-    loop Each face
-        App->>App: read family/style/file/index
-        App->>App: compute script mask
-    end
+    Note over Model,Shape: Layout: no fontconfig per character
 
-    App->>Cat: build by_family + by_script
-    App->>UI: publish font list
+    App->>Model: CellText (plain or runs)
+    Model->>Layout: resolve effective styles
+    Layout->>Layout: split by script + shaping key
+    Layout->>Layout: coalesce equal runs
+    Layout->>Layout: build paint spans
 
-    Note over UI,Egui: Normal layout: no fontconfig per character
-
-    UI->>UI: split_runs(text)
-    UI->>UI: classify Unicode scripts<br/>attach Common to neighbor
-
-    loop Each run
-        UI->>Cat: font_for_script(script)
-        alt Catalog has a covering face
-            Cat-->>UI: FontEntry
-            UI->>UI: add face to run fallback chain
-        else No covering face
-            Cat-->>UI: None
-            UI->>UI: mark run as missing
+    loop Each shaping run
+        Layout->>Cat: primary face for family/script
+        Cat-->>Layout: FontEntry
+        Layout->>Shape: shape(text, face, size, weight, italic)
+        Shape-->>Layout: glyphs + advances
+        alt missing glyph
+            Layout->>Cat: fallback face for script
+            Cat-->>Layout: FontEntry
+            Layout->>Shape: shape missing glyphs
+            Shape-->>Layout: replacement glyphs
         end
     end
 
-    UI->>Egui: LayoutJob / FontDefinitions
+    Layout-->>App: ShapedCell + PaintSpans
+    App->>Egui: paint glyphs at cached positions
 
-    loop Each glyph
-        Egui->>Egui: current face has glyph?
-        alt Yes
-            Egui-->>UI: draw glyph
-        else No
-            Egui->>Egui: try next fallback face
-        end
+    Note over Layout,Cat: Rare character
+
+    Layout->>Layout: character cache lookup
+    alt cache hit
+        Layout->>Layout: reuse covering face list
+    else cache miss
+        Layout->>Cat: list_fonts(pattern + charset)
+        Cat-->>Layout: covering faces / empty
+        Layout->>Layout: store result
     end
 
-    alt No fallback face has the glyph
-        Egui-->>UI: tofu
-    end
+    Note over App,Cat: Font installation / refresh
 
-    Note over UI,FC: Rare character: cache by character
-
-    UI->>UI: character cache lookup
-    alt Cache hit
-        UI->>UI: reuse result
-    else Cache miss
-        UI->>FC: list_fonts(pattern + charset)
-        FC-->>UI: covering faces / empty
-        UI->>UI: store result
-    end
-
-    Note over UI,FC: Explicit family requested
-
-    UI->>FC: font_match(FcQuery)
-    FC-->>UI: FontMatch
-
-    alt Matched face covers the target charset
-        UI->>Egui: use matched face
-    else Not covered
-        UI->>Cat: font_for_script(script)
-        Cat-->>UI: covering face / None
-    end
-
-    Note over App,FC: Font installation / refresh
-
-    App->>Cat: clear catalog
-    App->>FC: clear query and character caches
-    App->>FC: list_fonts again
+    App->>Cat: clear catalog and caches
+    App->>Cat: list_fonts again
+    App->>Layout: invalidate layout caches
 ```
 
----
-
-## 8. Target flowchart
+### 6.2 Flowchart
 
 ```mermaid
 flowchart TD
-    A[Start font scan] --> B{fontconfig available?}
-    B -- Yes --> C[list_fonts once]
-    B -- No --> D[scan platform font directories]
-    C --> E[Build FontCatalog]
-    D --> E
-    E --> F[Compute script masks]
-    F --> G[Publish family list and by_script]
+    A[CellText] --> B[Resolve cell style + run overrides]
+    B --> C[Classify Unicode scripts]
+    C --> D[Split by script + shaping key]
+    D --> E[Coalesce equal shaping runs]
+    E --> F[Build paint spans]
 
-    H[Text to lay out] --> I[split_runs]
-    I --> J{For each run}
-    J --> K[font_for_script]
-    K --> L{Covering face found?}
-    L -- Yes --> M[Append face to run chain]
-    L -- No --> N[Mark run missing]
-    M --> O[egui LayoutJob / FontDefinitions]
+    F --> G{For each shaping run}
+    G --> H[Choose primary face]
+    H --> I{Primary covers glyphs?}
+    I -- Yes --> J[Shape with primary face]
+    I -- No --> K[Choose fallback face by script]
+    K --> L{Fallback covers?}
+    L -- Yes --> M[Shape missing glyphs with fallback]
+    L -- No --> N[Mark tofu]
+    J --> O[Store shaped run in layout cache]
+    M --> O
     N --> O
+    O --> P[Paint glyphs + paint spans]
 
-    O --> P{egui glyph exists?}
-    P -- Yes --> Q[Draw glyph]
-    P -- No --> R{More fallback faces?}
-    R -- Yes --> P
-    R -- No --> S[tofu]
-
-    T[Rare character] --> U{Character cache hit?}
-    U -- Yes --> V[Reuse face list]
-    U -- No --> W[list_fonts with charset]
-    W --> X[Store result]
-    X --> V
+    Q[Rare character] --> R{Character cache hit?}
+    R -- Yes --> S[Reuse covering face list]
+    R -- No --> T[list_fonts with charset]
+    T --> U[Store result]
+    U --> S
 ```
+
+### 6.3 Walkthrough
+
+- Plain text: one run, cell style, one shaping run unless script fallback is
+  needed.
+- Rich text with per-character fonts: runs split at font boundaries; each run is
+  shaped independently.
+- Rich text with color-only changes: one shaping run, multiple paint spans.
+- Mixed Latin/CJK: script itemization adds fallback faces; Common punctuation
+  stays with the previous run.
+- Missing glyph: fallback per glyph; never replace the whole run's explicit
+  font.
 
 ---
 
-## 9. Algorithm notes
+## 7. Algorithms
 
-### 9.1 `classify`
+### 7.1 `classify`
 
 Use Unicode scalar ranges, not locale:
 
@@ -672,7 +985,7 @@ Use Unicode scalar ranges, not locale:
 Digits and punctuation are intentionally `Common` so they do not force a font
 switch inside a word.
 
-### 9.2 `split_runs`
+### 7.2 `split_runs`
 
 ```text
 last = Latin
@@ -684,12 +997,26 @@ for each char:
         append to current run
     else:
         start a new run
-last = c
+    last = c
 ```
 
 If the entire string is Common, return one Latin run.
 
-### 9.3 `font_for_script`
+### 7.3 Shaping-run merge
+
+```text
+for each styled run:
+    key = shaping_key(style, script)
+    if key == previous key and ranges are adjacent:
+        merge
+    else:
+        start new shaping run
+```
+
+Only shaping attributes participate. Color, underline, and background become
+paint spans.
+
+### 7.4 `font_for_script`
 
 Return the first `FontEntry` in `by_script[script]` that:
 
@@ -701,7 +1028,7 @@ Return the first `FontEntry` in `by_script[script]` that:
 Han preference follows `HanOrder`: Chinese first for non-Japanese UI, Japanese
 first for Japanese UI.
 
-### 9.4 Coverage
+### 7.5 Coverage
 
 Do not trust `font_match` alone.
 
@@ -727,11 +1054,32 @@ else:
 
 The fallback requires one `list_fonts` per script at startup, not per character.
 
+### 7.6 Rare characters
+
+For characters not covered by the selected run font:
+
+1. check a character cache;
+2. on a miss, query `list_fonts` with the character's charset;
+3. store the covering `(path, index)` list, including an empty result;
+4. choose from the result, or tofu if empty.
+
+Do not put a non-covering `font_match` result into the fallback chain.
+
+### 7.7 Complexity
+
+- `classify` and `split_runs`: O(n) in characters.
+- Style resolution: O(number of runs).
+- Catalog lookup: O(1) hash lookup plus a short preference scan.
+- Shaping: O(glyphs) per shaping run.
+- Paint: O(glyphs + paint spans).
+- Normal layout: no fontconfig process, no filesystem scan, no per-character
+  `font_match`.
+
 ---
 
-## 10. Performance
+## 8. Performance
 
-### 10.1 Metadata scan benchmark
+### 8.1 Metadata scan benchmark
 
 Measured on the development host with 237 supported font files and 287 faces:
 
@@ -745,7 +1093,7 @@ Speedup: roughly 27–30×. Both methods produced 287 faces.
 The benchmark was temporary and is not in the current worktree. Re-add it as an
 ignored test if the scanner changes.
 
-### 10.2 Rebind timing
+### 8.2 Rebind timing
 
 Before caching and read deduplication:
 
@@ -773,44 +1121,31 @@ Interpretation:
 - The remaining 1–2 s freeze is dominated by egui font-atlas and glyph-cache
   rebuild, not by `fc-match` or metadata scanning.
 
-### 10.3 What not to cache
+### 8.3 Rich-text layout cost
+
+Rich text adds work proportional to:
+
+- number of style runs;
+- number of shaping runs after itemization;
+- number of glyphs;
+- number of paint spans.
+
+It must not add per-frame fontconfig calls or per-frame font-file reads.
+Cache the shaped result per cell and invalidate on text/style/width/zoom/font
+generation changes.
+
+### 8.4 What not to cache
 
 - Do not cache `fontconfig::Pattern` or `CharSet`: `!Send`/`!Sync`.
 - Do not cache `FontSet` across threads.
 - Cache plain `(path, index)` and owned metadata.
 - Cache negative lookups too; otherwise a missing family is retried on every
   rebuild.
+- Do not cache shaped layout across font-generation changes.
 
 ---
 
-## 11. Failure modes and invariants
-
-| Failure | Required behavior |
-|---|---|
-| `fc-list` missing | Fall back to `system_font_dirs()` and `scan_dirs()`. |
-| `fc-match` missing | Use hard-coded role candidates. |
-| Damaged font file | Skip it; never panic. |
-| TTC index out of range | Skip that face. |
-| Huge font file | Metadata read is bounded; full read only when binding. |
-| No CJK font | Keep Latin; CJK characters render tofu, not crash. |
-| Font lacks italic face | Do not bind an italic role to regular unless explicitly intended. |
-| Same TTC, different script faces | Deduplicate by `(path, index)`, not path only. |
-| Generic `serif` in Flatpak | Do not assume host result; use explicit family or charset query. |
-| Font installed while running | Not visible until restart unless refresh is implemented. |
-| egui family not bound | Never name it from `cell_family()`. |
-| wasm | No system fonts; return standard list only. |
-
-Invariants:
-
-1. `cell_family()` only returns an egui family that has data.
-2. `FontData::index` is a face index, never a named-instance encoding.
-3. A failed font parse costs one fallback, never a panic.
-4. The UI thread never scans font directories.
-5. Normal layout never spawns `fc-match` per character.
-
----
-
-## 12. Tests
+## 9. Tests and invariants
 
 Current relevant tests:
 
@@ -827,6 +1162,20 @@ Current relevant tests:
   - `fontconfig_candidates_are_ordered_and_deduplicated`
   - `fontconfig_serif_match_precedes_hard_coded_paths`
   - `chromeos_font_layout_is_probed`
+
+Rich-text tests to add:
+
+- normalize adjacent equal runs;
+- reject or repair overlapping/out-of-bounds ranges;
+- style inheritance from cell to run;
+- split a run at a selection boundary;
+- XLSX `<r>` import → model → export round-trip;
+- shared strings and inline strings;
+- unknown `<rPr>` attribute policy;
+- color-only change does not re-shape;
+- font change re-shapes and applies new glyph positions;
+- missing italic face behavior;
+- mixed Latin/CJK with Common punctuation.
 
 CI without CJK:
 
@@ -850,7 +1199,7 @@ error in `crates/xlsx/src/xls/mod.rs:273`
 
 ---
 
-## 13. fontconfig 0.11 API coverage and gaps
+## 10. fontconfig 0.11 API coverage and gaps
 
 Crate facts:
 
@@ -858,10 +1207,10 @@ Crate facts:
 - Depends on `yeslogic-fontconfig-sys ^6.0.0`.
 - The `dlopen` feature loads fontconfig at runtime.
 - `Pattern` and `CharSet` are `!Send` and `!Sync`.
-- `GridCraft` has `unsafe_code = "forbid"` in `Cargo.toml:59`; do not add raw
+- GridCraft has `unsafe_code = "forbid"` in `Cargo.toml:59`; do not add raw
   FFI inside GridCraft.
 
-### 13.1 Available in 0.11
+### 10.1 Available in 0.11
 
 | Need | API |
 |---|---|
@@ -887,7 +1236,7 @@ Semantics:
 - `list_fonts("sans-serif")` does not resolve generic aliases. Resolve with
   `font_match()` first, or use a concrete family.
 
-### 13.2 Missing but needed for direct charset introspection
+### 10.2 Missing but needed for direct charset introspection
 
 | Need | Missing Rust API | C API |
 |---|---|---|
@@ -921,7 +1270,7 @@ Implementation notes if adding upstream:
 - `CharSet` must continue to destroy its `FcCharSet` in `Drop`.
 - All wrappers must remain `!Send`/`!Sync`; do not put them in global state.
 
-### 13.3 Workaround without new APIs
+### 10.3 Workaround without new APIs
 
 Build coverage sets at startup:
 
@@ -949,7 +1298,7 @@ else:
 This avoids both missing APIs. The cost is a few extra `list_fonts` calls at
 startup, not per character.
 
-### 13.4 Recommendation
+### 10.4 Recommendation
 
 Short term:
 
@@ -969,9 +1318,9 @@ the repository's `unsafe_code = "forbid"` policy.
 
 ---
 
-## 14. Migration plan
+## 11. Migration plan
 
-### Phase 1: preserve current behavior
+### Phase 0: preserve current behavior
 
 - Keep `fc-list` discovery and metadata scan.
 - Keep `fc-match` role candidates.
@@ -979,21 +1328,38 @@ the repository's `unsafe_code = "forbid"` policy.
 - Keep `pending_bound`.
 - Add tests for TTC faces, malformed tables, and no-fontconfig fallback.
 
-### Phase 2: build the catalog
+### Phase 1: rich-text model and file round-trip
+
+- Add `CellText`, `RichText`, `TextRun`, `CharStyle`.
+- Add normalization and validation.
+- Stop flattening `<r>` runs in `sheet_read.rs`.
+- Import and export shared-string and inline-string rich text.
+- Add XLSX round-trip tests before any UI uses the model.
+
+### Phase 2: rich-text editing
+
+- Add character-range selection in the cell editor.
+- Apply bold/italic/font/color/underline to a selection.
+- Split and merge runs at selection boundaries.
+- Keep cell-level style as the base.
+
+### Phase 3: font catalog and script routing
 
 - Introduce `FontEntry` and `FontCatalog`.
 - Build script coverage sets with `list_fonts` + charset.
-- Keep the existing `Vec<Face>` as a compatibility view.
-- Add a feature flag or internal switch so the old path remains testable.
-
-### Phase 3: script routing
-
 - Add `classify` and `split_runs`.
 - Add `font_for_script`.
-- Start with global fallback chains; add `LayoutJob` per-run only if needed.
-- Add synthetic tests for mixed-script text.
+- Start with global fallback chains; add per-run families only if needed.
 
-### Phase 4: replace subprocesses
+### Phase 4: shaping and paint separation
+
+- Add shaping-key itemization.
+- Keep paint spans independent of shaping runs.
+- Add a layout cache keyed by text/style/width/zoom/font generation.
+- Start with `LayoutJob` sections (MVP); move to pre-shaped glyph runs if
+  color-boundary kerning matters.
+
+### Phase 5: replace subprocesses
 
 - Add `fontconfig` 0.11 as a Linux target dependency with `dlopen`.
 - Replace `fc-list` with `list_fonts`.
@@ -1001,7 +1367,7 @@ the repository's `unsafe_code = "forbid"` policy.
 - Keep process fallback if library loading fails.
 - Do not store `Pattern`/`CharSet` in shared state.
 
-### Phase 5: refresh and performance
+### Phase 6: refresh and performance
 
 - Add explicit refresh after font installation.
 - Cache family lists after the scan.
@@ -1010,19 +1376,20 @@ the repository's `unsafe_code = "forbid"` policy.
 
 ---
 
-## 15. Current project status
+## 12. Current project status
 
 - Branch: `fix/linux-fontconfig`
-- HEAD: `09b0d1d`
+- HEAD at the start of this rewrite: `775a14a`
 - Remote PR branch: `fork/fix/linux-fontconfig` at old head `6531ce0`
 - PR: `#1972`
 - PR state: open, conflicting with `main`
-- Local worktree: only `docs/font-flow.md` untracked
 - Not pushed after the local commits
+- This document is currently being reorganized in the working tree
 
 Commits on the branch (newest first):
 
 ```text
+775a14a docs: add Linux font flow design note (#1231)
 09b0d1d perf(ui): reuse bound font data across rebinds (#1231)
 8eb6977 perf(ui): cache Linux fontconfig lookups (#1231)
 fb96434 fix(ui): defer bound font roles until fonts activate (#1231)
@@ -1040,32 +1407,39 @@ Current app behavior:
 - Ribbon font list includes host fonts.
 - First use of a large unbound CJK family can still freeze for 1–2 seconds.
 - Italic is ineffective for families without an italic face.
+- Per-character rich text is not implemented; XLSX runs are flattened.
 
 ---
 
-## 16. Open questions
+## 13. Open questions
 
-1. Should the catalog store `script_mask` only, or also a coarse
-   `coverage: Vec<(u32, u32)>` range list? The latter enables exact rare-character
-   checks without fontconfig.
-2. Should `split_runs` attach Common punctuation to the previous run, the next
+1. What is the exact rich-text scope: font, size, bold, italic, underline,
+   strike, color, vertical alignment, charset, scheme?
+2. Should formula cells carry rich text, or only text values?
+3. Should copy/paste preserve rich text, and through which clipboard format?
+4. Should the catalog store `script_mask` only, or also a coarse
+   `coverage: Vec<(u32, u32)>` range list? The latter enables exact
+   rare-character checks without fontconfig.
+5. Should `split_runs` attach Common punctuation to the previous run, the next
    run, or duplicate it into both? Previous is simpler and usually correct.
-3. Should script routing use one global fallback chain (Option A) or per-run
+6. Should script routing use one global fallback chain (Option A) or per-run
    `LayoutJob` families (Option B)? Start with A and measure.
-4. Can egui's atlas rebuild be moved off the UI thread, or made incremental for
+7. Can egui's atlas rebuild be moved off the UI thread, or made incremental for
    newly added faces?
-5. Should the catalog refresh automatically on font installation, or only on
+8. Should the catalog refresh automatically on font installation, or only on
    restart?
-6. Should GridCraft bundle a minimal CJK fallback for Flatpak? This conflicts
+9. Should GridCraft bundle a minimal CJK fallback for Flatpak? This conflicts
    with the current "no bundled fonts by default" policy and the
    `storytold/craft-fonts` rule.
-7. Should `fontconfig` 0.11 be a direct dependency, or should GridCraft keep the
-   subprocess path and only use the library when available?
-8. How should `fc-match` differences between host and Flatpak be tested in CI?
+10. Should `fontconfig` 0.11 be a direct dependency, or should GridCraft keep
+    the subprocess path and only use the library when available?
+11. How should `fc-match` differences between host and Flatpak be tested in CI?
+12. How should unsupported `<rPr>` attributes be preserved without turning the
+    model into raw XML?
 
 ---
 
-## 17. File and command reference
+## 14. File and command reference
 
 ### Source files
 
@@ -1076,6 +1450,10 @@ Current app behavior:
 | `crates/ui-egui/src/lib.rs` | Startup, background scan, rebind state, `pending_bound`. |
 | `crates/ui-egui/src/ribbon.rs` | Ribbon font combo, `FONTS` standard list. |
 | `crates/ui-egui/src/dialogs.rs` | Format Cells font list. |
+| `crates/ui-egui/src/grid.rs` | Cell text layout; currently `LayoutJob::simple`. |
+| `crates/ui-egui/src/formula_bar.rs` | Formula bar layout and reference coloring. |
+| `crates/xlsx/src/sheet_read.rs` | Shared-string import; currently flattens rich text. |
+| `crates/xlsx/src/xml.rs` | XML helpers, including `rich_text(...)`. |
 | `Cargo.toml` | `unsafe_code = "forbid"` at line 59. |
 
 ### Commands
@@ -1105,7 +1483,7 @@ flatpak run --command=sh ai.storyteller.gridcraft//fontfix -c \
 fc-match -f '%{file}\t%{index}\t%{family}\n' 'sans-serif:lang=zh-cn'
 ```
 
-### Test chat control
+### Test control channel
 
 ```json
 {"id":1,"method":"engine.execute","params":{"command":"home.fontName","params":{"name":"Noto Serif CJK SC"}}}
@@ -1114,7 +1492,7 @@ fc-match -f '%{file}\t%{index}\t%{family}\n' 'sans-serif:lang=zh-cn'
 
 ---
 
-## 18. Appendix: host vs Flatpak observations
+## 15. Appendix: host vs Flatpak observations
 
 Measured on the development host:
 
