@@ -807,6 +807,16 @@ fn cjk_han_japanese() -> Vec<(String, u32)> {
     v
 }
 
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// Answers already obtained from `fc-match`, including failed lookups. Fonts rarely change
+    /// during a session, and rebuilding a font set asks for the same patterns many times.
+    ///
+    /// No invalidation: fonts installed while GridCraft is running are not picked up until restart.
+    static FC_MATCH_CACHE: std::cell::RefCell<std::collections::HashMap<String, Option<(String, u32)>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Asks fontconfig (`fc-match`, part of the standard Linux font stack) for the best face for
 /// `pattern`. Distributions install fonts in different directories, so fontconfig is the primary
 /// source; the [`LINUX_CJK_FALLBACK_DIRS`] list remains as a fallback for systems where it is
@@ -815,6 +825,18 @@ fn cjk_han_japanese() -> Vec<(String, u32)> {
 /// from the file name.
 #[cfg(target_os = "linux")]
 fn fc_match(pattern: &str) -> Option<(String, u32)> {
+    if let Some(answer) = FC_MATCH_CACHE.with(|cache| cache.borrow().get(pattern).cloned()) {
+        return answer;
+    }
+    let answer = fc_match_uncounted(pattern);
+    FC_MATCH_CACHE.with(|cache| {
+        cache.borrow_mut().insert(pattern.to_owned(), answer.clone());
+    });
+    answer
+}
+
+#[cfg(target_os = "linux")]
+fn fc_match_uncounted(pattern: &str) -> Option<(String, u32)> {
     let output = std::process::Command::new("fc-match").args(["-f", "%{file}\n%{index}\n", pattern]).output().ok()?;
     if !output.status.success() {
         return None;
