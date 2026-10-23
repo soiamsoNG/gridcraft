@@ -5,7 +5,7 @@ Status: design note and implementation map.
 - Repository: `storytold/gridcraft`
 - Branch: `fix/linux-fontconfig`
 - HEAD at the start of this rewrite: `775a14a docs: add Linux font flow design note (#1231)`
-- Last updated: 2026-10-22 (fontconfig face metadata; panose read at binding)
+- Last updated: 2026-10-23 (fontconfig language rules split)
 - Related issue: `#1231`
 - Current PR: `#1972` (open; remote branch is older than this local branch)
 
@@ -1525,6 +1525,98 @@ flatpak run --command=sh ai.storyteller.gridcraft//fontfix -c \
 # Inspect a specific match
 fc-match -f '%{file}\t%{index}\t%{family}\n' 'sans-serif:lang=zh-cn'
 ```
+
+### Verifying fontconfig rules (`FC_DEBUG=4`)
+
+`fc-match` returning the expected family does not prove a rule fired: another rule — the
+host's, or an earlier snippet — can produce the same answer. Read fontconfig's own rule
+dump instead.
+
+A rule is only as wide as the tests fontconfig keeps. **`<or>` inside `<match>` is
+silently dropped** (observed on fontconfig 2.17.0 and 2.17.1): the parser emits no
+warning, the rule keeps its remaining tests, and it therefore matches every pattern that
+passes those. A language group written as `<or>` collapses into a rule that fires for
+every query of that family; in the sandbox that puts the SC/TC/HK faces in front for
+`lang=ja` and `lang=ko` too, the ordering bug reported for #1972. On a host whose own
+`conf.d` already orders CJK families, the same rules can lose to the host's and the bug
+stays invisible in `fc-match` output — which is why the rule dump is the check.
+
+Test a snippet in a temporary config whose include chain matches the Flatpak's
+`50-flatpak.conf` (host config first, then the snippets in `conf.d` order):
+
+```bash
+mkdir -p /tmp/fc-check
+cp packaging/linux/flatpak/fontconfig/65-lang.conf \
+   packaging/linux/flatpak/fontconfig/70-noto-cjk.conf /tmp/fc-check/
+cat > /tmp/fc-check/fonts.conf <<'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <include>/etc/fonts/fonts.conf</include>
+  <include>/tmp/fc-check/65-lang.conf</include>
+  <include>/tmp/fc-check/70-noto-cjk.conf</include>
+</fontconfig>
+EOF
+FONTCONFIG_FILE=/tmp/fc-check/fonts.conf FC_DEBUG=4 \
+  fc-match 'sans-serif:lang=ja' 2>&1 | grep -A3 '70-noto-cjk.conf' | head -5
+```
+
+Bad output — the Simplified Chinese rule lost its language test, so it matches every query
+of that family:
+
+```text
+Add Rule(kind:0, name: /tmp/fc-check/70-noto-cjk.conf) [test]
+	pattern any family Equal "sans-serif"
+[edit]
+	Edit family Prepend "Noto Sans CJK SC";
+```
+
+Good output — the same rule keeps its test:
+
+```text
+Add Rule(kind:0, name: /tmp/fc-check/70-noto-cjk.conf) [test]
+	pattern any lang Equal "zh-cn"
+	pattern any family Equal "sans-serif"
+[edit]
+	Edit family Prepend "Noto Sans CJK SC";
+```
+
+The rule that answers `lang=ja` is a separate one; grep for it to see that Japanese no
+longer rides on the SC/TC/HK rules:
+
+```bash
+FONTCONFIG_FILE=/tmp/fc-check/fonts.conf FC_DEBUG=4 \
+  fc-match 'sans-serif:lang=ja' 2>&1 | grep -A3 'Equal "ja"' | head -4
+```
+
+```text
+	pattern any lang Equal "ja"
+	pattern any family Equal "sans-serif"
+[edit]
+	Edit family Prepend "Noto Sans CJK JP";
+```
+
+Gate the files before running, since `<or>` has no legitimate use here:
+
+```bash
+grep -c '<or>' packaging/linux/flatpak/fontconfig/*.conf   # must be 0
+```
+
+Then compare outcomes per language. A host with its own CJK rules can hide the bug,
+because those rules reorder the same families:
+
+```bash
+for q in 'sans-serif:lang=zh-cn' 'sans-serif:lang=zh-tw' 'sans-serif:lang=ja' \
+         'sans-serif:lang=ko' 'monospace:lang=en' 'sans-serif:lang=en'; do
+  printf '%-26s ' "$q"
+  FONTCONFIG_FILE=/tmp/fc-check/fonts.conf fc-match -f '%{family[0]} %{index}\n' "$q"
+done
+```
+
+After splitting every `<or>` into one `<match>` per (language, generic family),
+`70-noto-cjk.conf` holds 36 `<match>` blocks instead of 15, and `65-lang.conf` 25 instead
+of 11; every block carries exactly one language test and one edit. Measured on the
+development host (fontconfig 2.17.0); the Flatpak runtime is 2.17.1.
 
 ### Test control channel
 
