@@ -5,7 +5,7 @@ Status: design note and implementation map.
 - Repository: `storytold/gridcraft`
 - Branch: `fix/linux-fontconfig`
 - HEAD at the start of this rewrite: `775a14a docs: add Linux font flow design note (#1231)`
-- Last updated: 2026-10-23 (fontconfig language rules split)
+- Last updated: 2026-10-23 (merged `origin/main`; fontconfig language rules split; style resolution rules)
 - Related issue: `#1231`
 - Current PR: `#1972` (open; remote branch is older than this local branch)
 
@@ -426,7 +426,7 @@ Consequences:
 | Serif companions load on demand | A serif workbook font pays ~55 MB for Noto Serif CJK; a sans-only workbook never loads it. |
 | `try_load` checks parseability, not script coverage | `fc-match` substitute may be chosen even if it lacks the script. |
 | `families()` rebuilds the list on every call | Ribbon calls it per frame; potentially wasteful. |
-| Missing italic face binds regular | Italic button may look ineffective for fonts without an italic face. |
+| Missing bold/italic face binds regular | A font without a bold or italic face renders both as regular. `SERIF` and `MONO` have no style roles either, so Times New Roman, Cambria and Courier New cells lose bold and italic on Linux. |
 | No cache invalidation | Fonts installed while running are not picked up until restart. |
 | Host/Flatpak fontconfig differs | The Flatpak ships `65-lang.conf`, `70-noto-cjk.conf` and `75-noto-color-emoji.conf`; the 28 East/Southeast Asian `lang` probes now match the host exactly. |
 | No rich-text model | Per-character formatting is lost; XLSX runs are flattened. |
@@ -616,6 +616,53 @@ Only effective style differences split shaping runs. A run with
 `color = red` and the same font as its neighbor is one shaping run with a paint
 span, not two shaping runs.
 
+#### 5.3.1 Weight and slant
+
+Style is resolved **inside one family**. Choosing the family (explicit run
+font, role, or script fallback) happens first; never cross families to repair
+the style of an installed family.
+
+```rust
+pub struct StyleRequest { pub weight: f32, pub italic: bool } // default 400.0, false
+pub enum SlantFallback { Exact, Oblique, Axis, Synthetic, Upright }
+pub struct ResolvedFace { pub face: usize, pub weight_gap: f32, pub slant: SlantFallback }
+```
+
+1. **Exact.** Same weight and slant. An italic request also accepts `oblique`;
+   the model has no separate oblique flag. An upright request never selects an
+   italic or oblique face.
+2. **Variable axis.** A face whose `wght` (or `slnt`) axis covers the request is
+   clamped to `[min, max]` and receives the axis value through
+   `FontTweak::coords`. This is exact and takes precedence over rounding to the
+   nearest static face.
+3. **Nearest static weight**, within the requested slant, following CSS Fonts 4
+   §5.2.2:
+   - `400 <= w <= 500`: `[w, 500]` ascending, then `< w` descending, then
+     `> 500` ascending;
+   - `w < 400`: `<= w` descending, then `> w` ascending;
+   - `w > 500`: `>= w` ascending, then `< w` descending.
+
+   Equal distance prefers the heavier face for `w >= 600` and the lighter face
+   for `w <= 500`; a remaining tie takes the lower face index.
+4. **Synthetic style**, only when the family is installed but has no matching
+   face: shear the glyph mesh by about 12° for italic, or embolden the outline
+   (stroke, or a small double-draw offset) for bold. Mark the result
+   `Synthetic`; layout keeps the face's advances so columns do not jump.
+5. **Substitute family**, only when the requested family is not installed: rank
+   the script/role candidates by style match first, then by candidate order. A
+   candidate with the exact style beats an earlier candidate with only regular.
+6. **Degrade.** If nothing matches or synthesises, return the upright or lighter
+   face with an explicit `SlantFallback::Upright` or non-zero `weight_gap`, and
+   record it in `used_fonts()`. Never present it as an exact match; this is the
+   §5.10 rule that a missing italic must not silently bind regular.
+
+Under egui, style is part of the family key, not a shaping argument: `FontId`
+carries only `family + size`, and epaint never synthesises. The four roles
+(`cell`, `cell-bold`, `cell-italic`, `cell-bold-italic`) encode weight 400/700
+and `italic`. A numeric weight needs a key per weight value the workbook
+actually uses (`used_fonts()` must return the used weight set), never a key per
+possible weight: every added key can load another large CJK face.
+
 ### 5.4 Font catalog
 
 ```rust
@@ -720,6 +767,8 @@ shaping key =
 6. For each run, choose the primary face:
    - explicit run font, if present;
    - otherwise the role/script face from the catalog.
+
+   Then resolve the face's weight and slant per §5.3.1 within that family.
 7. Validate coverage; add a fallback only if the primary face lacks glyphs.
 
 Paint properties are **not** part of the shaping key.
@@ -1055,7 +1104,14 @@ Return the first `FontEntry` in `by_script[script]` that:
 - has a file;
 - still parses;
 - is not already the primary face of the run;
-- has the best family preference for the current UI language.
+- has the best family preference for the current UI language;
+- covers the run's weight and slant per §5.3.1.
+
+"First" means after filtering by style coverage: a later candidate that resolves
+the requested weight and slant beats an earlier one that has only regular. If no
+candidate covers the style, return the first candidate and mark the degradation
+described in §5.3.1 step 6 instead of presenting its regular face as an exact
+match.
 
 Han preference follows `HanOrder`: Chinese first for non-Japanese UI, Japanese
 first for Japanese UI.
@@ -1478,6 +1534,13 @@ Current app behavior:
 11. How should `fc-match` differences between host and Flatpak be tested in CI?
 12. How should unsupported `<rPr>` attributes be preserved without turning the
     model into raw XML?
+13. Should the renderer synthesise bold and italic (stroke / shear) for an
+    installed family that lacks those faces, or is substituting another family
+    acceptable? §5.3.1 prefers synthesis inside the family and substitution only
+    when the family is missing, but epaint has no shear yet.
+14. Should `model::Font` gain a numeric weight now, or keep `bold: bool` until
+    the catalog exposes real weights? §5.3.1 supports both; the family-key
+    constraint only becomes visible once a workbook uses more than 400/700.
 
 ---
 
