@@ -374,6 +374,38 @@ fn installed_in(cat: &[Face], names: &[String]) -> Vec<String> {
     out
 }
 
+/// The installed family that stands in for a standard Excel name that is not installed, as the
+/// desktop's own font substitution decides it: `Times New Roman` → `Liberation Serif`, `Cambria` →
+/// `Caladea`, `Courier New` → `Liberation Mono` (#1231).
+///
+/// Only [`crate::ribbon::FONTS`] names are substituted. fontconfig answers *any* pattern (a
+/// misspelt name resolves to DejaVu Sans), and binding four roles for it would hide the miss
+/// instead of leaving the cell in the built-in role.
+#[cfg(target_os = "linux")]
+pub fn substitute_family(name: &str) -> Option<String> {
+    if !crate::ribbon::FONTS.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    let cat = CATALOG.get()?;
+    if cat.iter().any(|f| f.answers_to(name)) {
+        return None; // the real font is installed: nothing to substitute
+    }
+    let (path, _) = crate::theme::fc_match(name)?;
+    let path = PathBuf::from(path);
+    let family = cat.iter().find(|f| f.path == path)?.family.clone();
+    if family.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    Some(family)
+}
+
+/// macOS and Windows resolve the standard names themselves (the core fonts ship with them, and
+/// Core Text and DirectWrite substitute where one is absent), so nothing extra is bound.
+#[cfg(not(target_os = "linux"))]
+pub fn substitute_family(_name: &str) -> Option<String> {
+    None
+}
+
 /// The font list a combo box shows: the standard [`crate::ribbon::FONTS`] names first (what Excel
 /// offers, and what we substitute), then every other installed family A–Z. Never blocks: until the
 /// background scan finishes it returns just the standard names.
@@ -727,6 +759,27 @@ mod tests {
         assert!(faces.iter().all(|face| (100.0..=900.0).contains(&face.weight)));
         let unique: HashSet<(&PathBuf, u32)> = faces.iter().map(|face| (&face.path, face.index)).collect();
         assert_eq!(unique.len(), faces.len(), "fc-list duplicates are removed");
+    }
+
+    /// A standard Excel name that is not installed resolves through fontconfig to the family that
+    /// stands in for it; names outside the standard list never do, because fontconfig answers any
+    /// pattern and binding a misspelt name would hide the miss (#1231).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_standard_name_resolves_to_its_substitute_family() {
+        let cat = catalog();
+        assert_eq!(substitute_family("DejaVu Sans"), None, "only standard names are substituted");
+        assert_eq!(substitute_family("Grossly Missing Font"), None);
+        if cat.iter().any(|f| f.answers_to("Times New Roman")) {
+            return; // the real font is installed: nothing to substitute
+        }
+        // A container without fontconfig answers nothing, and the folder scan may find no
+        // substitute either; when fontconfig does answer, the substitute must be usable.
+        let Some(resolved) = substitute_family("Times New Roman") else { return };
+        assert!(!resolved.eq_ignore_ascii_case("Times New Roman"));
+        let faces = faces_of(&resolved);
+        assert!(!faces.is_empty(), "{resolved} is in the catalog");
+        assert!(faces.iter().any(|f| f.weight >= 600.0 && !f.italic), "the substitute has a bold face");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

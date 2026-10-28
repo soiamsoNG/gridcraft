@@ -718,8 +718,21 @@ pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[Stri
     // carries the script fallbacks for its own face: sans for upright faces, serif for serif ones.
     let script_fallbacks =
         crate::fonts::ScriptFallbacks { sans: fallback.clone(), serif: if want_serif { serif_fallback.clone() } else { fallback.clone() } };
-    for family in crate::fonts::installed_among(used) {
-        bound.extend(crate::fonts::bind_family(&mut fonts, &family, &script_fallbacks));
+    let installed = crate::fonts::installed_among(used);
+    for family in &installed {
+        bound.extend(crate::fonts::bind_family(&mut fonts, family, &script_fallbacks));
+    }
+    // A standard Excel name that is not installed still has a substitute the desktop already picks
+    // (Times New Roman → Liberation Serif). Binding that substitute under the requested name is
+    // what keeps bold and italic: SERIF and MONO carry one regular-weight chain each, so a cell in
+    // Times New Roman used to lose both (#1231).
+    let mut substituted: Vec<&String> = used.iter().filter(|name| !installed.iter().any(|i| i == *name)).collect();
+    substituted.sort();
+    substituted.dedup();
+    for family in substituted {
+        let Some(resolved) = crate::fonts::substitute_family(family) else { continue };
+        let faces = crate::fonts::faces_of(&resolved);
+        bound.extend(crate::fonts::bind_faces(&mut fonts, family, &faces, &script_fallbacks));
     }
     // Interface text (formula bar, name box, dialogs) falls back to the cell font before the
     // script faces: whatever a cell can draw, the formula bar can draw too, even where no script
@@ -905,7 +918,7 @@ thread_local! {
 /// locale-specific face (for example SC = 2 in `NotoSansCJK-Regular.ttc`) instead of guessing it
 /// from the file name.
 #[cfg(target_os = "linux")]
-fn fc_match(pattern: &str) -> Option<(String, u32)> {
+pub(crate) fn fc_match(pattern: &str) -> Option<(String, u32)> {
     if let Some(answer) = FC_MATCH_CACHE.with(|cache| cache.borrow().get(pattern).cloned()) {
         return answer;
     }
@@ -1317,6 +1330,7 @@ pub fn color32(rgb: [u8; 3]) -> Color32 {
 #[cfg(test)]
 mod font_binding_tests {
     use super::*;
+    use crate::i18n::Language;
 
     /// The families [`font_definitions`] always binds, whatever is installed.
     fn always_bound() -> Vec<String> {
@@ -1345,6 +1359,34 @@ mod font_binding_tests {
         // The same family in a style that wasn't bound falls back to a built-in role that is.
         let FontFamily::Name(fallback) = cell_family("Ubuntu", false, true) else { panic!("should name a family") };
         assert!(crate::fonts::is_bound(&fallback), "the fallback is a bound role");
+        crate::fonts::set_bound(always_bound());
+    }
+
+    /// A standard workbook font this machine doesn't have still binds four roles, under the name the
+    /// workbook uses, to the substitute the desktop picks for it (Times New Roman → Liberation
+    /// Serif). Without that, SERIF and MONO carry one regular-weight chain and the cell loses bold
+    /// and italic entirely (#1231).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_uninstalled_standard_font_binds_its_substitute_in_all_four_roles() {
+        let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::fonts::catalog(); // the substitute is looked up in the scanned catalog
+        if crate::fonts::substitute_family("Times New Roman").is_none() {
+            return; // installed already, or no fontconfig and no folder-scan substitute
+        }
+        let (fonts, bound) = font_definitions_with_bound(Language::En, &["Times New Roman".to_string()]);
+        crate::fonts::set_bound(bound.clone());
+        let face = |bold: bool, italic: bool| -> String {
+            let family = cell_family("Times New Roman", bold, italic);
+            fonts.families.get(&family).and_then(|chain| chain.first()).cloned().unwrap_or_default()
+        };
+        let regular = face(false, false);
+        assert!(!regular.is_empty(), "the regular role has a face");
+        assert_ne!(face(true, false), regular, "bold is a different face, not the regular one");
+        assert_ne!(face(false, true), regular, "italic is a different face, not the regular one");
+        for (b, i) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(bound.contains(&crate::fonts::role_key("Times New Roman", b, i)), "role {b} {i} is bound");
+        }
         crate::fonts::set_bound(always_bound());
     }
 
