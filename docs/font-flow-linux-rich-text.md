@@ -5,9 +5,9 @@ Status: design note and implementation map.
 - Repository: `storytold/gridcraft`
 - Branch: `fix/linux-fontconfig`
 - HEAD at the start of this rewrite: `775a14a docs: add Linux font flow design note (#1231)`
-- Last updated: 2026-10-28 (ExtraBold weight point; each role picks the face nearest its weight)
+- Last updated: 2026-10-28 (substitutes for uninstalled standard names bind all four roles)
 - Related issue: `#1231`
-- Current PR: `#1972` (open; local branch and remote PR branch are both at `57df98d`)
+- Current PR: `#1972` (open; remote PR branch at `57df98d`, local `HEAD` at `0d58e8d`)
 
 This document has three layers:
 
@@ -286,9 +286,17 @@ It:
    because at this point `FontFamily::Proportional` may still be egui's bundled
    Latin-only fonts, so a Latin family such as DejaVu Sans would otherwise show
    tofu for CJK (#1231);
-6. inserts the cell face before script fallback faces in interface chains;
-7. sets `FontFamily::Proportional` to the UI chain;
-8. drops unparseable faces with `drop_unparseable_fonts()`.
+6. binds the OS substitute for a standard Excel name that is not installed
+   (`substitute_family()`, `fonts.rs`): `fc-match` resolves `Times New Roman` to
+   `Liberation Serif`, `Cambria` to `Caladea`, `Courier New` to
+   `Liberation Mono`, and `bind_faces()` binds that family's four roles **under
+   the requested name**, so the cell keeps bold and italic. Only
+   `ribbon::FONTS` names qualify: fontconfig answers any pattern, so a misspelt
+   name would silently bind DejaVu Sans and hide the miss. macOS and Windows
+   resolve the standard names themselves and bind nothing extra (#1231);
+7. inserts the cell face before script fallback faces in interface chains;
+8. sets `FontFamily::Proportional` to the UI chain;
+9. drops unparseable faces with `drop_unparseable_fonts()`.
 
 `font_definitions_with()` (`theme.rs:474`) is the non-deferred wrapper: it calls
 `font_definitions_with_bound()` and immediately publishes `set_bound(bound)`.
@@ -438,7 +446,7 @@ Consequences:
 | Serif companions load on demand | A serif workbook font pays ~55 MB for Noto Serif CJK; a sans-only workbook never loads it. |
 | `try_load` checks parseability, not script coverage | `fc-match` substitute may be chosen even if it lacks the script. |
 | `families()` rebuilds the list on every call | Ribbon calls it per frame; potentially wasteful. |
-| Missing bold/italic face binds regular | A font without a bold or italic face renders both as regular. `SERIF` and `MONO` have no style roles either, so Times New Roman, Cambria and Courier New cells lose bold and italic on Linux. |
+| Missing bold/italic face binds regular | A font without a bold or italic face renders both as regular. `SERIF` and `MONO` have no style roles either, so a standard name that is *not* installed used to lose bold and italic. Its substitute is now bound in all four roles (#1231); a family really installed but lacking a face still falls back to its regular. |
 | No cache invalidation | Fonts installed while running are not picked up until restart. |
 | Host/Flatpak fontconfig differs | The Flatpak ships `65-lang.conf`, `70-noto-cjk.conf` and `75-noto-color-emoji.conf`; the 28 East/Southeast Asian `lang` probes now match the host exactly. |
 | No rich-text model | Per-character formatting is lost; XLSX runs are flattened. |
@@ -1260,6 +1268,7 @@ Current relevant tests:
   - `fontconfig_records_carry_family_style_and_slant`
   - `fontconfig_weights_map_to_the_css_scale`
   - `a_role_takes_the_face_nearest_its_weight`
+  - `a_standard_name_resolves_to_its_substitute_family`
 - `crates/ui-egui/src/theme.rs`:
   - `fallback_faces_are_appended_to_every_family`
   - `fallback_faces_load_each_file_once`
@@ -1272,6 +1281,7 @@ Current relevant tests:
   - `a_serif_face_uses_the_serif_fallbacks`
   - `fontconfig_candidates_are_ordered_and_deduplicated`
   - `fontconfig_serif_match_precedes_hard_coded_paths`
+  - `an_uninstalled_standard_font_binds_its_substitute_in_all_four_roles`
   - `chromeos_font_layout_is_probed`
 
 Rich-text tests to add:
@@ -1301,7 +1311,7 @@ Current test result:
 
 ```text
 cargo +1.95.0 test -p gridcraft-ui-egui --lib
-171 passed, 0 failed
+173 passed, 0 failed
 ```
 
 Full `cargo xtask ci` is currently blocked by a pre-existing unrelated clippy
@@ -1492,7 +1502,8 @@ the repository's `unsafe_code = "forbid"` policy.
 - Branch: `fix/linux-fontconfig`
 - HEAD at the start of this rewrite: `775a14a`
 - HEAD after the weight/face-selection fix: `57df98d`
-- Remote PR branch: `fork/fix/linux-fontconfig` at `57df98d` (pushed)
+- HEAD after binding substitutes for uninstalled standard names: `0d58e8d`
+- Remote PR branch: `fork/fix/linux-fontconfig` at `57df98d` (`0d58e8d` is local only)
 - PR: `#1972`
 - PR state: open; base `main`, currently reported `CONFLICTING` because the branch
   merged an older `origin/main` (`ac8da7d4`) and upstream has moved on
@@ -1500,6 +1511,7 @@ the repository's `unsafe_code = "forbid"` policy.
 Commits on the branch (newest first):
 
 ```text
+0d58e8d  fix(ui): bind the OS substitute for a standard font that is not installed (#1231)
 57df98d  fix(ui): weight ExtraBold and pick the face nearest each role (#1231)
 (merge)  Merge remote-tracking branch 'origin/main'
 37eeb7f  docs: record how to check fontconfig rules (#1231)
@@ -1530,7 +1542,11 @@ Current app behavior:
 - Bold binds the family's Bold, not its SemiBold; italic binds Italic, not Thin or
   Light Italic; `ExtraBold` (fontconfig weight 205) maps to 800 and no longer ties
   with Bold.
-- Italic is ineffective for families without an italic face.
+- Times New Roman, Cambria and Courier New cells keep bold and italic on Linux:
+  the name is not installed, so the family fontconfig substitutes for it
+  (Liberation Serif, Caladea, Liberation Mono) is bound in all four roles under
+  the requested name. The same now applies to every standard `ribbon::FONTS` name.
+- Italic is ineffective for families that are installed but have no italic face.
 - Per-character rich text is not implemented; XLSX runs are flattened.
 
 ---
@@ -1563,7 +1579,9 @@ Current app behavior:
 13. Should the renderer synthesise bold and italic (stroke / shear) for an
     installed family that lacks those faces, or is substituting another family
     acceptable? §5.3.1 prefers synthesis inside the family and substitution only
-    when the family is missing, but epaint has no shear yet.
+    when the family is missing, but epaint has no shear yet. *Partly answered:*
+    for a standard name that is not installed at all, the OS substitute is bound
+    in all four roles (`substitute_family()`), which is the "missing family" case. Installed-but-style-less families still bind regular.
 14. Should `model::Font` gain a numeric weight now, or keep `bold: bool` until
     the catalog exposes real weights? §5.3.1 supports both; the family-key
     constraint only becomes visible once a workbook uses more than 400/700.
