@@ -5,9 +5,9 @@ Status: design note and implementation map.
 - Repository: `storytold/gridcraft`
 - Branch: `fix/linux-fontconfig`
 - HEAD at the start of this rewrite: `775a14a docs: add Linux font flow design note (#1231)`
-- Last updated: 2026-10-23 (merged `origin/main`; fontconfig language rules split; style resolution rules)
+- Last updated: 2026-10-28 (ExtraBold weight point; each role picks the face nearest its weight)
 - Related issue: `#1231`
-- Current PR: `#1972` (open; remote branch is older than this local branch)
+- Current PR: `#1972` (open; local branch and remote PR branch are both at `57df98d`)
 
 This document has three layers:
 
@@ -187,9 +187,14 @@ pub struct Face {
 ```
 
 Style names are converted to weight and italic flags by `style_weight()` and
-`style_italic()`.
+`style_italic()`. On Linux the weight comes from `fc_weight()`
+(`crates/ui-egui/src/fonts.rs:312`), which maps fontconfig's OpenType-style
+constants (`FC_WEIGHT_REGULAR` 80, `FC_WEIGHT_BOLD` 200) onto the CSS scale.
+`FC_WEIGHT_EXTRABOLD` (205) has its own point at 800: it is equally far from
+Bold (200) and Black (210), and while it was missing from the table
+`min_by_key` rounded it down to 700 and tied it with Bold.
 
-`families()` (`:507`) builds the font picker list:
+`families()` (`crates/ui-egui/src/fonts.rs:418`) builds the font picker list:
 
 - standard `ribbon::FONTS` names first;
 - then installed family names, A–Z, case-insensitively deduplicated.
@@ -358,10 +363,17 @@ For each installed family, `bind_family()` calls `bind_faces()`.
 - inserts a `FontFamily::Name("fnt:{family}:{b|n}{i|n}")`;
 - returns the bound role keys.
 
-`pick_face()` (`fonts.rs:362`) falls back to the regular face when an exact
-bold/italic face is missing. That means an italic role can be bound to a regular
-face; the italic button may then appear to do nothing for fonts without an
-italic face. This is a known limitation.
+`pick_face()` (`fonts.rs:445`) chooses the eligible face **nearest the role's
+own weight** — 700 for bold, 400 for regular — within the requested slant, and
+only then falls back to the family's regular face. Taking the first eligible
+face instead went wrong once `fc-list` began reporting every named instance of a
+variable font: `faces_named()` hands the catalog over in ascending weight order
+(`fonts.rs:378`), so the bold role took `SemiBold` and the italic role took
+`Thin Italic` or `Light Italic` — on the host this hit Noto Sans, Open Sans,
+Montserrat, Adwaita Sans and 51 more families that ship the full weight range
+(#1231). The regular fallback still means an italic role can be bound to a
+regular face; the italic button may then appear to do nothing for fonts
+without an italic face. This is a known limitation.
 
 `bind_faces()` avoids duplicate reads by checking
 `fonts.font_data.contains_key(&key)` before `std::fs::read()`.
@@ -1247,6 +1259,7 @@ Current relevant tests:
   - `fontconfig_faces_are_existing_supported_fonts`
   - `fontconfig_records_carry_family_style_and_slant`
   - `fontconfig_weights_map_to_the_css_scale`
+  - `a_role_takes_the_face_nearest_its_weight`
 - `crates/ui-egui/src/theme.rs`:
   - `fallback_faces_are_appended_to_every_family`
   - `fallback_faces_load_each_file_once`
@@ -1288,7 +1301,7 @@ Current test result:
 
 ```text
 cargo +1.95.0 test -p gridcraft-ui-egui --lib
-112 passed, 0 failed
+171 passed, 0 failed
 ```
 
 Full `cargo xtask ci` is currently blocked by a pre-existing unrelated clippy
@@ -1478,24 +1491,34 @@ the repository's `unsafe_code = "forbid"` policy.
 
 - Branch: `fix/linux-fontconfig`
 - HEAD at the start of this rewrite: `775a14a`
-- Remote PR branch: `fork/fix/linux-fontconfig` at old head `6531ce0`
+- HEAD after the weight/face-selection fix: `57df98d`
+- Remote PR branch: `fork/fix/linux-fontconfig` at `57df98d` (pushed)
 - PR: `#1972`
-- PR state: open, conflicting with `main`
-- Not pushed after the local commits
-- This document is currently being reorganized in the working tree
+- PR state: open; base `main`, currently reported `CONFLICTING` because the branch
+  merged an older `origin/main` (`ac8da7d4`) and upstream has moved on
 
 Commits on the branch (newest first):
 
 ```text
-775a14a docs: add Linux font flow design note (#1231)
-09b0d1d perf(ui): reuse bound font data across rebinds (#1231)
-8eb6977 perf(ui): cache Linux fontconfig lookups (#1231)
-fb96434 fix(ui): defer bound font roles until fonts activate (#1231)
-b282d8f fix(ui): list installed Linux fonts in the ribbon (#1231)
-2ed8fc0 fix(ui): resolve Linux font roles with fontconfig (#1231)
-a80b10c perf(ui): read font names without loading whole files (#1231)
-4d9068a fix(ui): discover Linux fonts with fontconfig (#1231)
-c17854d fix(ui): start Linux font scan on context setup (#1231)
+57df98d  fix(ui): weight ExtraBold and pick the face nearest each role (#1231)
+(merge)  Merge remote-tracking branch 'origin/main'
+37eeb7f  docs: record how to check fontconfig rules (#1231)
+5d47d82  flatpak: split language rules so fontconfig keeps their tests (#1231)
+64501b2  perf(ui): build the Linux font catalog from fontconfig metadata (#1231)
+3c53f22  fix(ui): apply fontconfig named instances to variable font matches (#1231)
+52d2839  fix(ui): use serif script fallbacks for serif faces (#1231)
+a0e1547  fix(ui): keep script fallbacks in bound families (#1231)
+5f55c30  flatpak: install fontconfig snippets
+735e986  docs: add Linux font flow and rich text design note (#1231)
+775a14a  docs: add Linux font flow design note (#1231)
+09b0d1d  perf(ui): reuse bound font data across rebinds (#1231)
+8eb6977  perf(ui): cache Linux fontconfig lookups (#1231)
+fb96434  fix(ui): defer bound font roles until fonts activate (#1231)
+b282d8f  fix(ui): list installed Linux fonts in the ribbon (#1231)
+2ed8fc0  fix(ui): resolve Linux font roles with fontconfig (#1231)
+a80b10c  perf(ui): read font names without loading whole files (#1231)
+4d9068a  fix(ui): discover Linux fonts with fontconfig (#1231)
+c17854d  fix(ui): start Linux font scan on context setup (#1231)
 ```
 
 Current app behavior:
@@ -1504,6 +1527,9 @@ Current app behavior:
 - Format Cells font list includes host fonts.
 - Ribbon font list includes host fonts.
 - First use of a large unbound CJK family can still freeze for 1–2 seconds.
+- Bold binds the family's Bold, not its SemiBold; italic binds Italic, not Thin or
+  Light Italic; `ExtraBold` (fontconfig weight 205) maps to 800 and no longer ties
+  with Bold.
 - Italic is ineffective for families without an italic face.
 - Per-character rich text is not implemented; XLSX runs are flattened.
 
