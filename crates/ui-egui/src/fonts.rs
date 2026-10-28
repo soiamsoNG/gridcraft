@@ -267,10 +267,13 @@ fn fontconfig_face(line: &[u8]) -> Option<Face> {
 }
 
 /// The egui weight for a fontconfig weight. fontconfig's constants follow the OpenType
-/// convention (`FC_WEIGHT_REGULAR` 80, `FC_WEIGHT_BOLD` 200), not CSS numbers.
+/// convention (`FC_WEIGHT_REGULAR` 80, `FC_WEIGHT_BOLD` 200), not CSS numbers, and
+/// `FC_WEIGHT_EXTRABOLD` (205) sits as close to Bold as to Black — without its own point it would
+/// round down to 700 and tie with Bold.
 #[cfg(any(target_os = "linux", test))]
 fn fc_weight(value: u32) -> f32 {
-    const POINTS: &[(u32, f32)] = &[(0, 100.0), (40, 200.0), (50, 300.0), (80, 400.0), (100, 500.0), (180, 600.0), (200, 700.0), (210, 900.0)];
+    const POINTS: &[(u32, f32)] =
+        &[(0, 100.0), (40, 200.0), (50, 300.0), (80, 400.0), (100, 500.0), (180, 600.0), (200, 700.0), (205, 800.0), (210, 900.0)];
     POINTS.iter().min_by_key(|(fc, _)| fc.abs_diff(value)).map(|(_, weight)| *weight).unwrap_or(400.0)
 }
 
@@ -396,10 +399,19 @@ pub fn role_key(family: &str, bold: bool, italic: bool) -> String {
 
 /// The face to use for a role, or `None` when the family has no faces. Missing bold/italic faces
 /// fall back to the family's regular face, so every bound role has data behind it.
+///
+/// A family can hold every weight of a variable font (Thin through Black), so the eligible faces
+/// are not enough: the one nearest the role's own weight wins (700 for bold, 400 for regular),
+/// never just the first eligible face in catalog order (which is ascending by weight, and so
+/// would hand the bold role a `SemiBold` and the italic role a `Thin Italic`).
 fn pick_face(faces: &[Face], bold: bool, italic: bool) -> Option<&Face> {
     let regular = || faces.iter().find(|f| !f.italic && (f.weight - 400.0).abs() < 1.0);
     let exact = |wanted_bold: bool, wanted_italic: bool| {
-        faces.iter().find(|f| f.italic == wanted_italic && if wanted_bold { f.weight >= 600.0 } else { f.weight < 600.0 })
+        let target = if wanted_bold { 700.0 } else { 400.0 };
+        faces
+            .iter()
+            .filter(|f| f.italic == wanted_italic && (f.weight >= 600.0) == wanted_bold)
+            .min_by(|a, b| (a.weight - target).abs().total_cmp(&(b.weight - target).abs()))
     };
     (match (bold, italic) {
         (true, true) => exact(true, true).or_else(|| exact(true, false)).or_else(|| exact(false, true)),
@@ -661,9 +673,26 @@ mod tests {
         assert_eq!(fc_weight(100), 500.0);
         assert_eq!(fc_weight(180), 600.0);
         assert_eq!(fc_weight(200), 700.0);
+        assert_eq!(fc_weight(205), 800.0);
         assert_eq!(fc_weight(210), 900.0);
         // An unknown value picks the nearest known point instead of failing.
         assert_eq!(fc_weight(75), 400.0);
+    }
+
+    /// A family can hold every weight of a variable font, and `faces_named` hands them over in
+    /// ascending order, so each role must take the face nearest its own weight (700 bold, 400
+    /// regular) rather than the first eligible one (SemiBold, or Thin Italic).
+    #[test]
+    fn a_role_takes_the_face_nearest_its_weight() {
+        let mut faces = Vec::new();
+        for (weight, italic) in [(600.0, false), (700.0, false), (800.0, false), (100.0, true), (400.0, true), (700.0, true)] {
+            let mut f = face("Montserrat", &["Montserrat"], "/f/montserrat.ttf", weight);
+            f.italic = italic;
+            faces.push(f);
+        }
+        assert_eq!(pick_face(&faces, true, false).map(|f| f.weight), Some(700.0), "bold is Bold, not SemiBold");
+        assert_eq!(pick_face(&faces, false, true).map(|f| f.weight), Some(400.0), "italic is Italic, not Thin Italic");
+        assert_eq!(pick_face(&faces, true, true).map(|f| f.weight), Some(700.0), "bold italic keeps both");
     }
 
     #[cfg(target_os = "linux")]
