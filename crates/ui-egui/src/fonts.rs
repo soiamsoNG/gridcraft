@@ -21,6 +21,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::script::ScriptSet;
+
 /// A font file larger than this is not read for the catalog. Real fonts are far smaller; the cap
 /// keeps a hostile or damaged file from making the scan allocate its size.
 #[cfg(not(target_arch = "wasm32"))]
@@ -50,6 +52,9 @@ pub struct Face {
     pub italic: bool,
     /// Whether the face's OS/2 panose declares a serif style.
     pub serif: bool,
+    /// The scripts the face has glyphs for, as the font's charset declares them (a hit on any of
+    /// [`crate::script::SAMPLES`]'s characters per class; see [`ScriptSet`]).
+    pub scripts: ScriptSet,
 }
 
 /// The platform's font folders, used as a fallback when fontconfig is unavailable. Empty on wasm.
@@ -120,22 +125,37 @@ fn style_italic(style: &str) -> bool {
     s.contains("italic") || s.contains("oblique")
 }
 
-/// Every face in `data` as `(index, family, style, serif)`, read with `skrifa` (which parses the
-/// sfnt directory and the `name`/`OS/2` tables), in file order. `data` may be a collection.
+/// Every face in `data` as `(index, family, names, style, serif, scripts)`, where `names` holds every
+/// family name (see [`Face::names`]) and `serif` comes from the OS/2 panose. Read with `skrifa`
+/// (which parses the sfnt directory and the `name`/`OS/2` tables), in file order. `data` may be a
+/// collection; damaged data yields nothing, never a panic.
 #[cfg(not(target_arch = "wasm32"))]
-fn file_faces(data: &[u8]) -> Vec<(u32, String, String, bool)> {
+fn file_faces(data: &[u8]) -> Vec<(u32, String, Vec<String>, String, bool, ScriptSet)> {
+    use skrifa::MetadataProvider as _;
     use skrifa::raw::{FileRef, TableProvider as _};
     use skrifa::string::StringId;
 
     let Ok(file) = FileRef::new(data) else { return Vec::new() };
+    let family_ids = [StringId::TYPOGRAPHIC_FAMILY_NAME, StringId::FAMILY_NAME];
     let mut out = Vec::new();
     for (position, font) in file.fonts().enumerate() {
         let Ok(font) = font else { continue };
         let Ok(index) = u32::try_from(position) else { continue };
-        let Some(family) = face_name(&font, &[StringId::TYPOGRAPHIC_FAMILY_NAME, StringId::FAMILY_NAME]) else { continue };
+        let Some(family) = face_name(&font, &family_ids) else { continue };
+        let mut names = vec![family.clone()];
+        for name in family_ids.iter().flat_map(|id| font.localized_strings(*id)) {
+            if names.len() >= MAX_FAMILY_NAMES {
+                break;
+            }
+            let name = name.to_string().trim_matches('\0').trim().to_string();
+            if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                names.push(name);
+            }
+        }
         let style = face_name(&font, &[StringId::TYPOGRAPHIC_SUBFAMILY_NAME, StringId::SUBFAMILY_NAME]).unwrap_or_else(|| "Regular".into());
         let serif = font.os2().is_ok_and(|os2| is_serif_panose(os2.panose_10()));
-        out.push((index, family, style, serif));
+        let scripts = ScriptSet::of_coverage(|c| font.charmap().map(c).is_some());
+        out.push((index, family, names, style, serif, scripts));
     }
     out
 }
@@ -177,8 +197,8 @@ fn scan_file(path: &Path, out: &mut Vec<Face>) {
         return;
     }
     let Ok(data) = std::fs::read(path) else { return };
-    for (index, family, style, serif) in file_faces(&data) {
-        out.push(Face { family, path: path.to_path_buf(), index, weight: style_weight(&style), italic: style_italic(&style), serif });
+    for (index, family, names, style, serif, scripts) in file_faces(&data) {
+        out.push(Face { family, names, path: path.to_path_buf(), index, weight: style_weight(&style), italic: style_italic(&style), serif, scripts });
     }
 }
 
@@ -214,7 +234,7 @@ pub fn scan_dirs(dirs: &[PathBuf]) -> Vec<Face> {
 fn fontconfig_faces() -> Vec<Face> {
     let Ok(output) = std::process::Command::new("fc-list")
         .env("LC_ALL", "C")
-        .args(["-f", "%{file}\t%{index}\t%{family[0]}\t%{style[0]}\t%{weight}\t%{slant}\n"])
+        .args(["-f", "%{file}\t%{index}\t%{family[0]}\t%{family}\t%{style[0]}\t%{weight}\t%{slant}\t%{charset}\n"])
         .output()
     else {
         return Vec::new();
@@ -247,6 +267,7 @@ fn fontconfig_face(line: &[u8]) -> Option<Face> {
     let style = fields.next()?;
     let weight = fields.next()?;
     let slant = fields.next()?;
+    let charset = fields.next()?;
     if fields.next().is_some() || file.is_empty() || family.is_empty() {
         return None;
     }
@@ -263,7 +284,40 @@ fn fontconfig_face(line: &[u8]) -> Option<Face> {
     if !is_font_path(&path) {
         return None;
     }
-    Some(Face { family: family.to_string(), path, index, weight, italic: slant >= 100, serif: crate::theme::family_name_is_serif(family) })
+    // `%{family}` lists every name fontconfig knows for the face — localized names and aliases
+    // included (`Malgun Gothic, 맑은 고딕`), which a workbook may use (#1898).
+    let names = match std::str::from_utf8(names) {
+        Ok(all) => family_names(family, all),
+        Err(_) => vec![family.to_string()],
+    };
+    let scripts = ScriptSet::of_charset(&String::from_utf8_lossy(charset));
+    Some(Face {
+        family: family.to_string(),
+        names,
+        path,
+        index,
+        weight,
+        italic: slant >= 100,
+        serif: crate::theme::family_name_is_serif(family),
+        scripts,
+    })
+}
+
+/// `family` first, then each comma-separated name in `all`, trimmed, deduplicated
+/// case-insensitively and capped at [`MAX_FAMILY_NAMES`].
+#[cfg(target_os = "linux")]
+fn family_names(family: &str, all: &str) -> Vec<String> {
+    let mut names = vec![family.to_string()];
+    for name in all.split(',') {
+        if names.len() >= MAX_FAMILY_NAMES {
+            break;
+        }
+        let name = name.trim();
+        if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    names
 }
 
 /// The egui weight for a fontconfig weight. fontconfig's constants follow the OpenType
@@ -629,7 +683,21 @@ mod tests {
     #[test]
     fn file_faces_reads_ttf_name_table() {
         let faces = file_faces(epaint_default_fonts::UBUNTU_LIGHT);
-        assert_eq!(faces, vec![(0, "Ubuntu".into(), "Light".into(), false)]);
+        assert_eq!(faces.len(), 1);
+        let (index, family, names, style, serif, _) = &faces[0];
+        assert_eq!((*index, family.as_str(), style.as_str(), *serif), (0, "Ubuntu", "Light", false));
+        assert_eq!(names.first().map(String::as_str), Some("Ubuntu"), "the family name comes first");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_faces_charset_marks_the_scripts_it_covers() {
+        use crate::script::ScriptClass;
+        let faces = file_faces(epaint_default_fonts::UBUNTU_LIGHT);
+        let scripts = faces[0].5;
+        assert!(scripts.has(ScriptClass::Latin), "Ubuntu Light draws Latin");
+        assert!(!scripts.has(ScriptClass::Han), "it has no Han glyphs");
+        assert!(!scripts.has(ScriptClass::Thai), "it has no Thai glyphs");
     }
 
     /// Wrap one TTF twice in a TTC. Table offsets in a collection are relative to the TTC start,
@@ -664,8 +732,11 @@ mod tests {
         let ttc = ttc_with_two_faces(epaint_default_fonts::UBUNTU_LIGHT);
         let faces = file_faces(&ttc);
         assert_eq!(faces.len(), 2);
-        assert_eq!(faces[0], (0, "Ubuntu".into(), "Light".into(), false));
-        assert_eq!(faces[1], (1, "Ubuntu".into(), "Light".into(), false));
+        assert_eq!((faces[0].0, faces[1].0), (0, 1));
+        assert!(faces.iter().all(|(_, family, names, style, serif, _)| family == "Ubuntu"
+            && names.first().is_some_and(|n| n == "Ubuntu")
+            && style == "Light"
+            && !serif));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -730,20 +801,28 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fontconfig_records_carry_family_style_and_slant() {
-        let bold = fontconfig_face(b"/usr/share/fonts/x/NotoSans-Bold.ttf\t2\tNoto Sans\tBold\t200\t0").expect("a concrete face");
+        use crate::script::ScriptClass;
+        let bold = fontconfig_face(
+            b"/usr/share/fonts/x/NotoSans-Bold.ttf\t2\tNoto Sans\tNoto Sans,Noto Sans Bold\tBold\t200\t0\t20-7e 4e00-9fff 1f600-1f64f",
+        )
+        .expect("a concrete face");
         assert_eq!(bold.family, "Noto Sans");
         assert_eq!(bold.index, 2);
         assert_eq!(bold.weight, 700.0);
         assert!(!bold.italic);
+        assert!(bold.scripts.has(ScriptClass::Latin) && bold.scripts.has(ScriptClass::Han), "the charset names the scripts");
+        assert!(bold.scripts.has(ScriptClass::Symbols), "an emoji block covers the symbol samples");
+        assert!(!bold.scripts.has(ScriptClass::Thai), "a script absent from the charset stays out");
 
-        let italic = fontconfig_face(b"/usr/share/fonts/x/NotoSans-Italic.ttf\t0\tNoto Sans\tItalic\t80\t100").expect("an italic face");
+        let italic =
+            fontconfig_face(b"/usr/share/fonts/x/NotoSans-Italic.ttf\t0\tNoto Sans\tNoto Sans\tItalic\t80\t100\t20-7e").expect("an italic face");
         assert!(italic.italic);
 
         // The variable font's default-instance range row has no style and is not a usable face.
-        assert!(fontconfig_face(b"/usr/share/fonts/x/NotoSans[wdth,wght].ttf\t0\tNoto Sans\t\t[80 200]\t0").is_none());
+        assert!(fontconfig_face(b"/usr/share/fonts/x/NotoSans[wdth,wght].ttf\t0\tNoto Sans\tNoto Sans\t\t[80 200]\t0\t20-7e").is_none());
         // Truncated records and non-font files are ignored.
         assert!(fontconfig_face(b"/usr/share/fonts/x/NotoSans.ttf\t0\tNoto Sans").is_none());
-        assert!(fontconfig_face(b"/usr/share/fonts/x/README.txt\t0\tNoto Sans\tRegular\t80\t0").is_none());
+        assert!(fontconfig_face(b"/usr/share/fonts/x/README.txt\t0\tNoto Sans\tNoto Sans\tRegular\t80\t0\t20-7e").is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -757,6 +836,8 @@ mod tests {
         }
         assert!(faces.iter().all(|face| face.path.is_file() && is_font_path(&face.path)));
         assert!(faces.iter().all(|face| (100.0..=900.0).contains(&face.weight)));
+        // `%{charset}` has to arrive for every record, so a Latin face says so.
+        assert!(faces.iter().any(|face| face.scripts.has(crate::script::ScriptClass::Latin)), "charset parsed");
         let unique: HashSet<(&PathBuf, u32)> = faces.iter().map(|face| (&face.path, face.index)).collect();
         assert_eq!(unique.len(), faces.len(), "fc-list duplicates are removed");
     }
@@ -820,7 +901,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("Ubuntu-Light.ttf");
         std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
-        let face = Face { family: "Ubuntu".into(), names: vec!["Ubuntu".into()], path, index: 0, weight: 300.0, italic: false, serif: false };
+        let face = Face {
+            family: "Ubuntu".into(),
+            names: vec!["Ubuntu".into()],
+            path,
+            index: 0,
+            weight: 300.0,
+            italic: false,
+            serif: false,
+            scripts: ScriptSet::of_text("A"),
+        };
 
         let mut fonts = egui::FontDefinitions::default();
         let fallback = ScriptFallbacks::default();
@@ -845,7 +935,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("Ubuntu-Light.ttf");
         std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
-        let face = Face { family: "Ubuntu".into(), path, index: 0, weight: 300.0, italic: false, serif: false };
+        let face = Face {
+            family: "Ubuntu".into(),
+            names: vec!["Ubuntu".into()],
+            path,
+            index: 0,
+            weight: 300.0,
+            italic: false,
+            serif: false,
+            scripts: ScriptSet::of_text("A"),
+        };
 
         let mut fonts = egui::FontDefinitions::default();
         let data = || std::sync::Arc::new(egui::FontData::from_owned(epaint_default_fonts::UBUNTU_LIGHT.to_vec()));
@@ -898,7 +997,16 @@ mod tests {
         let path = dir.join("Ubuntu-Light.ttf");
         std::fs::write(&path, with_panose(epaint_default_fonts::UBUNTU_LIGHT, [2, 2])).expect("write");
         // The catalog hint says sans; the loaded bytes say serif, and binding trusts the bytes.
-        let face = Face { family: "Ubuntu".into(), path, index: 0, weight: 300.0, italic: false, serif: false };
+        let face = Face {
+            family: "Ubuntu".into(),
+            names: vec!["Ubuntu".into()],
+            path,
+            index: 0,
+            weight: 300.0,
+            italic: false,
+            serif: false,
+            scripts: ScriptSet::of_text("A"),
+        };
 
         let mut fonts = egui::FontDefinitions::default();
         let data = || std::sync::Arc::new(egui::FontData::from_owned(epaint_default_fonts::UBUNTU_LIGHT.to_vec()));
@@ -951,7 +1059,16 @@ mod tests {
     const KO: u16 = 0x0412;
 
     fn face(family: &str, names: &[&str], path: &str, weight: f32) -> Face {
-        Face { family: family.into(), names: names.iter().map(|s| s.to_string()).collect(), path: path.into(), index: 0, weight, italic: false }
+        Face {
+            family: family.into(),
+            names: names.iter().map(|s| s.to_string()).collect(),
+            path: path.into(),
+            index: 0,
+            weight,
+            italic: false,
+            serif: false,
+            scripts: ScriptSet::of_text("A"),
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -961,14 +1078,14 @@ mod tests {
         let font = font_with_names(&[(EN, 1, "Malgun Gothic"), (EN, 2, "Regular"), (KO, 1, "맑은 고딕"), (KO, 2, "보통")]);
         let faces = file_faces(&font);
         assert_eq!(faces.len(), 1);
-        let (_, family, names, style) = &faces[0];
+        let (_, family, names, style, _, _) = &faces[0];
         assert_eq!(family, "Malgun Gothic", "the font list keeps the English name");
         assert_eq!(names, &["Malgun Gothic", "맑은 고딕"]);
         assert_eq!(style, "Regular");
 
         // Both name IDs are kept: a legacy family name (ID 1) names a single face (#1606).
         let font = font_with_names(&[(EN, 1, "Noto Sans KR Medium"), (EN, 2, "Regular"), (EN, 16, "Noto Sans KR"), (EN, 17, "Medium")]);
-        let (_, family, names, _) = &file_faces(&font)[0];
+        let (_, family, names, _, _, _) = &file_faces(&font)[0];
         assert_eq!(family, "Noto Sans KR");
         assert_eq!(names, &["Noto Sans KR", "Noto Sans KR Medium"]);
     }
@@ -978,7 +1095,7 @@ mod tests {
     fn a_name_table_full_of_names_is_capped() {
         let texts: Vec<String> = (0..100).map(|i| format!("Family {i}")).collect();
         let records: Vec<(u16, u16, &str)> = texts.iter().enumerate().map(|(i, t)| (0x0400 + i as u16, 1, t.as_str())).collect();
-        let (_, _, names, _) = &file_faces(&font_with_names(&records))[0];
+        let (_, _, names, _, _, _) = &file_faces(&font_with_names(&records))[0];
         assert_eq!(names.len(), MAX_FAMILY_NAMES);
     }
 
@@ -1038,7 +1155,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("Ubuntu-Light.ttf");
         std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
-        let f = Face { family: "Ubuntu".into(), names: vec!["Ubuntu".into(), "우분투".into()], path, index: 0, weight: 300.0, italic: false };
+        let f = Face {
+            family: "Ubuntu".into(),
+            names: vec!["Ubuntu".into(), "우분투".into()],
+            path,
+            index: 0,
+            weight: 300.0,
+            italic: false,
+            serif: false,
+            scripts: ScriptSet::of_text("A"),
+        };
 
         let mut fonts = egui::FontDefinitions::default();
         let before = fonts.font_data.len();
