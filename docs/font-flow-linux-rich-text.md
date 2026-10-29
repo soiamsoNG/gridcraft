@@ -509,6 +509,7 @@ Consequences:
 | `list_fonts`/`fc-list` subprocess | No direct fontconfig library access; extra process and parsing. |
 | First bind reads whole font | Large CJK font can read 56 MiB; cold page cache can take seconds. |
 | `pending_bound` solves flash, not atlas cost | First frame after a large new font can still freeze. |
+| Opening a workbook waits for the font scan | The first font set is built once, from the workbook's scripts, so opening blocks for one `fc-list` run (~50 ms); without fontconfig every installed file is parsed instead, which can take seconds. |
 | `load_fallback` dedupes by path within one call | Sans and serif are separate calls: the Serif CJK TTC loads only when a serif face is actually needed. |
 | Serif companions load on demand | A serif workbook font pays ~55 MB for Noto Serif CJK; a sans-only workbook never loads it. |
 | `try_load` checks parseability, not script coverage | `fc-match` substitute may be chosen even if it lacks the script. |
