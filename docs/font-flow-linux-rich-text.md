@@ -450,8 +450,14 @@ without an italic face. This is a known limitation.
 
 Flow:
 
-1. If `!fonts_ready`, rebuild the base font set, clear `pending_bound`, and wait
-   for the next pass.
+1. If `!fonts_ready`, install the first font set and wait for the next pass. With
+   a workbook already open this set is built from its `used_fonts()` and
+   `used_scripts()` straight away (`install_first_font_set()` in `lib.rs`),
+   waiting for `fonts::catalog()` first: a script the built-in fallback list
+   does not cover (Bengali, Ethiopic) can only come from the catalog, and binding
+   it one pass later rebuilt the glyph atlas after the cells had already painted
+   — the two rows showed tofu for a second or two (#1231). An empty workbook
+   keeps the non-blocking path.
 2. Else if `fonts_rebind`, egui has activated the set made on the previous pass:
    publish `pending_bound` with `fonts::set_bound()`, clear the flag.
 3. Else if the scan is done and the workbook revision changed, compute
@@ -1421,7 +1427,7 @@ Current test result:
 
 ```text
 cargo +1.95.0 test -p gridcraft-ui-egui --lib
-199 passed, 0 failed
+222 passed, 0 failed
 ```
 
 The full `cargo xtask ci` was not run for this branch; the affected crates are
@@ -1661,6 +1667,9 @@ Still open:
 
 Current app behavior:
 
+- A workbook whose text uses a script only the installed-font catalog can name
+  (Bengali, Ethiopic) paints that text in the first frame: the first font set
+  waits for the catalog scan instead of rebinding after the grid has painted.
 - Chinese UI and cell text render correctly on the host.
 - Format Cells font list includes host fonts.
 - Ribbon font list includes host fonts.
