@@ -379,6 +379,39 @@ impl SheetApp {
         theme::apply(ctx, dark);
     }
 
+    /// Installs the font set the first frame is built with.
+    ///
+    /// With a workbook open the set is built for its fonts and text scripts straight away. A
+    /// script the built-in fallback list does not cover (Bengali, Ethiopic) can only come from the
+    /// installed-font catalog, and binding it one pass later would rebuild the glyph atlas
+    /// mid-startup — the cells showed tofu for a second or two (#1231). Waiting for the catalog is
+    /// one `fc-list` run; an empty workbook keeps the non-blocking path.
+    fn install_first_font_set(&mut self, ctx: &egui::Context) {
+        let used = self.used_fonts();
+        let scripts = self.used_scripts();
+        self.fonts_bound.clear();
+        self.fonts_scripts = crate::script::ScriptSet::EMPTY;
+        self.fonts_seen = (0, 0);
+        self.pending_bound = None;
+        self.fonts_rebind = false;
+        if scripts.is_empty() {
+            SheetApp::setup_context_for_language(ctx, self.ui.dark, self.ui.language);
+            return;
+        }
+        // Blocking here costs one `fc-list` (tens of milliseconds) and saves the atlas rebuild a
+        // later rebind would trigger.
+        let _ = fonts::catalog();
+        let (defs, bound) = theme::font_definitions_with_bound(self.ui.language, &used, scripts);
+        ctx.set_fonts(defs);
+        theme::apply(ctx, self.ui.dark);
+        self.fonts_bound = used;
+        self.fonts_scripts = scripts;
+        self.fonts_seen = self.session.active().map(|d| (d.uid, d.revision)).unwrap_or((0, 0));
+        // Nothing paints before `fonts_ready`, so the roles this set installs can be advertised
+        // now; leaving them pending would paint the first visible frame with role families only.
+        crate::fonts::set_bound(bound);
+    }
+
     /// The font names the active workbook uses: every style's font plus the theme's heading/body
     /// fonts. These are the families [`fonts`] binds an installed file for.
     pub fn used_fonts(&self) -> Vec<String> {
@@ -1218,13 +1251,8 @@ impl SheetApp {
             if self.fonts_set {
                 self.fonts_ready = true;
             } else {
-                SheetApp::setup_context_for_language(ctx, self.ui.dark, self.ui.language);
+                self.install_first_font_set(ctx);
                 self.fonts_set = true;
-                // The rebuilt set has no workbook fonts yet: bind them again once it is active.
-                self.fonts_bound.clear();
-                self.fonts_scripts = crate::script::ScriptSet::EMPTY;
-                self.fonts_seen = (0, 0);
-                self.pending_bound = None;
                 self.fonts_han = Some(theme::HanOrder::of(self.ui.language));
                 ctx.request_repaint();
             }
