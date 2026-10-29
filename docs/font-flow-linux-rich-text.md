@@ -1642,50 +1642,22 @@ Still open:
 
 ## 12. Current project status
 
-- Branch: `fix/linux-fontconfig`
-- HEAD at the start of this rewrite: `775a14a`
-- HEAD after the weight/face-selection fix: `57df98d`
-- HEAD after binding substitutes for uninstalled standard names: `0d58e8d`
-- HEAD after Phase 3 (scripts, catalog, per-script fallback loading): `561e539`
-- HEAD after the catalog fallback selector: `b9283ba`
-- HEAD after classifying Bengali and Ethiopic: `ac0bacd`
+- Branch: `fix/linux-fontconfig-0121`, created with
+  `git rebase --onto v0.12.1 ac8da7d4` on 2026-10-29 (34 commits). `v0.12.1` is
+  the newest release that still takes IME input; 0.13.0 lost it in the egui 0.37
+  migration, and this branch is the base for fixing that on a tree we can ship.
+- HEAD after the rebase: `4f219953` (`fix(ui): align the font layer with the
+  0.12.1 signatures (#1231)`)
+- The rebase rewrote history: the hashes quoted in §3–§11 and in earlier
+  revisions of this note (`775a14a`, `57df98d`, `0d58e8d`, `561e539`, `b9283ba`,
+  `ac0bacd`) name the pre-rebase commits. They are still reachable on
+  `backup/linux-fontconfig-0.13` and keep their original subjects.
 - Remote PR branch: `fork/fix/linux-fontconfig` at `57df98d` (everything after it
   is local only, not pushed)
 - PR: `#1972`
-- PR state: open; base `main`, currently reported `CONFLICTING` because the branch
-  merged an older `origin/main` (`ac8da7d4`) and upstream has moved on
-
-Commits on the branch (newest first):
-
-```text
-ac0bacd  feat(ui): classify Bengali and Ethiopic text (#1231)
-b9283ba  feat(ui): choose a fallback family from the catalog for an uncovered script (#1231)
-561e539  fix(ui): reload fallback faces when the cell text gains a script (#1231)
-8eafe63  feat(ui): load fallback faces only for the scripts in use (#1231)
-70444ae  feat(ui): index installed faces by family and script (#1231)
-504cc8a  feat(ui): record the scripts each face covers (#1231)
-cbdc666  feat(ui): classify text into script runs (#1231)
-0d58e8d  fix(ui): bind the OS substitute for a standard font that is not installed (#1231)
-57df98d  fix(ui): weight ExtraBold and pick the face nearest each role (#1231)
-(merge)  Merge remote-tracking branch 'origin/main'
-37eeb7f  docs: record how to check fontconfig rules (#1231)
-5d47d82  flatpak: split language rules so fontconfig keeps their tests (#1231)
-64501b2  perf(ui): build the Linux font catalog from fontconfig metadata (#1231)
-3c53f22  fix(ui): apply fontconfig named instances to variable font matches (#1231)
-52d2839  fix(ui): use serif script fallbacks for serif faces (#1231)
-a0e1547  fix(ui): keep script fallbacks in bound families (#1231)
-5f55c30  flatpak: install fontconfig snippets
-735e986  docs: add Linux font flow and rich text design note (#1231)
-775a14a  docs: add Linux font flow design note (#1231)
-09b0d1d  perf(ui): reuse bound font data across rebinds (#1231)
-8eb6977  perf(ui): cache Linux fontconfig lookups (#1231)
-fb96434  fix(ui): defer bound font roles until fonts activate (#1231)
-b282d8f  fix(ui): list installed Linux fonts in the ribbon (#1231)
-2ed8fc0  fix(ui): resolve Linux font roles with fontconfig (#1231)
-a80b10c  perf(ui): read font names without loading whole files (#1231)
-4d9068a  fix(ui): discover Linux fonts with fontconfig (#1231)
-c17854d  fix(ui): start Linux font scan on context setup (#1231)
-```
+- PR state: open; base `main`. This rebased branch is a local development line: a
+  tag cannot be a PR base, so pushing it would add the 166 release commits
+  between `ac8da7d4` and `v0.12.1` to the PR diff.
 
 Current app behavior:
 
