@@ -398,9 +398,6 @@ pub(crate) fn apply_named_instance(fd: &mut FontData, instance: u32) {
 fn try_load(paths: &[(&str, u32)]) -> Option<FontData> {
     for (p, raw) in paths {
         let (index, instance) = fc_index_parts(*raw);
-        if !std::path::Path::new(p).is_file() {
-            continue;
-        }
         let Some(bytes) = font_file(p, index) else {
             log::warn!("skipping font {p} (face {index}): not a font file egui can read");
             continue;
@@ -410,8 +407,7 @@ fn try_load(paths: &[(&str, u32)]) -> Option<FontData> {
         if let Some(instance) = instance {
             apply_named_instance(&mut fd, instance);
         }
-            return Some(fd);
-        }
+        return Some(fd);
     }
     None
 }
@@ -1228,12 +1224,6 @@ fn script_serif(lang: &str, files: &[&str]) -> Vec<(String, u32)> {
     v
 }
 
-/// Lao faces: Noto Sans Lao where installed, plus the usual Debian/Arch names.
-#[cfg(not(target_arch = "wasm32"))]
-fn lao() -> Vec<(String, u32)> {
-    script_face("lo", &["NotoSansLao-Regular.ttf", "NotoSansLao[wght].ttf"])
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn lao_serif() -> Vec<(String, u32)> {
     script_serif("lo", &["NotoSerifLao-Regular.ttf", "NotoSerifLao[wght].ttf"])
@@ -1859,7 +1849,7 @@ mod tests {
         // Real render check, per script: the proportional family (what cells and the UI use) must
         // resolve a sample string to a real glyph, not the tofu replacement char. Skips a script
         // whose face is absent (a minimal machine) and fails if a face is present but not wired in.
-        let cases: [(&str, Vec<(String, u32)>, &str, Option<&str>); 7] = [
+        let cases: [(&str, Vec<(String, u32)>, &str, Option<&str>); 8] = [
             ("sys-cjk-han-ja", cjk_han_japanese(), "カテゴリ", Some("ja")),
             ("sys-cjk-han-zh", cjk_han_simplified(), "页面布局 客户端配置", Some("zh-cn")),
             ("sys-cjk-hangul", cjk_hangul(), "한글", Some("ko")),
@@ -2094,14 +2084,20 @@ mod tests {
             ("hebrew", paths(hebrew()), "google-noto-vf/NotoSansHebrew[wght].ttf", "/NotoSansHebrew-Regular.ttf"),
         ];
         for (role, list, fedora_file, earlier) in &cases {
-            let at = list.iter().position(|p| *p == format!("/usr/share/fonts/{fedora_file}"));
+            // fontconfig's own answer can name the same file before the hard-coded list, so ask
+            // for the last occurrence: that one is the fallback entry this test is about.
+            let at = list.iter().rposition(|p| *p == format!("/usr/share/fonts/{fedora_file}"));
             let last_earlier = list.iter().rposition(|p| p.ends_with(earlier));
             assert!(at.is_some(), "{role}: Fedora's {fedora_file} is not a candidate");
             assert!(last_earlier.is_some(), "{role}: no existing {earlier} candidate to compare with");
             assert!(at > last_earlier, "{role}: {fedora_file} must come after every existing {earlier}");
         }
         // Liberation Mono only stands in for DejaVu Sans Mono, wherever that is installed.
+        // Same as above: the fallback order is what this test checks, not fontconfig's answer.
         let mono = paths(candidates(MONO));
+        #[cfg(target_os = "linux")]
+        let mono = mono.get(linux_fontconfig_candidates(MONO).len().min(mono.len())..).unwrap_or_default();
+        let mono = mono.to_vec();
         let first_liberation = mono.iter().position(|p| p.ends_with("LiberationMono-Regular.ttf"));
         let last_dejavu = mono.iter().rposition(|p| p.ends_with("DejaVuSansMono.ttf"));
         assert!(first_liberation.is_some() && first_liberation > last_dejavu, "Liberation Mono must follow DejaVu Sans Mono: {mono:?}");

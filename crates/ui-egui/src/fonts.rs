@@ -264,6 +264,7 @@ fn fontconfig_face(line: &[u8]) -> Option<Face> {
     let file = fields.next()?;
     let index = fields.next()?;
     let family = fields.next()?;
+    let names = fields.next()?;
     let style = fields.next()?;
     let weight = fields.next()?;
     let slant = fields.next()?;
@@ -565,7 +566,7 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
     let mut bound: Vec<String> = Vec::new();
     for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
         let Some(primary) = pick_face(faces, bold, italic) else { continue };
-        let primary_key = face_key(family, primary);
+        let primary_key = face_key(primary);
         if !fonts.font_data.contains_key(&primary_key)
             && let Some(fd) = load_face(primary)
         {
@@ -1168,8 +1169,9 @@ mod tests {
 
         let mut fonts = egui::FontDefinitions::default();
         let before = fonts.font_data.len();
-        let mut bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&f));
-        bound.extend(bind_faces(&mut fonts, "우분투", std::slice::from_ref(&f)));
+        let fallback = ScriptFallbacks::default();
+        let mut bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&f), &fallback);
+        bound.extend(bind_faces(&mut fonts, "우분투", std::slice::from_ref(&f), &fallback));
         assert!(bound.contains(&role_key("우분투", false, false)), "bound under the workbook's name");
         assert!(bound.contains(&role_key("Ubuntu", true, true)));
         assert_eq!(fonts.font_data.len(), before + 1, "one file, loaded once");
