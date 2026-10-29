@@ -739,6 +739,10 @@ pub struct ResolvedFace { pub face: usize, pub weight_gap: f32, pub slant: Slant
    face: shear the glyph mesh by about 12° for italic, or embolden the outline
    (stroke, or a small double-draw offset) for bold. Mark the result
    `Synthetic`; layout keeps the face's advances so columns do not jump.
+   **Deferred** (§13.13): epaint 0.36.2 has no shear and never synthesises, so
+   faux bold would need a double-draw workaround and faux italic an upstream
+   change. Until then a family without the face keeps its regular (step 6
+   applies), and `bind_faces()` logs the degrade at debug level.
 5. **Substitute family**, only when the requested family is not installed: rank
    the script/role candidates by style match first, then by candidate order. A
    candidate with the exact style beats an earlier candidate with only regular.
@@ -1428,7 +1432,7 @@ Current test result:
 
 ```text
 cargo +1.95.0 test -p gridcraft-ui-egui --lib
-222 passed, 0 failed
+223 passed, 0 failed
 ```
 
 The full `cargo xtask ci` was not run for this branch; the affected crates are
@@ -1629,6 +1633,9 @@ Still open:
 - Add a layout cache keyed by text/style/width/zoom/font generation.
 - Start with `LayoutJob` sections (MVP); move to pre-shaped glyph runs if
   color-boundary kerning matters.
+- Optional, parity-only: synthetic bold (double-draw offset, advances kept) for
+  a family that has no bold face; synthetic italic stays blocked on epaint
+  (§13.13). Both would be marked `SlantFallback::Synthetic`, never as exact.
 
 ### Phase 5: replace subprocesses
 
@@ -1732,9 +1739,18 @@ Current app behavior:
 13. Should the renderer synthesise bold and italic (stroke / shear) for an
     installed family that lacks those faces, or is substituting another family
     acceptable? §5.3.1 prefers synthesis inside the family and substitution only
-    when the family is missing, but epaint has no shear yet. *Partly answered:*
-    for a standard name that is not installed at all, the OS substitute is bound
-    in all four roles (`substitute_family()`), which is the "missing family" case. Installed-but-style-less families still bind regular.
+    when the family is missing. *Answered for now, deferred for the rest:*
+    - A standard name that is not installed at all binds the OS substitute in
+      all four roles (`substitute_family()`): the "missing family" case, step 5.
+    - A family that is installed but lacks the face keeps its regular face, the
+      step 6 degrade, and `bind_faces()` logs which role degraded and why. It is
+      the honest option while epaint has no synthesis.
+    - Synthetic **bold** is feasible without touching epaint (draw the run twice
+      with a sub-pixel offset), but it changes how text widths are measured, so
+      it belongs in Phase 4 next to the paint spans, not before them.
+    - Synthetic **italic** needs a glyph-mesh shear that `FontId` cannot express.
+      It waits for upstream epaint (or a deliberate decision to fork the
+      painting path), which the "UI crate is swappable" rule argues against.
 14. Should `model::Font` gain a numeric weight now, or keep `bold: bool` until
     the catalog exposes real weights? §5.3.1 supports both; the family-key
     constraint only becomes visible once a workbook uses more than 400/700.

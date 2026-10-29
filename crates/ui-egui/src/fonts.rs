@@ -565,7 +565,18 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
     let base: Vec<String> = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
     let mut bound: Vec<String> = Vec::new();
     for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+        let role = role_key(family, bold, italic);
         let Some(primary) = pick_face(faces, bold, italic) else { continue };
+        if (primary.weight >= 600.0) != bold || primary.italic != italic {
+            // No face of this family carries the requested style: the role keeps a regular face.
+            // That degrade is invisible without a log line, and §13.13 has no synthesis to hide it.
+            log::debug!(
+                "font role {role}: {family} has no italic/bold face for this role, using {} (weight {}, italic {})",
+                primary.family,
+                primary.weight,
+                primary.italic
+            );
+        }
         let primary_key = face_key(primary);
         if !fonts.font_data.contains_key(&primary_key)
             && let Some(fd) = load_face(primary)
@@ -601,7 +612,6 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
         chain.extend(base.iter().cloned());
         // A key without data would make egui panic when it builds the atlas.
         chain.retain(|k| fonts.font_data.contains_key(k));
-        let role = role_key(family, bold, italic);
         fonts.families.insert(egui::FontFamily::Name(role.clone().into()), chain);
         bound.push(role);
     }
@@ -797,6 +807,16 @@ mod tests {
         assert_eq!(pick_face(&faces, true, false).map(|f| f.weight), Some(700.0), "bold is Bold, not SemiBold");
         assert_eq!(pick_face(&faces, false, true).map(|f| f.weight), Some(400.0), "italic is Italic, not Thin Italic");
         assert_eq!(pick_face(&faces, true, true).map(|f| f.weight), Some(700.0), "bold italic keeps both");
+    }
+
+    /// A family with no bold and no italic face keeps its regular one: the degrade §13.13
+    /// accepts, which `bind_faces` now logs instead of hiding.
+    #[test]
+    fn a_family_without_the_style_keeps_its_regular_face() {
+        let faces = vec![face("Ubuntu", &["Ubuntu"], "/f/ubuntu.ttf", 400.0)];
+        assert_eq!(pick_face(&faces, true, false).map(|f| f.weight), Some(400.0));
+        assert_eq!(pick_face(&faces, false, true).map(|f| f.weight), Some(400.0));
+        assert_eq!(pick_face(&faces, true, true).map(|f| f.weight), Some(400.0));
     }
 
     #[cfg(target_os = "linux")]
