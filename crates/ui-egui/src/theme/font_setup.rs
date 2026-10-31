@@ -502,6 +502,7 @@ fn font_definitions_impl(
     // face per installed script on startup.
     let known = !scripts.is_empty();
     let fallback = if system { font_fallback::load_fallback(&mut fonts, han, false, wanted, known) } else { Vec::new() };
+
     // Serif companions (Noto Serif CJK alone is ~55 MB) are loaded only when something asks for a
     // serif face: a workbook font whose name reads as serif, or the serif role.
     let want_serif = used.iter().any(|name| crate::fonts::family_name_is_serif(name));
@@ -529,7 +530,7 @@ fn font_definitions_impl(
     // Installed workbook fonts, so a cell's chosen font actually renders in it.
     if system {
         for family in crate::fonts::installed_among(used) {
-            bound.extend(crate::fonts::bind_family(&mut fonts, &family));
+            bound.extend(crate::fonts::bind_family(&mut fonts, &family, &fallback, &bold_sans));
         }
         // A standard name this machine does not have is bound to the face the desktop substitutes
         // for it, under the name the workbook uses: Times New Roman cells keep bold and italic
@@ -546,7 +547,7 @@ fn font_definitions_impl(
             if faces.is_empty() {
                 continue;
             }
-            bound.extend(crate::fonts::bind_faces(&mut fonts, name, &faces));
+            bound.extend(crate::fonts::bind_faces(&mut fonts, name, &faces, &fallback, &bold_sans));
         }
     }
     // Interface text (formula bar, name box, dialogs) falls back to the cell font before the
