@@ -150,13 +150,16 @@ pub(crate) fn ink_bottom_inset(galley: &egui::Galley) -> f32 {
     }
 }
 
+/// What share of the space below the ink is kept as a gap: the rest of the font's descent is taken
+/// up by putting the glyphs nearer the cell's bottom edge, the way Excel does.
+const BOTTOM_TRAIL: f32 = 0.25;
+
 pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, inset: f32) -> f32 {
     let pad_v = 1.5 * z;
     let y_top = rect.top() + pad_v;
     // Not clamped to `y_top`: text taller than the row overflows upward (Bottom) or both ways
     // (Center), and the cell's clip rect trims it, so Middle and Bottom stay distinct from Top.
-    // Only half of the trailing descent is kept as space below the ink.
-    let y_bottom = rect.bottom() - gh + 0.5 * inset - 0.5 * pad_v;
+    let y_bottom = rect.bottom() - gh + (1.0 - BOTTOM_TRAIL) * inset - BOTTOM_TRAIL * pad_v;
     match valign {
         VAlign::Top => y_top,
         VAlign::Center | VAlign::Justify | VAlign::Distributed => (y_top + y_bottom) / 2.0,
@@ -170,8 +173,7 @@ pub(crate) fn cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, inset: f3
     // Not clamped to `y_top`: a line mixing scripts sits taller than the row (its fallback faces are
     // put on the baseline, #1231), so Bottom lets the extra ascent overflow above and the cell's clip
     // trims it there. Clamping would push the baseline down and hang the glyphs under the row.
-    // Only half of the trailing descent is kept as space below the ink.
-    let y_bottom = rect.bottom() - gh + 0.5 * inset - 0.25 * z;
+    let y_bottom = rect.bottom() - gh + (1.0 - BOTTOM_TRAIL) * inset - BOTTOM_TRAIL * 0.5 * z;
     match valign {
         VAlign::Top => y_top,
         VAlign::Center | VAlign::Justify | VAlign::Distributed => (y_top + y_bottom) / 2.0,
