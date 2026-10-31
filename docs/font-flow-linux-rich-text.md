@@ -522,6 +522,7 @@ Consequences:
 | Host/Flatpak fontconfig differs | The Flatpak ships `65-lang.conf`, `70-noto-cjk.conf` and `75-noto-color-emoji.conf`; the 28 East/Southeast Asian `lang` probes now match the host exactly. |
 | epaint puts each face on its own baseline | Upstream #8802: a glyph's `y` comes from its face's ascent, so a CJK fallback face hangs below the Latin baseline by ~0.3 em. `align_baselines()` in `crates/ui-egui/src/grid.rs` re-bases the row after layout and moves the quads tessellation already produced; it costs one galley clone per mixed cell per frame (`Arc::make_mut` inside `align_baselines`), and goes away when upstream #8804 lands. |
 | A rebuilt font set carries the previous families | egui activates a new set a pass after `set_fonts`, while the roles are published a pass later, so a rebuild that drops a role used to let `cell_family` name a family egui did not have (`FontFamily::Name(..) is not bound to any fonts`, a panic). `theme::merge_missing_fonts()` keeps the new set a superset of the old one and `fonts::set_bound_for()` refuses to advertise a role the definitions lack. The carried faces cost memory until restart. |
+| Bold scripts need a bold face from the host | `sys-script-<script>-bold` comes from the catalog (`font_for_script(script, serif, bold)` prefers weight 600+); a host that ships no bold face for a script keeps its regular one. The Flatpak installs no CJK font, so this is entirely the host's call. |
 | Cell layout never panics on a missing family | A role is advertised a pass before egui installs it; `layout_cell()` catches epaint's `FontFamily::Name(..) is not bound to any fonts` and retries with the proportional family, logging which role was missing. The bookkeeping bug stays a warning, not a crash. |
 | No rich-text model | Per-character formatting is lost; XLSX runs are flattened. |
 
@@ -1441,7 +1442,7 @@ Current test result:
 
 ```text
 cargo +1.95.0 test -p gridcraft-ui-egui --lib
-230 passed, 0 failed
+232 passed, 0 failed
 ```
 
 The full `cargo xtask ci` was not run for this branch; the affected crates are
@@ -1671,7 +1672,8 @@ Still open:
   `git rebase --onto v0.12.1 ac8da7d4` on 2026-10-29 (34 commits). `v0.12.1` is
   the newest release that still takes IME input; 0.13.0 lost it in the egui 0.37
   migration, and this branch is the base for fixing that on a tree we can ship.
-- Last code commit: `f1946258` (`fix(ui): lay cell text out even when a
+- Last code commit: `bbafc485` (`fix(ui): draw bold CJK text with the host's bold
+  face (#1231)`, on top of `f1946258`); earlier: `f1946258` (`fix(ui): lay cell text out even when a
   family is missing (#1231)`, on top of `74067f64`); earlier: `74067f64` (`fix(ui): keep a font set's roles resolvable
   while it is replaced (#1231)`, on top of `949b603d`, `4aef9bc3` and
   `c24c562d`); the rebase itself ended at `4f219953`.
@@ -1705,6 +1707,9 @@ Current app behavior:
   the name is not installed, so the family fontconfig substitutes for it
   (Liberation Serif, Caladea, Liberation Mono) is bound in all four roles under
   the requested name. The same now applies to every standard `ribbon::FONTS` name.
+- Chinese text in a bold Calibri cell draws bold: the Han glyphs come from the host's bold CJK
+  face (`sys-script-han-bold`) instead of the regular fallback, and the face is only loaded when
+  the workbook actually has bold text in that script.
 - Opening a workbook no longer panics while the font set is rebuilt: the new set keeps the
   families the old one advertised (`fnt:Arial:*` came from the default theme and vanished once a
   Calibri-only workbook loaded).
