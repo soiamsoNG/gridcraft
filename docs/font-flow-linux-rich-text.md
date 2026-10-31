@@ -514,7 +514,7 @@ Consequences:
 | Serif companions load on demand | A serif workbook font pays ~55 MB for Noto Serif CJK; a sans-only workbook never loads it. |
 | `try_load` checks parseability, not script coverage | `fc-match` substitute may be chosen even if it lacks the script. |
 | `families()` rebuilds the list on every call | Ribbon calls it per frame; potentially wasteful. |
-| Missing bold/italic face | A missing italic is slanted by epaint (`TextFormat::italics`) in cell painting; a missing bold still renders as regular, and the editor and formula bar do not slant yet. `SERIF` and `MONO` have no style roles either, so a standard name that is *not* installed used to lose bold and italic; its substitute is now bound in all four roles (#1231). |
+| Missing bold/italic face | A missing italic is slanted by epaint (`TextFormat::italics`) per script run in cell painting; a missing bold still renders as regular, and the editor and formula bar do not slant yet. Only bound role families are judged: the built-in `cell-*`/`SERIF`/`MONO` chains are left upright. `SERIF` and `MONO` have no style roles either, so a standard name that is *not* installed used to lose bold and italic; its substitute is now bound in all four roles (#1231). |
 | No cache invalidation | Fonts installed while running are not picked up until restart. |
 | `ScriptSet` is full | All 16 bits are used (Latin … Ethiopic); a new script class needs the set widened to `u32` first (§13 question 15). |
 | An empty workbook asks for everything | Until the first text is seen, `wanted_scripts()` returns `ScriptSet::all()` so the first frame cannot show tofu; an empty sheet therefore loads every installed fallback. |
@@ -738,12 +738,16 @@ pub struct ResolvedFace { pub face: usize, pub weight_gap: f32, pub slant: Slant
 4. **Synthetic style**, only when the family is installed but has no matching
    face. Italic already works: epaint shears any glyph whose
    `TextFormat::italics` is set (the top vertices move by a quarter of the font
-   size, about 14°; advances and the cell width do not change), so
-   `bind_faces()` records each role it had to degrade and the grid lays those
-   cells out with the flag on. Bold still needs a stroke or a double-draw
-   offset, which changes measured widths, so it stays deferred to Phase 4
-   (§13.13). A degraded role keeps the face's advances and is logged at debug
-   level.
+   size, about 14°; advances and the cell width do not change). The judgement is
+   per script run, not per cell: `bind_faces()` records which scripts the role's
+   real italic faces cover (`fonts::italic_coverage()`), and the grid lays the
+   cell out as one section per `script::split_runs()` run, slanting only the runs
+   beyond that set. That matters because a substitute family often has a
+   Latin-only italic — Calibri → Carlito Italic — while the Han glyphs come from
+   a CJK fallback face that ships no italic at all. Bold still needs a stroke or
+   a double-draw offset, which changes measured widths, so it stays deferred to
+   Phase 4 (§13.13). A degraded role keeps the face's advances and is logged at
+   debug level.
 5. **Substitute family**, only when the requested family is not installed: rank
    the script/role candidates by style match first, then by candidate order. A
    candidate with the exact style beats an earlier candidate with only regular.
@@ -1664,8 +1668,9 @@ Still open:
   `git rebase --onto v0.12.1 ac8da7d4` on 2026-10-29 (34 commits). `v0.12.1` is
   the newest release that still takes IME input; 0.13.0 lost it in the egui 0.37
   migration, and this branch is the base for fixing that on a tree we can ship.
-- Last code commit: `c24c562d` (`feat(ui): slant the cell text of a family
-  that has no italic face (#1231)`); the rebase itself ended at `4f219953`.
+- Last code commit: `4aef9bc3` (`fix(ui): slant only the scripts the italic
+  face does not cover (#1231)`, on top of `c24c562d`); the rebase itself ended
+  at `4f219953`.
   (This note is edited on top of it, so its own hash is not quoted.)
 - The rebase rewrote history: the hashes quoted in §3–§11 and in earlier
   revisions of this note (`775a14a`, `57df98d`, `0d58e8d`, `561e539`, `b9283ba`,
@@ -1698,7 +1703,10 @@ Current app behavior:
   the requested name. The same now applies to every standard `ribbon::FONTS` name.
 - Italic works for families that are installed but have no italic face: the cell
   text is sheared by epaint (`TextFormat::italics`), at the family's advances, so
-  a column does not change width. A real italic face is used as it is.
+  a column does not change width. A real italic face is used as it is, and the
+  shear is decided per script run: in a Calibri cell the Latin glyphs come from
+  Carlito Italic and the Han glyphs are slanted, instead of the Han staying
+  upright.
 - Fallback faces load per script: a Latin-only workbook no longer asks for the
   CJK, Thai or Hebrew faces, and Chinese text added later loads the Han face on
   the next pass (`used_scripts()` is compared when the workbook revision
