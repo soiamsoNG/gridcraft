@@ -223,6 +223,19 @@ fn wrapped_cell_text_y_positions_correctly_and_safeguards_overflow() {
 }
 
 #[test]
+fn cell_text_y_keeps_the_ink_inside_a_short_row() {
+    // A row shorter than its line: the line mixes scripts whose fallback faces sit on the baseline,
+    // so its galley is taller than the row (#1231).
+    let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 16.0));
+    let (gh, z) = (19.0, 1.0);
+    let y_top = cell_text_y(VAlign::Top, rect, gh, z);
+    let y_bottom = cell_text_y(VAlign::Bottom, rect, gh, z);
+    assert!(y_bottom < y_top, "Bottom ({y_bottom}) must start above Top ({y_top})");
+    // Bottom keeps the last pixel row of ink inside the cell, trimming the extra ascent instead.
+    assert!((y_bottom + gh - (rect.bottom() - 0.5)).abs() < 0.01, "Bottom ends at the bottom edge, got {y_bottom}");
+}
+
+#[test]
 fn wrapped_cell_text_y_keeps_vertical_alignment_when_text_is_taller_than_the_row() {
     // A default-height row holding three wrapped lines.
     let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 20.0));
