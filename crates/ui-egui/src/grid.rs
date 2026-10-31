@@ -1284,7 +1284,7 @@ pub(crate) fn paint_quadrant(
                 HAlign::Right => egui::Align::RIGHT,
                 _ => egui::Align::LEFT,
             };
-            let galley = align_baselines(p.layout_job(job));
+            let galley = align_baselines(layout_cell(p, job));
             let x = match halign {
                 HAlign::Center | HAlign::CenterAcross => rect.center().x,
                 HAlign::Right => rect.right() - pad,
@@ -1392,7 +1392,7 @@ pub(crate) fn paint_quadrant(
             // Upright (±90°) wrapped text wraps to the row height: lines then stack across the column.
             let galley = if st.align.wrap && st.align.rotation.abs() == 90 {
                 let job = cell_job(text.clone(), font.clone(), color, (rect.height() - 2.0 * pad).max(4.0), st.font.italic);
-                p.layout_job(job)
+                layout_cell(p, job)
             } else {
                 galley.clone()
             };
@@ -1623,7 +1623,7 @@ fn merged_edges(
 /// The smaller font that makes `text` fit in `room` points of width (Shrink to fit), or `None`
 /// when it already fits at its own size.
 fn shrink_font(p: &Painter, text: &str, font: &FontId, room: f32) -> Option<FontId> {
-    let natural = p.layout_no_wrap(text.to_string(), font.clone(), Color32::PLACEHOLDER).size().x;
+    let natural = layout_cell(p, cell_job(text.to_string(), font.clone(), Color32::PLACEHOLDER, f32::INFINITY, false)).size().x;
     let room = room.max(1.0);
     if natural.is_nan() || natural <= room {
         return None;
@@ -3177,7 +3177,7 @@ fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, sh: &Sheet, 
         let wrapped = ui.painter().layout(ed.text.clone(), font.clone(), Color32::BLACK, (rect.width() - 4.0).max(1.0));
         (rect.width(), (wrapped.size().y.max(size * 1.3 * shown) + 4.0).max(rect.height()))
     } else {
-        let text_w = ui.painter().layout_no_wrap(ed.text.clone(), font.clone(), Color32::BLACK).size().x;
+        let text_w = layout_cell(ui.painter(), cell_job(ed.text.clone(), font.clone(), Color32::BLACK, f32::INFINITY, false)).size().x;
         // Excel keeps the cell's height for one line and only grows for extra lines.
         let h = if lines > 1.0 { (size * 1.3 * lines + 4.0).max(rect.height()) } else { rect.height() };
         (editor_width(text_w, rect.width(), size).min(geo.cells.right() - rect.left()), h)
@@ -4173,9 +4173,32 @@ fn align_baselines(galley: Arc<egui::Galley>) -> Arc<egui::Galley> {
     Arc::new(out)
 }
 
+/// Lay a job out, but never let a missing family take the app down.
+///
+/// A role family is published by `fonts` and installed by egui a pass later; if the two ever
+/// disagree, epaint panics with `FontFamily::Name(..) is not bound to any fonts` (#1231). Falling
+/// back to egui's own proportional family keeps the frame and logs which role was missing, so the
+/// bookkeeping bug shows up as a warning instead of a crash.
+fn layout_cell(p: &Painter, job: egui::text::LayoutJob) -> Arc<egui::Galley> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.layout_job(job.clone()))) {
+        Ok(galley) => galley,
+        Err(_) => {
+            log::warn!(
+                "laying text out in {:?} panicked; falling back to the proportional family",
+                job.sections.first().map(|s| s.format.font_id.family.clone())
+            );
+            let mut job = job;
+            for section in &mut job.sections {
+                section.format.font_id.family = egui::FontFamily::Proportional;
+            }
+            p.layout_job(job)
+        }
+    }
+}
+
 /// Lay out unwrapped cell text (the common path).
 fn cell_text(p: &Painter, text: String, font: FontId, color: Color32, italic: bool) -> Arc<egui::Galley> {
-    align_baselines(p.layout_job(cell_job(text, font, color, f32::INFINITY, italic)))
+    align_baselines(layout_cell(p, cell_job(text, font, color, f32::INFINITY, italic)))
 }
 
 fn painted_halign(h: HAlign, rtl: bool) -> HAlign {
@@ -4672,6 +4695,19 @@ mod outline_band_tests {
         let job = cell_job("中文 A".into(), font, Color32::BLACK, f32::INFINITY, true);
         assert!(job.sections.iter().all(|s| s.format.italics), "no italic file, so every run is slanted");
         crate::fonts::set_bound([]);
+    }
+
+    #[test]
+    fn a_family_egui_does_not_have_falls_back_instead_of_panicking() {
+        // The failing case: `cell_family` names a role whose family is not in egui's set. epaint
+        // panics there; the cell renderer must keep the frame alive (#1231).
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        let painter = egui::Painter::new(ctx.clone(), egui::LayerId::debug(), Rect::EVERYTHING);
+        let font = FontId::new(14.0, egui::FontFamily::Name("fnt:Never Bound:nn".into()));
+        let galley = layout_cell(&painter, cell_job("abc".into(), font, Color32::BLACK, f32::INFINITY, false));
+        assert!(!galley.rows.is_empty(), "the fallback lays the text out");
     }
 
     #[test]
