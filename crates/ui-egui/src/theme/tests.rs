@@ -9,7 +9,7 @@ fn fallback_faces_are_appended_to_every_family() {
     for han in [HanOrder::Chinese, HanOrder::Japanese] {
         let language = if han == HanOrder::Japanese { Language::Ja } else { Language::Zh };
         let fonts = font_definitions_for_language(language);
-        let fb_keys: Vec<String> = fallback_faces(han).into_iter().map(|(k, _)| k.to_string()).filter(|k| fonts.font_data.contains_key(k)).collect();
+        let fb_keys: Vec<String> = fallback_faces(han).into_iter().map(|f| f.key.to_string()).filter(|k| fonts.font_data.contains_key(k)).collect();
         if fb_keys.is_empty() {
             return; // no fallback face on this machine (minimal Linux)
         }
@@ -106,7 +106,7 @@ fn interface_families_fall_back_to_the_cell_font() {
     if !fonts.font_data.contains_key(&cell) {
         return; // no system cell font on this machine
     }
-    let fb: Vec<String> = fallback_faces(HanOrder::Chinese).into_iter().map(|(k, _)| k.to_string()).collect();
+    let fb: Vec<String> = fallback_faces(HanOrder::Chinese).into_iter().map(|f| f.key.to_string()).collect();
     for family in [FontFamily::Proportional, FontFamily::Name(UI.into()), FontFamily::Name(UI_BOLD.into()), FontFamily::Name(MONO.into())] {
         let chain = fonts.families.get(&family).cloned().unwrap_or_default();
         let at = chain.iter().position(|k| *k == cell);
@@ -118,14 +118,44 @@ fn interface_families_fall_back_to_the_cell_font() {
 
 #[test]
 fn language_reorders_only_the_han_faces() {
-    let keys = |han| fallback_faces(han).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+    let keys = |han| fallback_faces(han).into_iter().map(|f| f.key).collect::<Vec<_>>();
     assert_eq!(
         keys(HanOrder::Japanese),
-        ["sys-cjk-han-ja", "sys-cjk-han-zh", "sys-cjk-hangul", "sys-thai", "sys-lao", "sys-hebrew", "sys-symbols", "sys-symbols-2"]
+        [
+            "sys-cjk-han-ja",
+            "sys-cjk-han-zh",
+            "sys-cjk-hangul",
+            "sys-thai",
+            "sys-lao",
+            "sys-khmer",
+            "sys-hebrew",
+            "sys-arabic",
+            "sys-devanagari",
+            "sys-myanmar",
+            "sys-tibetan",
+            "sys-yi",
+            "sys-symbols",
+            "sys-symbols-2",
+        ]
     );
     assert_eq!(
         keys(HanOrder::Chinese),
-        ["sys-cjk-han-zh", "sys-cjk-han-ja", "sys-cjk-hangul", "sys-thai", "sys-lao", "sys-hebrew", "sys-symbols", "sys-symbols-2"]
+        [
+            "sys-cjk-han-zh",
+            "sys-cjk-han-ja",
+            "sys-cjk-hangul",
+            "sys-thai",
+            "sys-lao",
+            "sys-khmer",
+            "sys-hebrew",
+            "sys-arabic",
+            "sys-devanagari",
+            "sys-myanmar",
+            "sys-tibetan",
+            "sys-yi",
+            "sys-symbols",
+            "sys-symbols-2",
+        ]
     );
     assert_eq!(HanOrder::of(Language::Ja), HanOrder::Japanese);
     for l in [Language::En, Language::Zh, Language::Ko, Language::Ru, Language::PtBr, Language::De, Language::Cs, Language::Fr, Language::Tr] {
@@ -167,7 +197,7 @@ fn fallback_faces_load_each_file_once() {
     // once, not once per script (tens of MB each).
     for language in [Language::En, Language::Ja] {
         let fonts = font_definitions_for_language(language);
-        let present: Vec<&Arc<FontData>> = fallback_faces(HanOrder::of(language)).into_iter().filter_map(|(k, _)| fonts.font_data.get(k)).collect();
+        let present: Vec<&Arc<FontData>> = fallback_faces(HanOrder::of(language)).into_iter().filter_map(|f| fonts.font_data.get(f.key)).collect();
         for (i, a) in present.iter().enumerate() {
             for b in present.iter().skip(i + 1) {
                 assert!(!std::sync::Arc::ptr_eq(&a.font, &b.font), "the same font file is loaded for two fallback scripts");
@@ -340,7 +370,9 @@ fn fedora_package_folders_are_searched_after_the_other_linux_layouts() {
         ("hebrew", paths(hebrew()), "google-noto-vf/NotoSansHebrew[wght].ttf", "/NotoSansHebrew-Regular.ttf"),
     ];
     for (role, list, fedora_file, earlier) in &cases {
-        let at = list.iter().position(|p| *p == format!("/usr/share/fonts/{fedora_file}"));
+        // fontconfig's own answer can name the same file before the hard-coded list, so ask for
+        // the last occurrence: that one is the fallback entry this test is about.
+        let at = list.iter().rposition(|p| *p == format!("/usr/share/fonts/{fedora_file}"));
         let last_earlier = list.iter().rposition(|p| p.ends_with(earlier));
         assert!(at.is_some(), "{role}: Fedora's {fedora_file} is not a candidate");
         assert!(last_earlier.is_some(), "{role}: no existing {earlier} candidate to compare with");

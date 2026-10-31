@@ -104,7 +104,7 @@ impl SheetApp {
         if used == self.fonts_bound {
             return;
         }
-        ctx.set_fonts(theme::font_definitions_with(self.ui.language, &used));
+        ctx.set_fonts(theme::font_definitions_with(self.ui.language, &used, crate::script::ScriptSet::EMPTY, crate::script::ScriptSet::EMPTY));
         self.fonts_bound = used;
         self.fonts_rebind = true;
         ctx.request_repaint();
