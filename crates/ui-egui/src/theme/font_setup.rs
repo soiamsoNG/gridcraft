@@ -133,7 +133,11 @@ pub(crate) fn font_parses(bytes: &[u8], index: u32) -> bool {
 pub(super) fn try_load(paths: &[(&str, u32)]) -> Option<FontData> {
     for (p, index) in paths {
         if let Some(blob) = font_file(p, *index) {
-            return Some(FontData::from_blob(blob, *index));
+            let mut fd = FontData::from_blob(blob, *index);
+            // A script face is a fallback in the workbook families that lack its script; without
+            // this it is centred in their row instead of sitting on their baseline (#1231).
+            crate::fonts::align_fallback(&mut fd, p);
+            return Some(fd);
         }
     }
     None
@@ -199,7 +203,9 @@ pub(super) fn craft_font_faces() -> Vec<(String, &'static CraftFont)> {
 fn add_craft_fonts(fonts: &mut FontDefinitions) -> Vec<String> {
     let mut keys = Vec::new();
     for (key, font) in craft_font_faces() {
-        fonts.font_data.insert(key.clone(), Arc::new(FontData::from_static(font.bytes)));
+        let mut fd = FontData::from_static(font.bytes);
+        crate::fonts::align_fallback(&mut fd, font.family);
+        fonts.font_data.insert(key.clone(), Arc::new(fd));
         keys.push(key);
     }
     keys
