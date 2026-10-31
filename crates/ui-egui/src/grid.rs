@@ -1253,7 +1253,7 @@ pub(crate) fn paint_quadrant(
         let fam = theme::cell_family(&st.font.name, st.font.bold, st.font.italic);
         let font = FontId::new(size, fam);
         // Digits fit by the cell's own font and size, not the default 11pt (9pt marks in narrow columns).
-        let char_w = cell_text(p, "0".to_string(), font.clone(), Color32::PLACEHOLDER).size().x.max(1.0);
+        let char_w = cell_text(p, "0".to_string(), font.clone(), Color32::PLACEHOLDER, st.font.italic).size().x.max(1.0);
         let avail_w = rect.right() - text_left;
         let (mut text, ncolor, numeric, fill_char) = display_text(wb, sh, c, &v, st, avail_w / z.max(0.1) * z, char_w);
         if sh.show_formulas && sh.cell(c).is_some_and(|cell| cell.formula.is_some()) {
@@ -1278,7 +1278,7 @@ pub(crate) fn paint_quadrant(
         // Rotated text wraps along its own direction (below), not across the column width.
         if !rotated && (st.align.wrap || st.align.h == HAlign::Justify) {
             let wrap_w = (rect.width() - 2.0 * pad - indent).max(4.0);
-            let mut job = cell_job(text.clone(), font.clone(), color, wrap_w);
+            let mut job = cell_job(text.clone(), font.clone(), color, wrap_w, st.font.italic);
             job.halign = match halign {
                 HAlign::Center | HAlign::CenterAcross => egui::Align::Center,
                 HAlign::Right => egui::Align::RIGHT,
@@ -1305,15 +1305,15 @@ pub(crate) fn paint_quadrant(
             .flatten();
         let shrunk = small.is_some();
         let font = small.unwrap_or(font);
-        let mut galley = cell_text(p, first_line.clone(), font.clone(), color);
+        let mut galley = cell_text(p, first_line.clone(), font.clone(), color, st.font.italic);
         let mut w = galley.size().x;
         // Numbers and dates never overflow: they show #### when too narrow.
         let hashed = !shrunk && (numeric || matches!(v, Value::Number(_))) && w > avail_w - 2.0 * pad && st.align.h != HAlign::Fill;
         if hashed {
             // Measured on `#` itself: it is wider than `0` in some fonts, and #### must fit its cell.
-            let hash_w = cell_text(p, "#".to_string(), font.clone(), color).size().x.max(1.0);
+            let hash_w = cell_text(p, "#".to_string(), font.clone(), color, st.font.italic).size().x.max(1.0);
             let n = ((avail_w - 2.0 * pad) / hash_w).floor().max(1.0) as usize;
-            galley = cell_text(p, "#".repeat(n), font.clone(), color);
+            galley = cell_text(p, "#".repeat(n), font.clone(), color, st.font.italic);
             w = galley.size().x;
         }
         // Repeat fill (`*` in number formats) / Fill alignment. A number already shown as #### keeps
@@ -1323,13 +1323,13 @@ pub(crate) fn paint_quadrant(
             && pos <= first_line.len()
         {
             let base_w = w;
-            let cw = cell_text(p, ch.to_string(), font.clone(), color).size().x.max(1.0);
+            let cw = cell_text(p, ch.to_string(), font.clone(), color, st.font.italic).size().x.max(1.0);
             let n = (((avail_w - 2.0 * pad) - base_w) / cw).floor().max(0.0) as usize;
             let mut s = first_line.clone();
             if first_line.is_char_boundary(pos) {
                 s.insert_str(pos, &ch.to_string().repeat(n));
             }
-            galley = cell_text(p, s, font.clone(), color);
+            galley = cell_text(p, s, font.clone(), color, st.font.italic);
             w = galley.size().x;
         }
         // Center Across Selection: the text is centred over this cell and the empty cells to its right that also use it.
@@ -1391,7 +1391,7 @@ pub(crate) fn paint_quadrant(
             let angle = -(st.align.rotation as f32).to_radians();
             // Upright (±90°) wrapped text wraps to the row height: lines then stack across the column.
             let galley = if st.align.wrap && st.align.rotation.abs() == 90 {
-                let job = cell_job(text.clone(), font.clone(), color, (rect.height() - 2.0 * pad).max(4.0));
+                let job = cell_job(text.clone(), font.clone(), color, (rect.height() - 2.0 * pad).max(4.0), st.font.italic);
                 p.layout_job(job)
             } else {
                 galley.clone()
@@ -4102,22 +4102,30 @@ mod selection_fill_tests {
 /// sheet is mirrored afterwards, so an explicit Left or Right is swapped first to end up on the
 /// side the user chose: Align Right stays on the right in either sheet direction, as in Excel.
 /// General alignment is resolved from the value before this and follows the sheet direction.
-/// Lay out one piece of cell text. A family without an italic file keeps a regular face, so epaint
-/// slants it (`TextFormat::italics`) rather than drawing upright text (#1231).
-fn cell_job(text: String, font: FontId, color: Color32, wrap: f32) -> egui::text::LayoutJob {
-    if !crate::fonts::is_synthetic_italic(&font.family) {
+/// Lay out one piece of cell text. Italic text whose face has no italic file is slanted by epaint
+/// (`TextFormat::italics`) instead of drawn upright (#1231).
+///
+/// The slant is decided per script run, not per cell: a substitute family whose italic face only
+/// covers Latin (Calibri → Carlito Italic) draws Latin in its real italic and slants the Han glyphs
+/// that a CJK fallback face supplies upright.
+fn cell_job(text: String, font: FontId, color: Color32, wrap: f32, italic: bool) -> egui::text::LayoutJob {
+    let Some(coverage) = italic.then(|| crate::fonts::italic_coverage(&font.family)).flatten() else {
         return egui::text::LayoutJob::simple(text, font, color, wrap);
+    };
+    let mut job = egui::text::LayoutJob { wrap: egui::text::TextWrapping { max_width: wrap, ..Default::default() }, ..Default::default() };
+    for (range, script) in crate::script::split_runs(&text) {
+        let mut format = egui::TextFormat::simple(font.clone(), color);
+        format.italics = !coverage.has(script);
+        let byte_range = egui::text::ByteIndex(range.start)..egui::text::ByteIndex(range.end);
+        job.sections.push(egui::text::LayoutSection { leading_space: 0.0, byte_range, format });
     }
-    let mut format = egui::TextFormat::simple(font, color);
-    format.italics = true;
-    let mut job = egui::text::LayoutJob::simple_format(text, format);
-    job.wrap.max_width = wrap;
+    job.text = text;
     job
 }
 
 /// Lay out unwrapped cell text (the common path).
-fn cell_text(p: &Painter, text: String, font: FontId, color: Color32) -> Arc<egui::Galley> {
-    p.layout_job(cell_job(text, font, color, f32::INFINITY))
+fn cell_text(p: &Painter, text: String, font: FontId, color: Color32, italic: bool) -> Arc<egui::Galley> {
+    p.layout_job(cell_job(text, font, color, f32::INFINITY, italic))
 }
 
 fn painted_halign(h: HAlign, rtl: bool) -> HAlign {
@@ -4596,18 +4604,23 @@ mod outline_band_tests {
     }
 
     #[test]
-    fn a_synthetic_italic_role_slants_cell_text() {
-        // The font layer marks a role whose family has no italic file; the layout must slant it.
+    fn only_the_scripts_beyond_the_italic_face_are_slanted() {
+        // A Latin-only italic face (Calibri → Carlito Italic) must not stop Han from being slanted.
         let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let role = "fnt:Grid Test Sans:ni";
         crate::fonts::set_bound([role.to_string()]);
+        crate::fonts::set_italic_coverage(role, Some(crate::script::ScriptSet::of_text("A")));
         let font = FontId::new(14.0, egui::FontFamily::Name(role.into()));
-        crate::fonts::set_synthetic_italic(role, true);
-        let job = cell_job("abc".into(), font.clone(), Color32::BLACK, f32::INFINITY);
-        assert!(job.sections.first().is_some_and(|s| s.format.italics), "a synthetic role is slanted");
-        crate::fonts::set_synthetic_italic(role, false);
-        let job = cell_job("abc".into(), font, Color32::BLACK, f32::INFINITY);
-        assert!(!job.sections.first().is_some_and(|s| s.format.italics), "a real italic is not sheared again");
+        let job = cell_job("中文 A".into(), font.clone(), Color32::BLACK, f32::INFINITY, true);
+        let slanted: Vec<bool> = job.sections.iter().map(|s| s.format.italics).collect();
+        assert_eq!(slanted, vec![true, false], "Han slanted, Latin drawn by its real italic");
+        let job = cell_job("中文 A".into(), font, Color32::BLACK, f32::INFINITY, false);
+        assert!(job.sections.iter().all(|s| !s.format.italics), "an upright cell is never slanted");
+        // A family with no italic at all slants every run.
+        crate::fonts::set_italic_coverage(role, Some(crate::script::ScriptSet::EMPTY));
+        let font = FontId::new(14.0, egui::FontFamily::Name(role.into()));
+        let job = cell_job("中文 A".into(), font, Color32::BLACK, f32::INFINITY, true);
+        assert!(job.sections.iter().all(|s| s.format.italics), "no italic file, so every run is slanted");
         crate::fonts::set_bound([]);
     }
 
