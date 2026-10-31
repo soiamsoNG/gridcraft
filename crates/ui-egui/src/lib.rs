@@ -284,6 +284,10 @@ pub struct SheetApp {
     /// Role families of the font set waiting for egui to activate it. Publishing them before
     /// activation would let `cell_family` name families the current pass has not installed yet.
     pending_bound: Option<Vec<String>>,
+    /// The definitions of the font set in use. A rebuild merges them into the new set, so a role
+    /// the previous set advertised stays resolvable while egui switches over
+    /// (`theme::merge_missing_fonts`).
+    fonts_defs: Option<egui::FontDefinitions>,
     /// Han face order the installed fonts were built with; a language switch rebuilds the fonts
     /// only when it changes this (see `theme::HanOrder`).
     fonts_han: Option<theme::HanOrder>,
@@ -348,6 +352,7 @@ impl SheetApp {
             fonts_seen: (0, 0),
             fonts_rebind: false,
             pending_bound: None,
+            fonts_defs: None,
             fonts_han: None,
             effective_dark: false,
             desktop_theme: desktop_theme::DesktopTheme::default(),
@@ -401,15 +406,19 @@ impl SheetApp {
         // Blocking here costs one `fc-list` (tens of milliseconds) and saves the atlas rebuild a
         // later rebind would trigger.
         let _ = fonts::catalog();
-        let (defs, bound) = theme::font_definitions_with_bound(self.ui.language, &used, scripts);
-        ctx.set_fonts(defs);
+        let (mut defs, bound) = theme::font_definitions_with_bound(self.ui.language, &used, scripts);
+        if let Some(old) = &self.fonts_defs {
+            theme::merge_missing_fonts(&mut defs, old);
+        }
+        ctx.set_fonts(defs.clone());
+        self.fonts_defs = Some(defs.clone());
         theme::apply(ctx, self.ui.dark);
         self.fonts_bound = used;
         self.fonts_scripts = scripts;
         self.fonts_seen = self.session.active().map(|d| (d.uid, d.revision)).unwrap_or((0, 0));
         // Nothing paints before `fonts_ready`, so the roles this set installs can be advertised
         // now; leaving them pending would paint the first visible frame with role families only.
-        crate::fonts::set_bound(bound);
+        crate::fonts::set_bound_for(&defs, bound);
     }
 
     /// The font names the active workbook uses: every style's font plus the theme's heading/body
@@ -1261,7 +1270,10 @@ impl SheetApp {
             // point the previous set stays advertised, so the frame that requested the change can
             // still paint with the fonts egui actually has.
             if let Some(bound) = self.pending_bound.take() {
-                crate::fonts::set_bound(bound);
+                match &self.fonts_defs {
+                    Some(defs) => crate::fonts::set_bound_for(defs, bound),
+                    None => crate::fonts::set_bound(bound),
+                }
             }
             self.fonts_rebind = false;
         } else if fonts::scan_done() {
@@ -1274,8 +1286,12 @@ impl SheetApp {
                 let scripts = self.used_scripts();
                 self.fonts_seen = seen;
                 if used != self.fonts_bound || scripts != self.fonts_scripts {
-                    let (fonts, bound) = theme::font_definitions_with_bound(self.ui.language, &used, scripts);
-                    ctx.set_fonts(fonts);
+                    let (mut fonts, bound) = theme::font_definitions_with_bound(self.ui.language, &used, scripts);
+                    if let Some(old) = &self.fonts_defs {
+                        theme::merge_missing_fonts(&mut fonts, old);
+                    }
+                    ctx.set_fonts(fonts.clone());
+                    self.fonts_defs = Some(fonts.clone());
                     self.fonts_bound = used;
                     self.fonts_scripts = scripts;
                     self.pending_bound = Some(bound);

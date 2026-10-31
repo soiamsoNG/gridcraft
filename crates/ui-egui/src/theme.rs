@@ -666,8 +666,34 @@ pub fn font_definitions_for_language(language: crate::i18n::Language) -> FontDef
 /// families are recorded in [`crate::fonts`] so [`cell_family`] only names a family egui has.
 pub fn font_definitions_with(language: crate::i18n::Language, used: &[String], scripts: ScriptSet) -> FontDefinitions {
     let (fonts, bound) = font_definitions_with_bound(language, used, scripts);
-    crate::fonts::set_bound(bound);
+    crate::fonts::set_bound_for(&fonts, bound);
     fonts
+}
+
+/// Carries the families of a previous font set that the new one does not have.
+///
+/// egui activates a new set a pass after `set_fonts`, while [`crate::fonts`] only publishes the
+/// roles a pass later: for one frame a role the old set advertised can be missing from the set egui
+/// is already using, and laying text out in it panics. Merging keeps the new set a superset of the
+/// old one, so every advertised role stays resolvable. The extra faces cost memory until the app
+/// restarts; correctness first.
+pub fn merge_missing_fonts(new: &mut FontDefinitions, old: &FontDefinitions) {
+    for (family, chain) in &old.families {
+        if chain.is_empty() || new.families.contains_key(family) {
+            continue;
+        }
+        for key in chain {
+            if let Some(data) = old.font_data.get(key)
+                && !new.font_data.contains_key(key)
+            {
+                new.font_data.insert(key.clone(), data.clone());
+            }
+        }
+        let kept: Vec<String> = chain.iter().filter(|key| new.font_data.contains_key(*key)).cloned().collect();
+        if !kept.is_empty() {
+            new.families.insert(family.clone(), kept);
+        }
+    }
 }
 
 /// Builds the font set and returns the role families it bound, without publishing them to
@@ -1666,6 +1692,45 @@ mod tests {
         let (fonts, _) = font_definitions_with_bound(Language::En, &[], ScriptSet::of_text("Total 42"));
         assert!(!fonts.font_data.keys().any(|k| k.starts_with("sys-cjk")), "Latin text loads no CJK face");
         assert!(!fonts.font_data.keys().any(|k| k.starts_with("sys-thai")), "Latin text loads no Thai face");
+    }
+
+    /// The crash this guards: a rebuild that drops a role the previous set advertised left
+    /// `cell_family` naming a family egui no longer had (#1231).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rebuilt_font_set_keeps_the_roles_the_previous_one_advertised() {
+        let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::fonts::substitute_family("Arial").is_none() {
+            return; // no Arial substitute on this machine
+        }
+        let scripts = ScriptSet::of_text("A");
+        let (defs_a, bound_a) = font_definitions_with_bound(crate::i18n::Language::En, &["Arial".to_string()], scripts);
+        assert!(bound_a.iter().any(|role| role.starts_with("fnt:Arial:")), "Arial is substituted and bound");
+        crate::fonts::set_bound_for(&defs_a, bound_a.clone());
+        // A later set for a workbook that only uses Calibri has no Arial role at all.
+        let (mut defs_b, bound_b) = font_definitions_with_bound(crate::i18n::Language::En, &["Calibri".to_string()], scripts);
+        assert!(!bound_b.iter().any(|role| role.starts_with("fnt:Arial:")), "the new set does not bind Arial");
+        merge_missing_fonts(&mut defs_b, &defs_a);
+        for role in &bound_a {
+            let chain = defs_b.families.get(&egui::FontFamily::Name(role.as_str().into()));
+            assert!(chain.is_some_and(|c| !c.is_empty()), "{role} must stay resolvable in the new set");
+        }
+        crate::fonts::set_bound([]);
+    }
+
+    #[test]
+    fn a_merged_family_brings_its_font_data() {
+        let mut new = FontDefinitions::default();
+        let mut old = FontDefinitions::default();
+        old.font_data.insert("old-face".into(), Arc::new(egui::FontData::from_static(b"x")));
+        old.families.insert(egui::FontFamily::Name("fnt:Old:nn".into()), vec!["old-face".to_string()]);
+        merge_missing_fonts(&mut new, &old);
+        assert!(new.font_data.contains_key("old-face"));
+        assert_eq!(new.families.get(&egui::FontFamily::Name("fnt:Old:nn".into())), Some(&vec!["old-face".to_string()]));
+        // An existing family is never overwritten by the old set.
+        let before = new.families.get(&egui::FontFamily::Proportional).cloned();
+        merge_missing_fonts(&mut new, &old);
+        assert_eq!(new.families.get(&egui::FontFamily::Proportional).cloned(), before);
     }
 
     #[test]

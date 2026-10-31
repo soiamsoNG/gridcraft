@@ -638,6 +638,14 @@ fn bound() -> &'static std::sync::RwLock<HashMap<String, Option<ScriptSet>>> {
     BOUND.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
+/// Record the role families a freshly built [`egui::FontDefinitions`] bound, keeping only the ones
+/// the definitions actually carry. A role that is advertised but missing from egui's set panics
+/// during layout (`FontFamily::Name(..) is not bound to any fonts`), so the definitions have the
+/// last word.
+pub fn set_bound_for(defs: &egui::FontDefinitions, keys: impl IntoIterator<Item = String>) {
+    set_bound(keys.into_iter().filter(|key| defs.families.get(&egui::FontFamily::Name(key.as_str().into())).is_some_and(|chain| !chain.is_empty())));
+}
+
 /// Record the role families a freshly built [`egui::FontDefinitions`] bound.
 pub fn set_bound(keys: impl IntoIterator<Item = String>) {
     let mut map = bound().write().unwrap_or_else(|e| e.into_inner());
@@ -1253,6 +1261,15 @@ mod tests {
         let coverage = italic_coverage(&real).expect("italic role");
         assert!(coverage.has(crate::script::ScriptClass::Latin), "the real italic face draws Latin");
         assert!(!coverage.has(crate::script::ScriptClass::Han), "Han has no italic face, so it is slanted");
+        set_bound([]);
+    }
+
+    #[test]
+    fn a_role_the_definitions_lack_is_never_advertised() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let defs = egui::FontDefinitions::default();
+        set_bound_for(&defs, [role_key("Missing Font", true, false)]);
+        assert!(!is_bound(&role_key("Missing Font", true, false)), "a role without a family is not advertised");
         set_bound([]);
     }
 
