@@ -3,11 +3,11 @@
 Status: design note and implementation map.
 
 - Repository: `storytold/gridcraft`
-- Branch: `fix/linux-fontconfig`
-- HEAD at the start of this rewrite: `775a14a docs: add Linux font flow design note (#1231)`
-- Last updated: 2026-10-28 (section 3 realigned with HEAD `ac0bacd`; function names replace line numbers)
+- Branch: `fix/linux-fontconfig-0121` (rebased onto `v0.12.1`; local only)
+- HEAD when section 10.5 was written: `4da3fb2c docs: record the bold script faces (#1231)`
+- Last updated: 2026-11-01 (section 10.5 records the egui/epaint versions of each line)
 - Related issue: `#1231`
-- Current PR: `#1972` (open; remote PR branch at `57df98d`, local `HEAD` at `ac0bacd`)
+- Current PR: `#1972` still points at the pre-rebase `fix/linux-fontconfig`; this branch has no PR
 
 This document has three layers:
 
@@ -1566,6 +1566,42 @@ Medium term:
 
 Do not add `yeslogic-fontconfig-sys` directly to GridCraft: raw FFI violates
 the repository's `unsafe_code = "forbid"` policy.
+
+### 10.5 egui and epaint on each line
+
+The text stack is not the same on the two lines, so a fix that works here may
+not apply there. Recorded so the difference is not rediscovered later.
+
+| Line | egui / epaint | Where it comes from |
+|---|---|---|
+| this branch (`fix/linux-fontconfig-0121`, base `v0.12.1`) | **0.36.2** | crates.io, no `[patch.crates-io]` — the stock upstream release of 2026-09-08 |
+| `main` (releases 0.13.0 and 0.14.x) | **0.37.0 + one commit** | `[patch.crates-io]` → `storytold/egui` @ `6d518fc7`, `storytold/winit` @ `a517b384` |
+
+Facts behind that table:
+
+- The pinned commit `6d518fc7 Add ordered IME reset completion across native
+  and web adapters` (2026-10-24) exists in `emilk/egui` as well; it is 90
+  commits ahead of and 8 behind upstream `main`, and it is in no release. So
+  `main` consumes upstream work in flight, not a GridCraft patch.
+- `storytold/egui` `main` is a mirror (two commits behind upstream `main`, no
+  own commits); the branches `craft/0.36.2` and `migration/egui-037-20261024`
+  pin the two bases.
+- Upstream releases: 0.37.0 (2026-10-15), 0.36.2 (2026-09-08), 0.36.1,
+  0.36.0. 0.37.0 adds no fontconfig or system-font API; its headline is
+  coloured emoji.
+
+Consequences for this document's plans:
+
+- `epaint` 0.36.2 places each glyph on the ascent of the face that supplies it,
+  which is the baseline drift of upstream issue `#8802`. Its fix (`#8804`) is
+  not in 0.37.0 either, so both lines need the local alignment pass.
+- `TextFormat::italics` in 0.36.2 already shears the top vertices of the
+  glyph quads (~14°, advances unchanged), so synthetic italic needs no upstream
+  change. Synthetic bold still does: `FontId` carries no weight.
+- Landing the font layer on `main` is not a merge: `crates/ui-egui/src/theme.rs`
+  no longer exists there (`theme/font_setup.rs`, `theme/font_fallback.rs`),
+  `crates/ui-egui/src/fonts.rs` keeps only the directory scan, and the role
+  chains come from `craft_fonts_policy.rs`.
 
 ---
 
