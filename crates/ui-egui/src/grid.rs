@@ -1284,7 +1284,7 @@ pub(crate) fn paint_quadrant(
                 HAlign::Right => egui::Align::RIGHT,
                 _ => egui::Align::LEFT,
             };
-            let galley = p.layout_job(job);
+            let galley = align_baselines(p.layout_job(job));
             let x = match halign {
                 HAlign::Center | HAlign::CenterAcross => rect.center().x,
                 HAlign::Right => rect.right() - pad,
@@ -4123,9 +4123,59 @@ fn cell_job(text: String, font: FontId, color: Color32, wrap: f32, italic: bool)
     job
 }
 
+/// epaint 0.36.2 puts every glyph on its own face's baseline (`text_layout.rs`: `pos.y =
+/// font_face_ascent + …`), so a CJK fallback face, whose ascent is much taller, hangs below the
+/// Latin baseline (upstream issue #8802). Until that lands, put a row's glyphs on one baseline — the
+/// smallest ascent in the row, the face the cell font itself supplies — and move the quads that
+/// layout already tessellated by the same amount.
+fn align_baselines(galley: Arc<egui::Galley>) -> Arc<egui::Galley> {
+    let mixed = galley.rows.iter().any(|placed| {
+        let mut ascents: Vec<i64> = placed.row.glyphs.iter().map(|g| g.font_face_ascent.round() as i64).collect();
+        ascents.sort_unstable();
+        ascents.first() != ascents.last()
+    });
+    if !mixed {
+        return galley;
+    }
+    let mut out = (*galley).clone();
+    let mut shifted = 0.0_f32;
+    for placed in &mut out.rows {
+        let row = Arc::make_mut(&mut placed.row);
+        let base = row.glyphs.iter().map(|g| g.font_face_ascent).fold(f32::INFINITY, f32::min);
+        if !base.is_finite() {
+            continue;
+        }
+        // The mesh is built during layout, so moving `pos` alone would not move the glyphs.
+        let mut starts: Vec<usize> = row.glyphs.iter().map(|g| g.first_vertex as usize).collect();
+        let plan: Vec<f32> = row.glyphs.iter().map(|g| base - g.pos.y).collect();
+        starts.push(row.visuals.mesh.vertices.len());
+        for glyph in &mut row.glyphs {
+            glyph.pos.y = base;
+        }
+        for (i, delta) in plan.iter().enumerate() {
+            if *delta == 0.0 {
+                continue;
+            }
+            shifted = shifted.max(delta.abs());
+            let end = starts.get(i + 1).copied().unwrap_or(starts[i]);
+            if let Some(vertices) = row.visuals.mesh.vertices.get_mut(starts[i]..end) {
+                for vertex in vertices {
+                    vertex.pos.y += delta;
+                }
+            }
+        }
+        row.visuals.mesh_bounds = row.visuals.mesh.calc_bounds();
+    }
+    if shifted > 0.0 {
+        // Keep culling and clipping honest after moving ink.
+        out.mesh_bounds = out.mesh_bounds.expand(shifted);
+    }
+    Arc::new(out)
+}
+
 /// Lay out unwrapped cell text (the common path).
 fn cell_text(p: &Painter, text: String, font: FontId, color: Color32, italic: bool) -> Arc<egui::Galley> {
-    p.layout_job(cell_job(text, font, color, f32::INFINITY, italic))
+    align_baselines(p.layout_job(cell_job(text, font, color, f32::INFINITY, italic)))
 }
 
 fn painted_halign(h: HAlign, rtl: bool) -> HAlign {
@@ -4622,6 +4672,35 @@ mod outline_band_tests {
         let job = cell_job("中文 A".into(), font, Color32::BLACK, f32::INFINITY, true);
         assert!(job.sections.iter().all(|s| s.format.italics), "no italic file, so every run is slanted");
         crate::fonts::set_bound([]);
+    }
+
+    #[test]
+    fn a_row_mixing_two_faces_gets_one_baseline() {
+        // emoji come from a different face than Latin in egui's default fonts, so the row mixes
+        // ascents; the cell renderer has to put them back on one baseline (upstream #8802).
+        let ctx = egui::Context::default();
+        // Fonts only exist after the first frame.
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        let job = egui::text::LayoutJob::simple(
+            "A\u{1F600}A".to_string(),
+            FontId::new(20.0, egui::FontFamily::Proportional),
+            Color32::BLACK,
+            f32::INFINITY,
+        );
+        let painter = egui::Painter::new(ctx.clone(), egui::LayerId::debug(), Rect::EVERYTHING);
+        let galley = painter.layout_job(job);
+        let ascents: Vec<f32> = galley.rows.iter().flat_map(|r| r.row.glyphs.iter().map(|g| g.font_face_ascent)).collect();
+        if ascents.len() < 3 || ascents.iter().all(|a| *a == ascents[0]) {
+            return; // this build has no second face with a different ascent
+        }
+        let mesh_before = galley.rows.first().map(|r| r.row.visuals.mesh_bounds);
+        let fixed = align_baselines(galley);
+        for placed in &fixed.rows {
+            assert!(placed.row.glyphs.windows(2).all(|w| w[0].pos.y == w[1].pos.y), "every glyph in a row shares the baseline");
+        }
+        // The layout already tessellated the quads, so they have to move with the glyphs.
+        assert_ne!(fixed.rows.first().map(|r| r.row.visuals.mesh_bounds), mesh_before, "the quads moved");
     }
 
     #[test]
