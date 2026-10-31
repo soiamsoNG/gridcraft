@@ -576,6 +576,14 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
         // A workbook font's role chain needs the script faces too: Carlito has no Han, so a Calibri
         // cell would draw tofu without them (#1231).
         chain.extend(if bold { bold_fallback } else { fallback }.iter().cloned());
+        // A script with no bold face still draws with its regular one rather than tofu.
+        if bold && !bold_fallback.is_empty() {
+            for key in fallback {
+                if !chain.contains(key) {
+                    chain.push(key.clone());
+                }
+            }
+        }
         chain.extend(base.iter().cloned());
         fonts.families.insert(egui::FontFamily::Name(role.clone().into()), chain);
         bound.push(role);

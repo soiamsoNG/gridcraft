@@ -62,6 +62,10 @@ pub(super) fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Res
             egui::Event::Text(_) if shortcut_pressed || shortcut_ran => {}
             // An input method (ibus, fcitx, a native IME) commits finished text as one string: it
             // never arrives as `Text`, so without this a Chinese or Japanese keyboard types nothing.
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                ime_preedit(app, &text);
+                return;
+            }
             egui::Event::Ime(egui::ImeEvent::Commit(text)) if !shortcut_pressed && !text.is_empty() => {
                 ime_commit(app, text);
                 return;
@@ -165,14 +169,21 @@ pub(super) fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Res
     }
 }
 
-/// Insert the text an input method committed, at the end of the active edit (or in a new one).
+/// Start an edit with the text an input method is composing. Once the in-cell editor has focus,
+/// egui's `TextEdit` owns IME events (composition, commit) and shows the preedit itself (#1231).
+fn ime_preedit(app: &mut SheetApp, text: &str) {
+    if app.editor.is_none() && !text.is_empty() {
+        app.begin_edit(Some(text.to_string()), false);
+    }
+}
+
+/// Commit an input method's text when no editor has focus yet: there is no `TextEdit` to insert it.
 fn ime_commit(app: &mut SheetApp, text: String) {
     if app.editor.is_none() {
         app.begin_edit(Some(text), false);
-    } else if let Some(ed) = app.editor.as_mut() {
-        ed.text.push_str(&text);
-    }
-    if let Some(ed) = app.editor.as_mut() {
-        ed.caret = ed.text.chars().count();
+        if let Some(ed) = app.editor.as_mut() {
+            ed.caret = ed.text.chars().count();
+            ed.anchor = ed.caret;
+        }
     }
 }

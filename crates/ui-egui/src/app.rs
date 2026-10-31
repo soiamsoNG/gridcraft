@@ -60,6 +60,8 @@ impl SheetApp {
             fonts_bound: Vec::new(),
             fonts_seen: (0, 0),
             fonts_scripts: crate::script::ScriptSet::EMPTY,
+            fonts_bold_scripts: crate::script::ScriptSet::EMPTY,
+            ime_allowed: false,
             fonts_rebind: false,
             fonts_defs: None,
             pending_roles: Vec::new(),
@@ -111,7 +113,10 @@ impl SheetApp {
         self.ensure_text_width(ctx);
         // egui 0.37 only forwards IME events once the window allows them; without this a Chinese,
         // Japanese or Korean input method composes in its own window and commits nothing (#1231).
-        ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
+        if !self.ime_allowed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
+            self.ime_allowed = true;
+        }
         // A glyph nothing can draw must never abort the app: a workbook saved on a machine with
         // more fonts than this one can name any character (#1231). Tofu is the honest answer.
         ctx.set_missing_glyph_policy(egui::epaint::text::MissingGlyphPolicy::Tofu);

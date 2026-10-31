@@ -309,3 +309,14 @@ fn an_input_method_commit_types_into_the_cell() {
     assert_eq!(ed.text, "中文");
     assert_eq!(ed.caret, 2);
 }
+
+#[test]
+fn an_input_method_preedit_starts_the_edit() {
+    // Before the in-cell editor has focus, a composition has to open the edit with its text;
+    // once it is open, egui's `TextEdit` owns the composition and shows it.
+    let mut h = harness(book("B2"));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Preedit { text: "zhong".into(), active_range_chars: None }));
+    h.run_steps(2);
+    let ed = h.state().editor.as_ref().expect("a composition starts an edit");
+    assert!(ed.text.starts_with("zhong"), "{:?}", ed.text);
+}

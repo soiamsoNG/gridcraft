@@ -248,6 +248,12 @@ pub struct SheetApp {
     /// The scripts `fonts_bound` was built for: text that gains a script (a Thai cell typed into a
     /// Latin sheet) has to rebuild the font set even though no font name changed.
     fonts_scripts: crate::script::ScriptSet,
+    /// The scripts `fonts_bound` loaded **bold** faces for: turning bold on a CJK cell has to add
+    /// them even though no font name changed (#1231).
+    fonts_bold_scripts: crate::script::ScriptSet,
+    /// The window's input method was enabled once; re-sending it every frame resets the composition.
+    ime_allowed: bool,
+
     /// Set while a font-set change is pending activation: the new set is live only from the next
     /// pass, so this frame keeps painting with the previous one (no blank frame).
     fonts_rebind: bool,
