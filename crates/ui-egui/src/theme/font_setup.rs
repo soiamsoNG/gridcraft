@@ -466,7 +466,7 @@ pub fn font_definitions_for_language(language: crate::i18n::Language) -> FontDef
 /// machine see the same font set. Craft-fonts remains a pinned build input rather than a repository
 /// asset; without it only egui's bundled faces are available, which is the documented no-font mode.
 pub fn pinned_font_definitions() -> FontDefinitions {
-    font_definitions_impl(crate::i18n::Language::En, &[], crate::script::ScriptSet::EMPTY, crate::script::ScriptSet::EMPTY, false)
+    font_definitions_impl(crate::i18n::Language::En, &[], crate::script::ScriptSet::EMPTY, crate::script::ScriptSet::EMPTY, false).0
 }
 
 /// [`font_definitions_for_language`] that also binds the workbook fonts in `used` that are
@@ -478,6 +478,20 @@ pub fn font_definitions_with(
     scripts: crate::script::ScriptSet,
     bold_scripts: crate::script::ScriptSet,
 ) -> FontDefinitions {
+    let (fonts, roles) = font_definitions_roles(language, used, scripts, bold_scripts);
+    crate::fonts::set_bound_for(&fonts, roles);
+    fonts
+}
+
+/// [`font_definitions_with`] without publishing the role registry: the caller publishes it once
+/// the set is active, so a frame painted with the previous set never names a family only the new
+/// one carries (#1231).
+pub fn font_definitions_roles(
+    language: crate::i18n::Language,
+    used: &[String],
+    scripts: crate::script::ScriptSet,
+    bold_scripts: crate::script::ScriptSet,
+) -> (FontDefinitions, Vec<String>) {
     font_definitions_impl(language, used, scripts, bold_scripts, true)
 }
 
@@ -488,7 +502,7 @@ fn font_definitions_impl(
     scripts: crate::script::ScriptSet,
     bold_scripts: crate::script::ScriptSet,
     system: bool,
-) -> FontDefinitions {
+) -> (FontDefinitions, Vec<String>) {
     let mut fonts = FontDefinitions::default();
     let base_prop: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let base_mono: Vec<String> = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
@@ -567,8 +581,23 @@ fn font_definitions_impl(
     drop_unparseable_fonts(&mut fonts);
     // Only families egui still has data for count as bound (a dropped face can empty a chain).
     bound.retain(|f| fonts.families.get(&FontFamily::Name(f.as_str().into())).is_some_and(|c| !c.is_empty()));
-    crate::fonts::set_bound_for(&fonts, bound);
-    fonts
+    (fonts, bound)
+}
+
+/// Keep every family and face of `old` in `new`: a frame painted with the previous set stays valid
+/// (no blank frame), and a family bound last frame can never go missing while the new set applies.
+pub fn merge_fonts(new: &mut FontDefinitions, old: &FontDefinitions) {
+    for (key, data) in &old.font_data {
+        new.font_data.entry(key.clone()).or_insert_with(|| data.clone());
+    }
+    for (family, chain) in &old.families {
+        let entry = new.families.entry(family.clone()).or_default();
+        for key in chain {
+            if !entry.contains(key) && new.font_data.contains_key(key) {
+                entry.push(key.clone());
+            }
+        }
+    }
 }
 
 /// Builds one role family's chain: the loaded system face (or its role fallback), egui's bundled
