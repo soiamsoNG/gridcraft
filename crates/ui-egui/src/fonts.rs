@@ -14,6 +14,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::script::ScriptSet;
+
 /// A font file is skipped by the scan past this size: a catalog only needs each face's name, and a
 /// damaged or enormous file must not turn startup into a long read.
 #[cfg(not(target_arch = "wasm32"))]
@@ -59,6 +61,11 @@ pub struct Face {
     pub weight: f32,
     /// Whether the style name reads as italic or oblique.
     pub italic: bool,
+    /// Whether the face's OS/2 panose declares a serif style.
+    pub serif: bool,
+    /// The scripts the face has glyphs for, as the font's charset declares them (a hit on any of
+    /// [`crate::script::SAMPLES`]'s characters per class; see [`ScriptSet`]).
+    pub scripts: ScriptSet,
 }
 
 /// The font folders of the platform (the system's and the user's). Empty on wasm.
@@ -132,36 +139,50 @@ fn style_italic(style: &str) -> bool {
 /// Every face in `data` as `(index, family, names, style)`, where `names` holds every family name
 /// (see [`Face::names`]). Damaged data yields nothing, never a panic.
 #[cfg(not(target_arch = "wasm32"))]
-fn file_faces(data: &[u8]) -> Vec<(u32, String, Vec<String>, String)> {
-    use skrifa::raw::FileRef;
-    use skrifa::{MetadataProvider, string::StringId};
-    let count = match FileRef::new(data) {
-        Ok(FileRef::Font(_)) => 1,
-        Ok(FileRef::Collection(c)) => c.len(),
-        Err(_) => return Vec::new(),
-    };
-    let name = |f: &skrifa::FontRef<'_>, ids: &[StringId]| -> Option<String> {
-        ids.iter().find_map(|id| f.localized_strings(*id).english_or_first().map(|s| s.to_string()).filter(|s| !s.is_empty()))
-    };
+fn file_faces(data: &[u8]) -> Vec<(u32, String, Vec<String>, String, bool, ScriptSet)> {
+    use skrifa::MetadataProvider as _;
+    use skrifa::raw::{FileRef, TableProvider as _};
+    use skrifa::string::StringId;
+
+    let Ok(file) = FileRef::new(data) else { return Vec::new() };
     let family_ids = [StringId::TYPOGRAPHIC_FAMILY_NAME, StringId::FAMILY_NAME];
-    (0..count)
-        .filter_map(|i| {
-            let f = skrifa::FontRef::from_index(data, i).ok()?;
-            let family = name(&f, &family_ids)?;
-            let mut names = vec![family.clone()];
-            for s in family_ids.iter().flat_map(|id| f.localized_strings(*id)) {
-                if names.len() >= MAX_FAMILY_NAMES {
-                    break;
-                }
-                let s = s.to_string();
-                if !s.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&s)) {
-                    names.push(s);
-                }
+    let mut out = Vec::new();
+    for (position, font) in file.fonts().enumerate() {
+        let Ok(font) = font else { continue };
+        let Ok(index) = u32::try_from(position) else { continue };
+        let Some(family) = face_name(&font, &family_ids) else { continue };
+        let mut names = vec![family.clone()];
+        for name in family_ids.iter().flat_map(|id| font.localized_strings(*id)) {
+            if names.len() >= MAX_FAMILY_NAMES {
+                break;
             }
-            let style = name(&f, &[StringId::TYPOGRAPHIC_SUBFAMILY_NAME, StringId::SUBFAMILY_NAME]).unwrap_or_else(|| "Regular".into());
-            Some((i, family, names, style))
-        })
-        .collect()
+            let name = name.to_string().trim_matches('\0').trim().to_string();
+            if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                names.push(name);
+            }
+        }
+        let style = face_name(&font, &[StringId::TYPOGRAPHIC_SUBFAMILY_NAME, StringId::SUBFAMILY_NAME]).unwrap_or_else(|| "Regular".into());
+        let serif = font.os2().is_ok_and(|os2| is_serif_panose(os2.panose_10()));
+        let scripts = ScriptSet::of_coverage(|c| font.charmap().map(c).is_some());
+        out.push((index, family, names, style, serif, scripts));
+    }
+    out
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn face_name(font: &skrifa::FontRef<'_>, ids: &[skrifa::string::StringId]) -> Option<String> {
+    use skrifa::MetadataProvider as _;
+    ids.iter()
+        .find_map(|id| font.localized_strings(*id).english_or_first())
+        .map(|name| name.to_string().trim_matches('\0').trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+/// Whether the OS/2 panose declaration says the face is serifed.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_serif_panose(panose: &[u8]) -> bool {
+    (panose.first() == Some(&2) && matches!(panose.get(1).copied(), Some(2..=10)))
+        || (panose.first() == Some(&3) && matches!(panose.get(1).copied(), Some(3..=10)))
 }
 
 /// Catalog every face under `dirs`, recursing into subfolders. A folder reached twice (through a
@@ -191,8 +212,17 @@ pub fn scan_dirs(dirs: &[PathBuf]) -> Vec<Face> {
                 continue;
             }
             let Some(data) = read_font(&path) else { continue };
-            for (index, family, names, style) in file_faces(&data) {
-                out.push(Face { family, names, path: path.clone(), index, weight: style_weight(&style), italic: style_italic(&style) });
+            for (index, family, names, style, serif, scripts) in file_faces(&data) {
+                out.push(Face {
+                    family,
+                    names,
+                    path: path.clone(),
+                    index,
+                    weight: style_weight(&style),
+                    italic: style_italic(&style),
+                    serif,
+                    scripts,
+                });
             }
         }
     }
@@ -474,7 +504,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("Ubuntu-Light.ttf");
         std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
-        let face = Face { family: "Ubuntu".into(), names: vec!["Ubuntu".into()], path, index: 0, weight: 300.0, italic: false };
+        let face = Face {
+            family: "Ubuntu".into(),
+            names: vec!["Ubuntu".into()],
+            path,
+            index: 0,
+            weight: 300.0,
+            italic: false,
+            serif: false,
+            scripts: ScriptSet::of_text("A"),
+        };
 
         let mut fonts = egui::FontDefinitions::default();
         let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face));
@@ -527,7 +566,16 @@ mod tests {
     const KO: u16 = 0x0412;
 
     fn face(family: &str, names: &[&str], path: &str, weight: f32) -> Face {
-        Face { family: family.into(), names: names.iter().map(|s| s.to_string()).collect(), path: path.into(), index: 0, weight, italic: false }
+        Face {
+            family: family.into(),
+            names: names.iter().map(|s| s.to_string()).collect(),
+            path: path.into(),
+            index: 0,
+            weight,
+            italic: false,
+            serif: false,
+            scripts: ScriptSet::of_text("A"),
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -537,14 +585,14 @@ mod tests {
         let font = font_with_names(&[(EN, 1, "Malgun Gothic"), (EN, 2, "Regular"), (KO, 1, "맑은 고딕"), (KO, 2, "보통")]);
         let faces = file_faces(&font);
         assert_eq!(faces.len(), 1);
-        let (_, family, names, style) = &faces[0];
+        let (_, family, names, style, _, _) = &faces[0];
         assert_eq!(family, "Malgun Gothic", "the font list keeps the English name");
         assert_eq!(names, &["Malgun Gothic", "맑은 고딕"]);
         assert_eq!(style, "Regular");
 
         // Both name IDs are kept: a legacy family name (ID 1) names a single face (#1606).
         let font = font_with_names(&[(EN, 1, "Noto Sans KR Medium"), (EN, 2, "Regular"), (EN, 16, "Noto Sans KR"), (EN, 17, "Medium")]);
-        let (_, family, names, _) = &file_faces(&font)[0];
+        let (_, family, names, _, _, _) = &file_faces(&font)[0];
         assert_eq!(family, "Noto Sans KR");
         assert_eq!(names, &["Noto Sans KR", "Noto Sans KR Medium"]);
     }
@@ -554,7 +602,7 @@ mod tests {
     fn a_name_table_full_of_names_is_capped() {
         let texts: Vec<String> = (0..100).map(|i| format!("Family {i}")).collect();
         let records: Vec<(u16, u16, &str)> = texts.iter().enumerate().map(|(i, t)| (0x0400 + i as u16, 1, t.as_str())).collect();
-        let (_, _, names, _) = &file_faces(&font_with_names(&records))[0];
+        let (_, _, names, _, _, _) = &file_faces(&font_with_names(&records))[0];
         assert_eq!(names.len(), MAX_FAMILY_NAMES);
     }
 
@@ -614,7 +662,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("Ubuntu-Light.ttf");
         std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
-        let f = Face { family: "Ubuntu".into(), names: vec!["Ubuntu".into(), "우분투".into()], path, index: 0, weight: 300.0, italic: false };
+        let f = Face {
+            family: "Ubuntu".into(),
+            names: vec!["Ubuntu".into(), "우분투".into()],
+            path,
+            index: 0,
+            weight: 300.0,
+            italic: false,
+            serif: false,
+            scripts: ScriptSet::of_text("A"),
+        };
 
         let mut fonts = egui::FontDefinitions::default();
         let before = fonts.font_data.len();
@@ -633,6 +690,6 @@ mod tests {
         let root = std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\Windows"));
         let Ok(data) = std::fs::read(root.join("Fonts").join("malgun.ttf")) else { return };
         let faces = file_faces(&data);
-        assert!(faces.iter().any(|(_, family, names, _)| family == "Malgun Gothic" && names.iter().any(|n| n == "맑은 고딕")), "{faces:?}");
+        assert!(faces.iter().any(|(_, family, names, _, _, _)| family == "Malgun Gothic" && names.iter().any(|n| n == "맑은 고딕")), "{faces:?}");
     }
 }
