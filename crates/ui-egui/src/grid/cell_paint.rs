@@ -129,12 +129,31 @@ pub(super) fn display_text(
     (f.text, f.color.map(numfmt_color), f.numeric, f.fill)
 }
 
-pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32) -> f32 {
+/// How much of a galley's last line sits below its lowest ink: the font's descent that no glyph
+/// fills. Placing a line by its ink instead of its whole line box brings the text nearer the cell's
+/// bottom edge, the way Excel does, without cutting the glyphs.
+pub(crate) fn ink_bottom_inset(galley: &egui::Galley) -> f32 {
+    let mut ink_bottom = f32::NEG_INFINITY;
+    for placed in &galley.rows {
+        for glyph in &placed.row.glyphs {
+            let bottom = placed.pos.y + glyph.pos.y + glyph.uv_rect.offset.y + glyph.uv_rect.size.y;
+            ink_bottom = ink_bottom.max(bottom);
+        }
+    }
+    if ink_bottom.is_finite() {
+        (galley.size().y - ink_bottom).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, inset: f32) -> f32 {
     let pad_v = 1.5 * z;
     let y_top = rect.top() + pad_v;
     // Not clamped to `y_top`: text taller than the row overflows upward (Bottom) or both ways
     // (Center), and the cell's clip rect trims it, so Middle and Bottom stay distinct from Top.
-    let y_bottom = rect.bottom() - gh - pad_v;
+    // Only half of the trailing descent is kept as space below the ink.
+    let y_bottom = rect.bottom() - gh + 0.5 * inset - 0.5 * pad_v;
     match valign {
         VAlign::Top => y_top,
         VAlign::Center | VAlign::Justify | VAlign::Distributed => (y_top + y_bottom) / 2.0,
@@ -142,13 +161,14 @@ pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32) -
     }
 }
 
-pub(crate) fn cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32) -> f32 {
+pub(crate) fn cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, inset: f32) -> f32 {
     let top_inset = 1.0 * z;
     let y_top = rect.top() - top_inset;
     // Not clamped to `y_top`: a line mixing scripts sits taller than the row (its fallback faces are
     // put on the baseline, #1231), so Bottom lets the extra ascent overflow above and the cell's clip
     // trims it there. Clamping would push the baseline down and hang the glyphs under the row.
-    let y_bottom = rect.bottom() - gh - 0.5 * z;
+    // Only half of the trailing descent is kept as space below the ink.
+    let y_bottom = rect.bottom() - gh + 0.5 * inset - 0.25 * z;
     match valign {
         VAlign::Top => y_top,
         VAlign::Center | VAlign::Justify | VAlign::Distributed => (y_top + y_bottom) / 2.0,
