@@ -523,6 +523,19 @@ fn face_key(face: &Face) -> String {
 pub struct ScriptFallbacks {
     pub sans: Vec<String>,
     pub serif: Vec<String>,
+    /// Faces whose weight answers a bold request, for the scripts that have one. A Chinese cell in
+    /// Calibri gets its Latin from Carlito Bold, so the Han glyphs have to come from a bold CJK face
+    /// or the cell looks half-bold (#1231).
+    pub bold_sans: Vec<String>,
+    pub bold_serif: Vec<String>,
+}
+
+/// The script fallbacks a role chains: the bold faces when the role is bold and the host has them,
+/// otherwise the regular ones, so a script with no bold face keeps its regular glyphs.
+fn script_chain(fallback: &ScriptFallbacks, bold: bool, serif: bool) -> &[String] {
+    let regular = if serif { &fallback.serif } else { &fallback.sans };
+    let bold_chain = if serif { &fallback.bold_serif } else { &fallback.bold_sans };
+    if bold && !bold_chain.is_empty() { bold_chain } else { regular }
 }
 
 /// Read one face's file, select its SFNT face, and apply the named instance fontconfig encoded in
@@ -595,7 +608,7 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
             Some(fd) => face_is_serif(fd.as_ref()),
             None => primary.serif,
         };
-        let script = if serif { &fallback.serif } else { &fallback.sans };
+        let script = script_chain(fallback, bold, serif);
         let mut chain: Vec<String> = Vec::new();
         for face in [Some(primary), pick_face(faces, false, false)] {
             let Some(face) = face else { continue };
@@ -1011,7 +1024,12 @@ mod tests {
         let data = || std::sync::Arc::new(egui::FontData::from_owned(epaint_default_fonts::UBUNTU_LIGHT.to_vec()));
         fonts.font_data.insert("sys-cjk-han-zh".into(), data());
         fonts.font_data.insert("sys-cjk-han-zh-serif".into(), data());
-        let fallback = ScriptFallbacks { sans: vec!["sys-cjk-han-zh".into()], serif: vec!["sys-cjk-han-zh-serif".into()] };
+        let fallback = ScriptFallbacks {
+            sans: vec!["sys-cjk-han-zh".into()],
+            serif: vec!["sys-cjk-han-zh-serif".into()],
+            bold_sans: Vec::new(),
+            bold_serif: Vec::new(),
+        };
         let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face), &fallback);
         for key in &bound {
             let chain = fonts.families.get(&egui::FontFamily::Name(key.as_str().into())).expect("role family");
@@ -1073,7 +1091,12 @@ mod tests {
         let data = || std::sync::Arc::new(egui::FontData::from_owned(epaint_default_fonts::UBUNTU_LIGHT.to_vec()));
         fonts.font_data.insert("sys-cjk-han-zh".into(), data());
         fonts.font_data.insert("sys-cjk-han-zh-serif".into(), data());
-        let fallback = ScriptFallbacks { sans: vec!["sys-cjk-han-zh".into()], serif: vec!["sys-cjk-han-zh-serif".into()] };
+        let fallback = ScriptFallbacks {
+            sans: vec!["sys-cjk-han-zh".into()],
+            serif: vec!["sys-cjk-han-zh-serif".into()],
+            bold_sans: Vec::new(),
+            bold_serif: Vec::new(),
+        };
         let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face), &fallback);
         for key in &bound {
             let chain = fonts.families.get(&egui::FontFamily::Name(key.as_str().into())).expect("role family");
@@ -1262,6 +1285,23 @@ mod tests {
         assert!(coverage.has(crate::script::ScriptClass::Latin), "the real italic face draws Latin");
         assert!(!coverage.has(crate::script::ScriptClass::Han), "Han has no italic face, so it is slanted");
         set_bound([]);
+    }
+
+    #[test]
+    fn a_bold_role_chains_the_bold_script_faces() {
+        let fallback = ScriptFallbacks {
+            sans: vec!["regular".into()],
+            serif: vec!["regular-serif".into()],
+            bold_sans: vec!["bold".into()],
+            bold_serif: vec!["bold-serif".into()],
+        };
+        assert_eq!(script_chain(&fallback, false, false), ["regular".to_string()]);
+        assert_eq!(script_chain(&fallback, true, false), ["bold".to_string()]);
+        assert_eq!(script_chain(&fallback, true, true), ["bold-serif".to_string()]);
+        // A host without bold faces keeps the regular chain instead of dropping the fallback.
+        let no_bold = ScriptFallbacks { bold_sans: Vec::new(), bold_serif: Vec::new(), ..fallback };
+        assert_eq!(script_chain(&no_bold, true, false), ["regular".to_string()]);
+        assert_eq!(script_chain(&no_bold, true, true), ["regular-serif".to_string()]);
     }
 
     #[test]

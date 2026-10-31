@@ -665,7 +665,7 @@ pub fn font_definitions_for_language(language: crate::i18n::Language) -> FontDef
 /// installed, so cells set in them render with them; the rest fall back to the roles. The bound
 /// families are recorded in [`crate::fonts`] so [`cell_family`] only names a family egui has.
 pub fn font_definitions_with(language: crate::i18n::Language, used: &[String], scripts: ScriptSet) -> FontDefinitions {
-    let (fonts, bound) = font_definitions_with_bound(language, used, scripts);
+    let (fonts, bound) = font_definitions_with_bound(language, used, scripts, ScriptSet::EMPTY);
     crate::fonts::set_bound_for(&fonts, bound);
     fonts
 }
@@ -699,7 +699,12 @@ pub fn merge_missing_fonts(new: &mut FontDefinitions, old: &FontDefinitions) {
 /// Builds the font set and returns the role families it bound, without publishing them to
 /// [`crate::fonts`]. Used when egui will activate the set on its next pass: publishing the roles
 /// now would let [`cell_family`] name families the current pass has not installed yet.
-pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[String], scripts: ScriptSet) -> (FontDefinitions, Vec<String>) {
+pub fn font_definitions_with_bound(
+    language: crate::i18n::Language,
+    used: &[String],
+    scripts: ScriptSet,
+    bold_scripts: ScriptSet,
+) -> (FontDefinitions, Vec<String>) {
     let mut fonts = FontDefinitions::default();
     let base_prop: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let base_mono: Vec<String> = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
@@ -718,6 +723,10 @@ pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[Stri
     // chained to the sans faces would draw CJK in the wrong style (Times New Roman → sans CJK).
     let want_serif = used.iter().any(|name| family_name_is_serif(name));
     let serif_fallback = if want_serif { load_fallback(&mut fonts, han, true, wanted, known) } else { Vec::new() };
+    // Bold script faces, for the scripts the workbook actually sets in bold. Loaded after the
+    // regular ones so a script with no bold face keeps its regular face instead of nothing.
+    let bold_sans = load_bold_script_faces(&mut fonts, bold_scripts, false);
+    let bold_serif = if want_serif { load_bold_script_faces(&mut fonts, bold_scripts, true) } else { Vec::new() };
     for role in [UI, UI_BOLD, CELL, CELL_BOLD, CELL_ITALIC, CELL_BOLD_ITALIC, SERIF, MONO] {
         let paths = candidates(role);
         let refs: Vec<(&str, u32)> = paths.iter().map(|(p, i)| (p.as_str(), *i)).collect();
@@ -737,7 +746,14 @@ pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[Stri
             chain.push(format!("sys-{CELL}"));
         }
         chain.extend(if role == MONO { base_mono.clone() } else { base_prop.clone() });
-        let role_fallback = if role == SERIF && want_serif { &serif_fallback } else { &fallback };
+        let wants_bold_face = matches!(role, UI_BOLD | CELL_BOLD | CELL_BOLD_ITALIC);
+        let role_fallback = if role == SERIF && want_serif {
+            &serif_fallback
+        } else if wants_bold_face && !bold_sans.is_empty() {
+            &bold_sans
+        } else {
+            &fallback
+        };
         chain.extend(role_fallback.iter().cloned());
         chain.retain(|k| fonts.font_data.contains_key(k));
         fonts.families.insert(FontFamily::Name(role.into()), chain);
@@ -745,8 +761,12 @@ pub fn font_definitions_with_bound(language: crate::i18n::Language, used: &[Stri
     }
     // Installed workbook fonts, so a cell's chosen font actually renders in it. Each bound family
     // carries the script fallbacks for its own face: sans for upright faces, serif for serif ones.
-    let script_fallbacks =
-        crate::fonts::ScriptFallbacks { sans: fallback.clone(), serif: if want_serif { serif_fallback.clone() } else { fallback.clone() } };
+    let script_fallbacks = crate::fonts::ScriptFallbacks {
+        sans: fallback.clone(),
+        serif: if want_serif { serif_fallback.clone() } else { fallback.clone() },
+        bold_sans: if bold_sans.is_empty() { fallback.clone() } else { bold_sans.clone() },
+        bold_serif: if bold_serif.is_empty() { if want_serif { serif_fallback.clone() } else { fallback.clone() } } else { bold_serif.clone() },
+    };
     let installed = crate::fonts::installed_among(used);
     for family in &installed {
         bound.extend(crate::fonts::bind_family(&mut fonts, family, &script_fallbacks));
@@ -892,7 +912,7 @@ fn load_catalog_fallback(fonts: &mut FontDefinitions, wanted: ScriptSet, covered
         if !wanted.intersects(single) || covered.intersects(single) {
             continue;
         }
-        let Some(entry) = catalog.font_for_script(script, serif) else { continue };
+        let Some(entry) = catalog.font_for_script(script, serif, false) else { continue };
         let path = entry.path.to_string_lossy().into_owned();
         // A file already in the font set serves every script it covers; loading it again under a
         // second key would duplicate its bytes in memory (a CJK collection is tens of megabytes).
@@ -908,8 +928,46 @@ fn load_catalog_fallback(fonts: &mut FontDefinitions, wanted: ScriptSet, covered
     keys
 }
 
+/// Faces for the scripts the workbook sets in bold, when the host has them.
+///
+/// A Calibri cell takes its Latin from Carlito Bold, so the Han glyphs have to come from a bold CJK
+/// face or half the cell stays regular. Resolving through the catalog keeps Flatpak honest: the
+/// sandbox installs no CJK font, it sees the host's faces, and a host without a bold face simply
+/// leaves the chain as it is (#1231).
+#[cfg(not(target_arch = "wasm32"))]
+fn load_bold_script_faces(fonts: &mut FontDefinitions, wanted_bold: ScriptSet, serif: bool) -> Vec<String> {
+    let Some(catalog) = crate::catalog::FontCatalog::installed() else { return Vec::new() };
+    let mut keys = Vec::new();
+    let mut loaded: Vec<String> = Vec::new();
+    for script in ScriptClass::ALL {
+        // Latin comes from the bound family's own bold face (Carlito Bold, Liberation Sans Bold).
+        if script == ScriptClass::Latin || !wanted_bold.intersects(ScriptSet::EMPTY.with(script)) {
+            continue;
+        }
+        let Some(entry) = catalog.font_for_script(script, serif, true) else { continue };
+        if entry.weight < 600.0 {
+            continue; // no bold face for this script on this host
+        }
+        let path = entry.path.to_string_lossy().into_owned();
+        if loaded.contains(&path) {
+            continue; // one file, several scripts
+        }
+        let Some(fd) = try_load(&[(path.as_str(), entry.index)]) else { continue };
+        let key = format!("sys-script-{}-bold{}", script.name(), if serif { "-serif" } else { "" });
+        fonts.font_data.insert(key.clone(), Arc::new(fd));
+        keys.push(key);
+        loaded.push(path);
+    }
+    keys
+}
+
 #[cfg(target_arch = "wasm32")]
 fn load_fallback(_fonts: &mut FontDefinitions, _han: HanOrder, _serif: bool, _wanted: ScriptSet, _known: bool) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_bold_script_faces(_fonts: &mut FontDefinitions, _wanted_bold: ScriptSet, _serif: bool) -> Vec<String> {
     Vec::new()
 }
 
@@ -1503,7 +1561,7 @@ mod font_binding_tests {
         if crate::fonts::substitute_family("Times New Roman").is_none() {
             return; // installed already, or no fontconfig and no folder-scan substitute
         }
-        let (fonts, bound) = font_definitions_with_bound(Language::En, &["Times New Roman".to_string()], ScriptSet::default());
+        let (fonts, bound) = font_definitions_with_bound(Language::En, &["Times New Roman".to_string()], ScriptSet::default(), ScriptSet::default());
         crate::fonts::set_bound(bound.clone());
         let face = |bold: bool, italic: bool| -> String {
             let family = cell_family("Times New Roman", bold, italic);
@@ -1689,7 +1747,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_latin_sheet_skips_the_cjk_and_thai_faces() {
-        let (fonts, _) = font_definitions_with_bound(Language::En, &[], ScriptSet::of_text("Total 42"));
+        let (fonts, _) = font_definitions_with_bound(Language::En, &[], ScriptSet::of_text("Total 42"), ScriptSet::default());
         assert!(!fonts.font_data.keys().any(|k| k.starts_with("sys-cjk")), "Latin text loads no CJK face");
         assert!(!fonts.font_data.keys().any(|k| k.starts_with("sys-thai")), "Latin text loads no Thai face");
     }
@@ -1704,11 +1762,11 @@ mod tests {
             return; // no Arial substitute on this machine
         }
         let scripts = ScriptSet::of_text("A");
-        let (defs_a, bound_a) = font_definitions_with_bound(crate::i18n::Language::En, &["Arial".to_string()], scripts);
+        let (defs_a, bound_a) = font_definitions_with_bound(crate::i18n::Language::En, &["Arial".to_string()], scripts, ScriptSet::default());
         assert!(bound_a.iter().any(|role| role.starts_with("fnt:Arial:")), "Arial is substituted and bound");
         crate::fonts::set_bound_for(&defs_a, bound_a.clone());
         // A later set for a workbook that only uses Calibri has no Arial role at all.
-        let (mut defs_b, bound_b) = font_definitions_with_bound(crate::i18n::Language::En, &["Calibri".to_string()], scripts);
+        let (mut defs_b, bound_b) = font_definitions_with_bound(crate::i18n::Language::En, &["Calibri".to_string()], scripts, ScriptSet::default());
         assert!(!bound_b.iter().any(|role| role.starts_with("fnt:Arial:")), "the new set does not bind Arial");
         merge_missing_fonts(&mut defs_b, &defs_a);
         for role in &bound_a {
@@ -1740,7 +1798,7 @@ mod tests {
         if !catalog.covers(ScriptClass::Thai) {
             return; // no Thai face to find on this machine
         }
-        let (fonts, _) = font_definitions_with_bound(Language::En, &[], ScriptSet::of_text("สวัสดี"));
+        let (fonts, _) = font_definitions_with_bound(Language::En, &[], ScriptSet::of_text("สวัสดี"), ScriptSet::default());
         assert!(
             fonts.font_data.keys().any(|k| k == "sys-thai" || k == "sys-script-thai"),
             "a Thai workbook needs a Thai face: {:?}",
@@ -1757,7 +1815,7 @@ mod tests {
             if !catalog.covers(script) {
                 continue; // this machine has no face for the script
             }
-            let (fonts, _) = font_definitions_with_bound(Language::En, &[], ScriptSet::of_text(text));
+            let (fonts, _) = font_definitions_with_bound(Language::En, &[], ScriptSet::of_text(text), ScriptSet::default());
             assert!(
                 fonts.font_data.keys().any(|k| k == chain),
                 "{script:?} needs a face from the catalog: {:?}",
@@ -1873,7 +1931,7 @@ mod tests {
 
     #[test]
     fn serif_workbook_fonts_load_the_serif_fallbacks() {
-        let (fonts, _) = font_definitions_with_bound(Language::En, &["Times New Roman".into()], ScriptSet::default());
+        let (fonts, _) = font_definitions_with_bound(Language::En, &["Times New Roman".into()], ScriptSet::default(), ScriptSet::default());
         if !cjk_han_simplified_serif().iter().any(|(p, _)| std::path::Path::new(p).is_file()) {
             return; // no serif CJK face on this machine
         }
@@ -1888,7 +1946,7 @@ mod tests {
     #[test]
     fn sans_workbook_fonts_skip_the_serif_fallbacks() {
         // Noto Serif CJK is ~55 MB; a workbook that asks for no serif face must not load it.
-        let (fonts, _) = font_definitions_with_bound(Language::En, &["Arial".into()], ScriptSet::default());
+        let (fonts, _) = font_definitions_with_bound(Language::En, &["Arial".into()], ScriptSet::default(), ScriptSet::default());
         let serif_keys = ["sys-cjk-han-zh-serif", "sys-cjk-han-ja-serif", "sys-thai-serif"];
         assert!(!serif_keys.iter().any(|k| fonts.font_data.contains_key(*k)), "sans-only workbook loaded serif faces");
     }

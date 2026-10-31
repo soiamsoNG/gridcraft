@@ -275,6 +275,9 @@ pub struct SheetApp {
     /// The scripts the cell text used when the fallback faces were chosen; new text in another
     /// script loads that script's faces on the next pass (#1231).
     fonts_scripts: crate::script::ScriptSet,
+    /// The scripts the workbook sets in bold when the bold faces were loaded; new bold text in
+    /// another script reloads them (#1231).
+    fonts_bold_scripts: crate::script::ScriptSet,
     /// The (doc uid, revision) `fonts_bound` was computed for, so the style table is walked only
     /// when the workbook changes.
     fonts_seen: (u64, u64),
@@ -349,6 +352,7 @@ impl SheetApp {
             fonts_set: false,
             fonts_bound: Vec::new(),
             fonts_scripts: crate::script::ScriptSet::EMPTY,
+            fonts_bold_scripts: crate::script::ScriptSet::EMPTY,
             fonts_seen: (0, 0),
             fonts_rebind: false,
             pending_bound: None,
@@ -394,6 +398,7 @@ impl SheetApp {
     fn install_first_font_set(&mut self, ctx: &egui::Context) {
         let used = self.used_fonts();
         let scripts = self.used_scripts();
+        let bold_scripts = self.used_bold_scripts();
         self.fonts_bound.clear();
         self.fonts_scripts = crate::script::ScriptSet::EMPTY;
         self.fonts_seen = (0, 0);
@@ -406,7 +411,7 @@ impl SheetApp {
         // Blocking here costs one `fc-list` (tens of milliseconds) and saves the atlas rebuild a
         // later rebind would trigger.
         let _ = fonts::catalog();
-        let (mut defs, bound) = theme::font_definitions_with_bound(self.ui.language, &used, scripts);
+        let (mut defs, bound) = theme::font_definitions_with_bound(self.ui.language, &used, scripts, bold_scripts);
         if let Some(old) = &self.fonts_defs {
             theme::merge_missing_fonts(&mut defs, old);
         }
@@ -415,6 +420,7 @@ impl SheetApp {
         theme::apply(ctx, self.ui.dark);
         self.fonts_bound = used;
         self.fonts_scripts = scripts;
+        self.fonts_bold_scripts = bold_scripts;
         self.fonts_seen = self.session.active().map(|d| (d.uid, d.revision)).unwrap_or((0, 0));
         // Nothing paints before `fonts_ready`, so the roles this set installs can be advertised
         // now; leaving them pending would paint the first visible frame with role families only.
@@ -437,6 +443,30 @@ impl SheetApp {
 
     /// The scripts the workbook's cell text uses, up to a character budget so a big sheet is not
     /// walked on every rebind. Empty until text is seen: the font set then loads every fallback.
+    /// The scripts the workbook sets in bold: only these need a bold fallback face loaded, which
+    /// keeps a Latin workbook from paying for a bold CJK file it never draws (#1231).
+    pub fn used_bold_scripts(&self) -> crate::script::ScriptSet {
+        const LIMIT: usize = 200_000;
+        let mut scripts = crate::script::ScriptSet::EMPTY;
+        let mut seen = 0usize;
+        if let Some(d) = self.session.active() {
+            for sheet in &d.wb.sheets {
+                for (cell, cell_value) in sheet.cells.iter() {
+                    let gridcraft_engine::core::Value::Text(text) = &cell_value.value else { continue };
+                    if !d.wb.styles.get(sheet.style_id(cell)).font.bold {
+                        continue;
+                    }
+                    scripts = scripts.union(crate::script::ScriptSet::of_text(text));
+                    seen += text.chars().count();
+                    if seen >= LIMIT {
+                        return scripts;
+                    }
+                }
+            }
+        }
+        scripts
+    }
+
     pub fn used_scripts(&self) -> crate::script::ScriptSet {
         /// Stop after this many characters: the first scripts seen say what to load, and a hostile
         /// sheet of millions of cells must not stall the frame.
@@ -1284,9 +1314,10 @@ impl SheetApp {
             if seen != self.fonts_seen {
                 let used = self.used_fonts();
                 let scripts = self.used_scripts();
+                let bold_scripts = self.used_bold_scripts();
                 self.fonts_seen = seen;
-                if used != self.fonts_bound || scripts != self.fonts_scripts {
-                    let (mut fonts, bound) = theme::font_definitions_with_bound(self.ui.language, &used, scripts);
+                if used != self.fonts_bound || scripts != self.fonts_scripts || bold_scripts != self.fonts_bold_scripts {
+                    let (mut fonts, bound) = theme::font_definitions_with_bound(self.ui.language, &used, scripts, bold_scripts);
                     if let Some(old) = &self.fonts_defs {
                         theme::merge_missing_fonts(&mut fonts, old);
                     }
@@ -1294,6 +1325,7 @@ impl SheetApp {
                     self.fonts_defs = Some(fonts.clone());
                     self.fonts_bound = used;
                     self.fonts_scripts = scripts;
+                    self.fonts_bold_scripts = bold_scripts;
                     self.pending_bound = Some(bound);
                     self.fonts_rebind = true;
                     ctx.request_repaint();
