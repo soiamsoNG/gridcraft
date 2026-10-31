@@ -232,18 +232,18 @@ fn cell_text_y_moves_monotonically_in_standard_and_tall_rows() {
     let gh = 18.5;
     let z = 1.0;
 
-    let y_top_std = cell_text_y(VAlign::Top, rect_std, gh, z);
-    let y_center_std = cell_text_y(VAlign::Center, rect_std, gh, z);
-    let y_bottom_std = cell_text_y(VAlign::Bottom, rect_std, gh, z);
+    let y_top_std = cell_text_y(VAlign::Top, rect_std, gh, z, 0.0);
+    let y_center_std = cell_text_y(VAlign::Center, rect_std, gh, z, 0.0);
+    let y_bottom_std = cell_text_y(VAlign::Bottom, rect_std, gh, z, 0.0);
 
     assert!(y_top_std < y_center_std, "Top ({y_top_std}) must be higher than Center ({y_center_std})");
     assert!(y_center_std < y_bottom_std, "Center ({y_center_std}) must be higher than Bottom ({y_bottom_std})");
 
     // Verify tall row (e.g. 40px)
     let rect_tall = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 40.0));
-    let y_top_tall = cell_text_y(VAlign::Top, rect_tall, gh, z);
-    let y_center_tall = cell_text_y(VAlign::Center, rect_tall, gh, z);
-    let y_bottom_tall = cell_text_y(VAlign::Bottom, rect_tall, gh, z);
+    let y_top_tall = cell_text_y(VAlign::Top, rect_tall, gh, z, 0.0);
+    let y_center_tall = cell_text_y(VAlign::Center, rect_tall, gh, z, 0.0);
+    let y_bottom_tall = cell_text_y(VAlign::Bottom, rect_tall, gh, z, 0.0);
 
     assert!(y_top_tall < y_center_tall, "Top ({y_top_tall}) must be higher than Center ({y_center_tall})");
     assert!(y_center_tall < y_bottom_tall, "Center ({y_center_tall}) must be higher than Bottom ({y_bottom_tall})");
@@ -255,16 +255,16 @@ fn wrapped_cell_text_y_positions_correctly_and_safeguards_overflow() {
     let gh = 30.0;
     let z = 1.0;
 
-    let y_top = wrapped_cell_text_y(VAlign::Top, rect, gh, z);
-    let y_center = wrapped_cell_text_y(VAlign::Center, rect, gh, z);
-    let y_bottom = wrapped_cell_text_y(VAlign::Bottom, rect, gh, z);
+    let y_top = wrapped_cell_text_y(VAlign::Top, rect, gh, z, 0.0);
+    let y_center = wrapped_cell_text_y(VAlign::Center, rect, gh, z, 0.0);
+    let y_bottom = wrapped_cell_text_y(VAlign::Bottom, rect, gh, z, 0.0);
 
     assert!(y_top < y_center);
     assert!(y_center < y_bottom);
 
     // Overflow case: gh exceeds rect height; Top still starts inside the cell.
     let gh_overflow = 60.0;
-    let y_top_ovf = wrapped_cell_text_y(VAlign::Top, rect, gh_overflow, z);
+    let y_top_ovf = wrapped_cell_text_y(VAlign::Top, rect, gh_overflow, z, 0.0);
     assert!(y_top_ovf >= rect.top());
 }
 
@@ -274,11 +274,25 @@ fn cell_text_y_keeps_the_ink_inside_a_short_row() {
     // so its galley is taller than the row (#1231).
     let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 16.0));
     let (gh, z) = (19.0, 1.0);
-    let y_top = cell_text_y(VAlign::Top, rect, gh, z);
-    let y_bottom = cell_text_y(VAlign::Bottom, rect, gh, z);
+    let y_top = cell_text_y(VAlign::Top, rect, gh, z, 0.0);
+    let y_bottom = cell_text_y(VAlign::Bottom, rect, gh, z, 0.0);
     assert!(y_bottom < y_top, "Bottom ({y_bottom}) must start above Top ({y_top})");
-    // Bottom keeps the last pixel row of ink inside the cell, trimming the extra ascent instead.
-    assert!((y_bottom + gh - (rect.bottom() - 0.5)).abs() < 0.01, "Bottom ends at the bottom edge, got {y_bottom}");
+    // Bottom keeps the ink inside the cell, trimming the extra ascent instead.
+    assert!((y_bottom + gh - (rect.bottom() - 0.25)).abs() < 0.01, "Bottom ends at the bottom edge, got {y_bottom}");
+}
+
+#[test]
+fn half_of_the_trailing_descent_stays_below_the_ink() {
+    // A 20px row, a 16px line box whose lowest ink ends 4px above its bottom (the font's descent).
+    let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 20.0));
+    let (gh, z, inset) = (16.0, 1.0, 4.0);
+    let y = cell_text_y(VAlign::Bottom, rect, gh, z, inset);
+    let ink_bottom = y + gh - inset;
+    // The gap below the ink is (inset + 1px) halved, not the whole descent.
+    assert!((ink_bottom - (rect.bottom() - (inset + 0.5) / 2.0)).abs() < 0.01, "ink bottom {ink_bottom}");
+    // Without a measured descent nothing moves further down than the line box.
+    let plain = cell_text_y(VAlign::Bottom, rect, gh, z, 0.0);
+    assert!(y > plain);
 }
 
 #[test]
@@ -286,13 +300,14 @@ fn wrapped_cell_text_y_keeps_vertical_alignment_when_text_is_taller_than_the_row
     // A default-height row holding three wrapped lines.
     let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 20.0));
     let (gh, z) = (60.0, 1.0);
-    let y_top = wrapped_cell_text_y(VAlign::Top, rect, gh, z);
-    let y_center = wrapped_cell_text_y(VAlign::Center, rect, gh, z);
-    let y_bottom = wrapped_cell_text_y(VAlign::Bottom, rect, gh, z);
+    let y_top = wrapped_cell_text_y(VAlign::Top, rect, gh, z, 0.0);
+    let y_center = wrapped_cell_text_y(VAlign::Center, rect, gh, z, 0.0);
+    let y_bottom = wrapped_cell_text_y(VAlign::Bottom, rect, gh, z, 0.0);
     // Taller text overflows upward for Bottom and both ways for Center (the cell clips it).
     assert!((y_top - 1.5).abs() < 0.01, "Top starts at the top edge, got {y_top}");
-    assert!((y_center + gh / 2.0 - rect.center().y).abs() < 0.01, "Center is centred, got {y_center}");
-    assert!((y_bottom + gh - (rect.bottom() - 1.5)).abs() < 0.01, "Bottom ends at the bottom edge, got {y_bottom}");
+    // Centre sits half of the smaller bottom gap lower than the row's centre (0.75 / 2 here).
+    assert!((y_center + gh / 2.0 - (rect.center().y + 0.375)).abs() < 0.01, "Center is centred, got {y_center}");
+    assert!((y_bottom + gh - (rect.bottom() - 0.75)).abs() < 0.01, "Bottom ends at the bottom edge, got {y_bottom}");
 }
 
 /// The screen box of a galley of `size` drawn at `pos` turned by `angle` about `pos`, as egui
