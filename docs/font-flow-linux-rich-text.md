@@ -520,6 +520,7 @@ Consequences:
 | An empty workbook asks for everything | Until the first text is seen, `wanted_scripts()` returns `ScriptSet::all()` so the first frame cannot show tofu; an empty sheet therefore loads every installed fallback. |
 | Latin never asks the catalog | The interface and bound families cover Latin, so `load_catalog_fallback()` skips it; a Latin-only face missing from every chain is not repaired. |
 | Host/Flatpak fontconfig differs | The Flatpak ships `65-lang.conf`, `70-noto-cjk.conf` and `75-noto-color-emoji.conf`; the 28 East/Southeast Asian `lang` probes now match the host exactly. |
+| epaint puts each face on its own baseline | Upstream #8802: a glyph's `y` comes from its face's ascent, so a CJK fallback face hangs below the Latin baseline by ~0.3 em. `align_baselines()` in `crates/ui-egui/src/grid.rs` re-bases the row after layout and moves the quads tessellation already produced; it costs one galley clone per mixed cell per frame (`Arc::make_mut` inside `align_baselines`), and goes away when upstream #8804 lands. |
 | No rich-text model | Per-character formatting is lost; XLSX runs are flattened. |
 
 ---
@@ -1438,7 +1439,7 @@ Current test result:
 
 ```text
 cargo +1.95.0 test -p gridcraft-ui-egui --lib
-225 passed, 0 failed
+226 passed, 0 failed
 ```
 
 The full `cargo xtask ci` was not run for this branch; the affected crates are
@@ -1668,9 +1669,9 @@ Still open:
   `git rebase --onto v0.12.1 ac8da7d4` on 2026-10-29 (34 commits). `v0.12.1` is
   the newest release that still takes IME input; 0.13.0 lost it in the egui 0.37
   migration, and this branch is the base for fixing that on a tree we can ship.
-- Last code commit: `4aef9bc3` (`fix(ui): slant only the scripts the italic
-  face does not cover (#1231)`, on top of `c24c562d`); the rebase itself ended
-  at `4f219953`.
+- Last code commit: `949b603d` (`fix(ui): put the faces mixed in a row on one
+  baseline (#1231)`, on top of `4aef9bc3` and `c24c562d`); the rebase itself
+  ended at `4f219953`.
   (This note is edited on top of it, so its own hash is not quoted.)
 - The rebase rewrote history: the hashes quoted in §3–§11 and in earlier
   revisions of this note (`775a14a`, `57df98d`, `0d58e8d`, `561e539`, `b9283ba`,
@@ -1701,6 +1702,9 @@ Current app behavior:
   the name is not installed, so the family fontconfig substitutes for it
   (Liberation Serif, Caladea, Liberation Mono) is bound in all four roles under
   the requested name. The same now applies to every standard `ribbon::FONTS` name.
+- Mixed Latin and CJK text shares one baseline: epaint 0.36.2 gives every face its own baseline
+  (upstream #8802), so the cell renderer re-bases the row after layout and CJK no longer hangs
+  below the Latin line.
 - Italic works for families that are installed but have no italic face: the cell
   text is sheared by epaint (`TextFormat::italics`), at the family's advances, so
   a column does not change width. A real italic face is used as it is, and the
