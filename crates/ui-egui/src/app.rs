@@ -107,6 +107,12 @@ impl SheetApp {
     /// Per-frame logic (control channel, screenshots). Call before `ui`.
     pub fn logic(&mut self, ctx: &egui::Context) {
         self.ensure_text_width(ctx);
+        // egui 0.37 only forwards IME events once the window allows them; without this a Chinese,
+        // Japanese or Korean input method composes in its own window and commits nothing (#1231).
+        ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
+        // A glyph nothing can draw must never abort the app: a workbook saved on a machine with
+        // more fonts than this one can name any character (#1231). Tofu is the honest answer.
+        ctx.set_missing_glyph_policy(egui::epaint::text::MissingGlyphPolicy::Tofu);
         // A keytip control request lives one frame: the ribbon consumes it during `ui`, and
         // anything that never reached a control (collapsed ribbon, tab switch) is dropped.
         self.ui.keytip_invoke = None;

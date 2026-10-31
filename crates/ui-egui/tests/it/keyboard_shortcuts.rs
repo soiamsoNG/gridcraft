@@ -298,3 +298,14 @@ fn ctrl_alt_letter_that_typed_text_is_not_select_all() {
     assert_eq!(h.state().session.active().unwrap().selection.current().a1(), "B2");
     assert_eq!(h.state().editor.as_ref().unwrap().text, "\u{e4}");
 }
+
+#[test]
+fn an_input_method_commit_types_into_the_cell() {
+    // A Chinese/Japanese IME commits finished text as one `Ime` event; it never arrives as `Text`.
+    let mut h = harness(book("B2"));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Commit("中文".into())));
+    h.run_steps(2);
+    let ed = h.state().editor.as_ref().expect("typing starts an edit");
+    assert_eq!(ed.text, "中文");
+    assert_eq!(ed.caret, 2);
+}

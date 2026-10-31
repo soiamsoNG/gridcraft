@@ -60,6 +60,13 @@ pub(super) fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Res
             // insert text at, so a middle click on a cell is deliberately not a paste.
             egui::Event::MiddleClickPaste { .. } => {}
             egui::Event::Text(_) if shortcut_pressed || shortcut_ran => {}
+            // An input method (ibus, fcitx, a native IME) commits finished text as one string: it
+            // never arrives as `Text`, so without this a Chinese or Japanese keyboard types nothing.
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !shortcut_pressed && !text.is_empty() => {
+                ime_commit(app, text);
+                return;
+            }
+            egui::Event::Ime(_) => {}
             egui::Event::Text(text) if text.chars().all(|c| !c.is_control()) && !text.is_empty() => {
                 app.begin_edit(Some(text), false);
                 if let Some(ed) = app.editor.as_mut() {
@@ -155,5 +162,17 @@ pub(super) fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Res
             }
             _ => {}
         }
+    }
+}
+
+/// Insert the text an input method committed, at the end of the active edit (or in a new one).
+fn ime_commit(app: &mut SheetApp, text: String) {
+    if app.editor.is_none() {
+        app.begin_edit(Some(text), false);
+    } else if let Some(ed) = app.editor.as_mut() {
+        ed.text.push_str(&text);
+    }
+    if let Some(ed) = app.editor.as_mut() {
+        ed.caret = ed.text.chars().count();
     }
 }
