@@ -245,6 +245,9 @@ pub struct SheetApp {
     /// The open workbooks' (uid, revision), folded, that `fonts_bound` was computed for, so the
     /// style tables are walked only when a workbook changes.
     fonts_seen: (u64, u64),
+    /// The scripts `fonts_bound` was built for: text that gains a script (a Thai cell typed into a
+    /// Latin sheet) has to rebuild the font set even though no font name changed.
+    fonts_scripts: crate::script::ScriptSet,
     /// Set while a font-set change is pending activation: skip this frame's paint, like the
     /// startup `fonts_ready` gate (egui applies new definitions at the next pass).
     fonts_rebind: bool,
