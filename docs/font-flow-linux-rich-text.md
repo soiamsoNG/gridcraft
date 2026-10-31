@@ -514,7 +514,7 @@ Consequences:
 | Serif companions load on demand | A serif workbook font pays ~55 MB for Noto Serif CJK; a sans-only workbook never loads it. |
 | `try_load` checks parseability, not script coverage | `fc-match` substitute may be chosen even if it lacks the script. |
 | `families()` rebuilds the list on every call | Ribbon calls it per frame; potentially wasteful. |
-| Missing bold/italic face binds regular | A font without a bold or italic face renders both as regular. `SERIF` and `MONO` have no style roles either, so a standard name that is *not* installed used to lose bold and italic. Its substitute is now bound in all four roles (#1231); a family really installed but lacking a face still falls back to its regular. |
+| Missing bold/italic face | A missing italic is slanted by epaint (`TextFormat::italics`) in cell painting; a missing bold still renders as regular, and the editor and formula bar do not slant yet. `SERIF` and `MONO` have no style roles either, so a standard name that is *not* installed used to lose bold and italic; its substitute is now bound in all four roles (#1231). |
 | No cache invalidation | Fonts installed while running are not picked up until restart. |
 | `ScriptSet` is full | All 16 bits are used (Latin … Ethiopic); a new script class needs the set widened to `u32` first (§13 question 15). |
 | An empty workbook asks for everything | Until the first text is seen, `wanted_scripts()` returns `ScriptSet::all()` so the first frame cannot show tofu; an empty sheet therefore loads every installed fallback. |
@@ -736,13 +736,14 @@ pub struct ResolvedFace { pub face: usize, pub weight_gap: f32, pub slant: Slant
    Equal distance prefers the heavier face for `w >= 600` and the lighter face
    for `w <= 500`; a remaining tie takes the lower face index.
 4. **Synthetic style**, only when the family is installed but has no matching
-   face: shear the glyph mesh by about 12° for italic, or embolden the outline
-   (stroke, or a small double-draw offset) for bold. Mark the result
-   `Synthetic`; layout keeps the face's advances so columns do not jump.
-   **Deferred** (§13.13): epaint 0.36.2 has no shear and never synthesises, so
-   faux bold would need a double-draw workaround and faux italic an upstream
-   change. Until then a family without the face keeps its regular (step 6
-   applies), and `bind_faces()` logs the degrade at debug level.
+   face. Italic already works: epaint shears any glyph whose
+   `TextFormat::italics` is set (the top vertices move by a quarter of the font
+   size, about 14°; advances and the cell width do not change), so
+   `bind_faces()` records each role it had to degrade and the grid lays those
+   cells out with the flag on. Bold still needs a stroke or a double-draw
+   offset, which changes measured widths, so it stays deferred to Phase 4
+   (§13.13). A degraded role keeps the face's advances and is logged at debug
+   level.
 5. **Substitute family**, only when the requested family is not installed: rank
    the script/role candidates by style match first, then by candidate order. A
    candidate with the exact style beats an earlier candidate with only regular.
@@ -752,7 +753,8 @@ pub struct ResolvedFace { pub face: usize, pub weight_gap: f32, pub slant: Slant
    §5.10 rule that a missing italic must not silently bind regular.
 
 Under egui, style is part of the family key, not a shaping argument: `FontId`
-carries only `family + size`, and epaint never synthesises. The four roles
+carries only `family + size`, and the one style epaint can synthesise is the
+italic shear of `TextFormat::italics`. The four roles
 (`cell`, `cell-bold`, `cell-italic`, `cell-bold-italic`) encode weight 400/700
 and `italic`. A numeric weight needs a key per weight value the workbook
 actually uses (`used_fonts()` must return the used weight set), never a key per
@@ -1432,7 +1434,7 @@ Current test result:
 
 ```text
 cargo +1.95.0 test -p gridcraft-ui-egui --lib
-223 passed, 0 failed
+225 passed, 0 failed
 ```
 
 The full `cargo xtask ci` was not run for this branch; the affected crates are
@@ -1634,8 +1636,10 @@ Still open:
 - Start with `LayoutJob` sections (MVP); move to pre-shaped glyph runs if
   color-boundary kerning matters.
 - Optional, parity-only: synthetic bold (double-draw offset, advances kept) for
-  a family that has no bold face; synthetic italic stays blocked on epaint
-  (§13.13). Both would be marked `SlantFallback::Synthetic`, never as exact.
+  a family that has no bold face; synthetic italic already lands in the cell
+  renderer through `TextFormat::italics` (§13.13) and only has to be carried
+  into the editor and the formula bar. Both are marked `Synthetic`, never as an
+  exact match.
 
 ### Phase 5: replace subprocesses
 
@@ -1660,8 +1664,9 @@ Still open:
   `git rebase --onto v0.12.1 ac8da7d4` on 2026-10-29 (34 commits). `v0.12.1` is
   the newest release that still takes IME input; 0.13.0 lost it in the egui 0.37
   migration, and this branch is the base for fixing that on a tree we can ship.
-- HEAD after the rebase: `4f219953` (`fix(ui): align the font layer with the
-  0.12.1 signatures (#1231)`)
+- Last code commit: `c24c562d` (`feat(ui): slant the cell text of a family
+  that has no italic face (#1231)`); the rebase itself ended at `4f219953`.
+  (This note is edited on top of it, so its own hash is not quoted.)
 - The rebase rewrote history: the hashes quoted in §3–§11 and in earlier
   revisions of this note (`775a14a`, `57df98d`, `0d58e8d`, `561e539`, `b9283ba`,
   `ac0bacd`) name the pre-rebase commits. They are still reachable on
@@ -1691,7 +1696,9 @@ Current app behavior:
   the name is not installed, so the family fontconfig substitutes for it
   (Liberation Serif, Caladea, Liberation Mono) is bound in all four roles under
   the requested name. The same now applies to every standard `ribbon::FONTS` name.
-- Italic is ineffective for families that are installed but have no italic face.
+- Italic works for families that are installed but have no italic face: the cell
+  text is sheared by epaint (`TextFormat::italics`), at the family's advances, so
+  a column does not change width. A real italic face is used as it is.
 - Fallback faces load per script: a Latin-only workbook no longer asks for the
   CJK, Thai or Hebrew faces, and Chinese text added later loads the Han face on
   the next pass (`used_scripts()` is compared when the workbook revision
@@ -1743,14 +1750,20 @@ Current app behavior:
     - A standard name that is not installed at all binds the OS substitute in
       all four roles (`substitute_family()`): the "missing family" case, step 5.
     - A family that is installed but lacks the face keeps its regular face, the
-      step 6 degrade, and `bind_faces()` logs which role degraded and why. It is
-      the honest option while epaint has no synthesis.
+      step 6 degrade (now visible as a slant for italic), and `bind_faces()` logs
+      which role degraded and why.
     - Synthetic **bold** is feasible without touching epaint (draw the run twice
       with a sub-pixel offset), but it changes how text widths are measured, so
       it belongs in Phase 4 next to the paint spans, not before them.
-    - Synthetic **italic** needs a glyph-mesh shear that `FontId` cannot express.
-      It waits for upstream epaint (or a deliberate decision to fork the
-      painting path), which the "UI crate is swappable" rule argues against.
+    - Synthetic **italic** is no longer blocked: epaint 0.36.2 shears a glyph
+      whose `TextFormat::italics` is set (top vertices move by a quarter of the
+      font size, advances kept). `bind_faces()` records which roles fell back to
+      an upright face, `fonts::is_synthetic_italic()` answers per role, and the
+      grid lays those cells out slanted; a real italic face is never sheared
+      twice. The editor and the formula bar still draw upright.
+    - The earlier note that italic had to wait for upstream epaint (or a fork of
+      the painting path, which the "UI crate is swappable" rule argues against)
+      is superseded: 0.36.2 already ships the shear.
 14. Should `model::Font` gain a numeric weight now, or keep `bold: bool` until
     the catalog exposes real weights? §5.3.1 supports both; the family-key
     constraint only becomes visible once a workbook uses more than 400/700.
