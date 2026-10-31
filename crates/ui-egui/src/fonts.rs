@@ -15,7 +15,7 @@
 //! Native only: on wasm there are no system fonts, every function here reports "nothing", and the
 //! font list is the standard [`crate::ribbon::FONTS`] set.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -567,6 +567,9 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
     for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
         let role = role_key(family, bold, italic);
         let Some(primary) = pick_face(faces, bold, italic) else { continue };
+        // A family without an italic file keeps its regular face here; the cell renderer slants it
+        // instead of showing upright text (#1231).
+        set_synthetic_italic(&role, italic && !primary.italic);
         if (primary.weight >= 600.0) != bold || primary.italic != italic {
             // No face of this family carries the requested style: the role keeps a regular face.
             // That degrade is invisible without a log line, and §13.13 has no synthesis to hide it.
@@ -624,21 +627,47 @@ pub fn bind_family(fonts: &mut egui::FontDefinitions, family: &str, fallback: &S
 }
 
 /// The role families currently bound to font data. `cell_family` consults this, so it never names a
-/// family egui hasn't been given.
-static BOUND: OnceLock<std::sync::RwLock<HashSet<String>>> = OnceLock::new();
+/// family egui hasn't been given. The flag is set when the role's italic is drawn by slanting an
+/// upright face, because the family has no italic file of its own.
+static BOUND: OnceLock<std::sync::RwLock<HashMap<String, bool>>> = OnceLock::new();
 
-fn bound() -> &'static std::sync::RwLock<HashSet<String>> {
-    BOUND.get_or_init(|| std::sync::RwLock::new(HashSet::new()))
+fn bound() -> &'static std::sync::RwLock<HashMap<String, bool>> {
+    BOUND.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
 /// Record the role families a freshly built [`egui::FontDefinitions`] bound.
 pub fn set_bound(keys: impl IntoIterator<Item = String>) {
-    *bound().write().unwrap_or_else(|e| e.into_inner()) = keys.into_iter().collect();
+    let mut map = bound().write().unwrap_or_else(|e| e.into_inner());
+    // Keep the italic flags `bind_faces` recorded for the roles this build bound; a role that is no
+    // longer bound drops out.
+    let previous = std::mem::take(&mut *map);
+    *map = keys
+        .into_iter()
+        .map(|key| {
+            let synthetic = previous.get(&key).copied().unwrap_or(false);
+            (key, synthetic)
+        })
+        .collect();
+}
+
+/// Note how a role's italic reaches the screen: a real italic face, or a slant of the regular one.
+pub(crate) fn set_synthetic_italic(role: &str, synthetic: bool) {
+    bound().write().unwrap_or_else(|e| e.into_inner()).insert(role.to_string(), synthetic);
 }
 
 /// Is this exact role family bound to font data?
 pub fn is_bound(role: &str) -> bool {
-    bound().read().unwrap_or_else(|e| e.into_inner()).contains(role)
+    bound().read().unwrap_or_else(|e| e.into_inner()).contains_key(role)
+}
+
+/// Does this role family draw its italic by slanting an upright face? egui's `TextFormat::italics`
+/// shears the glyph, so a family without an italic file still looks italic (#1231).
+///
+/// The built-in role families are left alone: their chains are built from fontconfig patterns that
+/// ask for a slanted face already, and a real italic sheared again would double the angle.
+pub fn is_synthetic_italic(family: &egui::FontFamily) -> bool {
+    let egui::FontFamily::Name(role) = family else { return false };
+    bound().read().unwrap_or_else(|e| e.into_inner()).get(role.as_ref()).copied().unwrap_or(false)
 }
 
 /// Serializes tests that mutate the process-wide bound-family registry.
@@ -1196,6 +1225,29 @@ mod tests {
         assert!(bound.contains(&role_key("Ubuntu", true, true)));
         assert_eq!(fonts.font_data.len(), before + 1, "one file, loaded once");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A family with only upright faces still answers an italic request: the renderer slants it.
+    #[test]
+    fn a_family_without_an_italic_face_records_a_synthetic_italic() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fallback = ScriptFallbacks::default();
+        let regular = face("Upright Only", &["Upright Only"], "/nonexistent/Upright.ttf", 400.0);
+        let mut fonts = egui::FontDefinitions::default();
+        bind_faces(&mut fonts, "Upright Only", std::slice::from_ref(&regular), &fallback);
+        let italic = egui::FontFamily::Name(role_key("Upright Only", false, true).into());
+        assert!(is_synthetic_italic(&italic), "no italic file, so the role is slanted");
+        let roman = egui::FontFamily::Name(role_key("Upright Only", false, false).into());
+        assert!(!is_synthetic_italic(&roman), "upright text is never slanted");
+        assert!(!is_synthetic_italic(&egui::FontFamily::Proportional), "built-in families ask for a slanted face");
+        // A family that does have an italic keeps the real face and must not be sheared twice.
+        let mut slanted = regular.clone();
+        slanted.italic = true;
+        let mut fonts = egui::FontDefinitions::default();
+        bind_faces(&mut fonts, "Slanted", std::slice::from_ref(&slanted), &fallback);
+        let real = egui::FontFamily::Name(role_key("Slanted", false, true).into());
+        assert!(!is_synthetic_italic(&real));
+        set_bound([]);
     }
 
     /// On a Windows machine with Malgun Gothic, the real file carries its Korean name.
