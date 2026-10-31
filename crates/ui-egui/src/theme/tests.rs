@@ -9,7 +9,7 @@ fn fallback_faces_are_appended_to_every_family() {
     for han in [HanOrder::Chinese, HanOrder::Japanese] {
         let language = if han == HanOrder::Japanese { Language::Ja } else { Language::Zh };
         let fonts = font_definitions_for_language(language);
-        let fb_keys: Vec<String> = fallback_faces(han).into_iter().map(|(k, _)| k.to_string()).filter(|k| fonts.font_data.contains_key(k)).collect();
+        let fb_keys: Vec<String> = fallback_faces(han).into_iter().map(|f| f.key.to_string()).filter(|k| fonts.font_data.contains_key(k)).collect();
         if fb_keys.is_empty() {
             return; // no fallback face on this machine (minimal Linux)
         }
@@ -107,7 +107,7 @@ fn interface_families_fall_back_to_the_cell_font() {
     if !fonts.font_data.contains_key(&cell) {
         return; // no system cell font on this machine
     }
-    let fb: Vec<String> = fallback_faces(HanOrder::Chinese).into_iter().map(|(k, _)| k.to_string()).collect();
+    let fb: Vec<String> = fallback_faces(HanOrder::Chinese).into_iter().map(|f| f.key.to_string()).collect();
     for family in [FontFamily::Proportional, FontFamily::Name(UI.into()), FontFamily::Name(UI_BOLD.into()), FontFamily::Name(MONO.into())] {
         let chain = fonts.families.get(&family).cloned().unwrap_or_default();
         let at = chain.iter().position(|k| *k == cell);
@@ -119,14 +119,44 @@ fn interface_families_fall_back_to_the_cell_font() {
 
 #[test]
 fn language_reorders_only_the_han_faces() {
-    let keys = |han| fallback_faces(han).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+    let keys = |han| fallback_faces(han).into_iter().map(|f| f.key).collect::<Vec<_>>();
     assert_eq!(
         keys(HanOrder::Japanese),
-        ["sys-cjk-han-ja", "sys-cjk-han-zh", "sys-cjk-hangul", "sys-thai", "sys-lao", "sys-hebrew", "sys-arabic", "sys-symbols", "sys-symbols-2"]
+        [
+            "sys-cjk-han-ja",
+            "sys-cjk-han-zh",
+            "sys-cjk-hangul",
+            "sys-thai",
+            "sys-lao",
+            "sys-khmer",
+            "sys-hebrew",
+            "sys-arabic",
+            "sys-devanagari",
+            "sys-myanmar",
+            "sys-tibetan",
+            "sys-yi",
+            "sys-symbols",
+            "sys-symbols-2",
+        ]
     );
     assert_eq!(
         keys(HanOrder::Chinese),
-        ["sys-cjk-han-zh", "sys-cjk-han-ja", "sys-cjk-hangul", "sys-thai", "sys-lao", "sys-hebrew", "sys-arabic", "sys-symbols", "sys-symbols-2"]
+        [
+            "sys-cjk-han-zh",
+            "sys-cjk-han-ja",
+            "sys-cjk-hangul",
+            "sys-thai",
+            "sys-lao",
+            "sys-khmer",
+            "sys-hebrew",
+            "sys-arabic",
+            "sys-devanagari",
+            "sys-myanmar",
+            "sys-tibetan",
+            "sys-yi",
+            "sys-symbols",
+            "sys-symbols-2",
+        ]
     );
     assert_eq!(HanOrder::of(Language::Ja), HanOrder::Japanese);
     for l in [Language::En, Language::Zh, Language::Ko, Language::Ru, Language::PtBr, Language::De, Language::Cs, Language::Fr, Language::Tr] {
@@ -168,7 +198,7 @@ fn fallback_faces_load_each_file_once() {
     // once, not once per script (tens of MB each).
     for language in [Language::En, Language::Ja] {
         let fonts = font_definitions_for_language(language);
-        let present: Vec<&Arc<FontData>> = fallback_faces(HanOrder::of(language)).into_iter().filter_map(|(k, _)| fonts.font_data.get(k)).collect();
+        let present: Vec<&Arc<FontData>> = fallback_faces(HanOrder::of(language)).into_iter().filter_map(|f| fonts.font_data.get(f.key)).collect();
         for (i, a) in present.iter().enumerate() {
             for b in present.iter().skip(i + 1) {
                 assert!(!std::sync::Arc::ptr_eq(&a.font, &b.font), "the same font file is loaded for two fallback scripts");
@@ -223,108 +253,11 @@ fn fallback_covers_its_script() {
     }
 }
 
-#[test]
-/// A preferred Arabic file keeps the system Arabic faces from loading it again only once it is
-/// loaded: one that failed to load leaves them free to load it.
-fn an_unloaded_preferred_arabic_file_does_not_block_the_system_face() {
-    let dir = std::env::temp_dir().join(format!("gridcraft-theme-preferred-arabic-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("Arabic.ttf");
-    std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT).expect("font fixture");
-    let path = path.to_string_lossy().into_owned();
-    let preferred = || Some((path.clone(), 0));
-    let faces = || vec![("sys-arabic", vec![(path.clone(), 0)])];
-
-    let mut fonts = FontDefinitions::default();
-    let loaded = preferred_file(&fonts, preferred());
-    assert!(loaded.is_empty(), "a preferred face that did not load reserves no file");
-    assert_eq!(load_faces(&mut fonts, faces(), loaded), ["sys-arabic"]);
-
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(PREFERRED_ARABIC.into(), Arc::new(FontData::from_static(epaint_default_fonts::UBUNTU_LIGHT)));
-    let loaded = preferred_file(&fonts, preferred());
-    assert_eq!(loaded, std::slice::from_ref(&path));
-    assert!(load_faces(&mut fonts, faces(), loaded).is_empty(), "a loaded preferred file is not loaded a second time");
-    assert!(!fonts.font_data.contains_key("sys-arabic"));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-fn with_installed_latin_font() -> std::io::Result<FontDefinitions> {
-    let dir = std::env::temp_dir().join(format!("gridcraft-theme-latin-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("Ubuntu-Light.ttf");
-    std::fs::write(&path, epaint_default_fonts::UBUNTU_LIGHT)?;
-    let face = crate::fonts::Face { family: "Ubuntu".into(), names: vec!["Ubuntu".into()], path, index: 0, weight: 300.0, italic: false };
-    let fonts = font_definitions_impl(Language::En, vec![("Ubuntu".into(), vec![face])], true);
-    std::fs::remove_dir_all(&dir)?;
-    Ok(fonts)
-}
-
-fn installed_latin_chains(fonts: &FontDefinitions) -> Vec<(FontFamily, Option<&Vec<String>>)> {
-    [(false, false), (true, false), (false, true), (true, true)]
-        .into_iter()
-        .map(|(bold, italic)| {
-            let family = FontFamily::Name(crate::fonts::role_key("Ubuntu", bold, italic).into());
-            let chain = fonts.families.get(&family);
-            (family, chain)
-        })
-        .collect()
-}
-
-fn chain_covers(fonts: &FontDefinitions, chain: &[String], ch: char) -> bool {
-    use skrifa::MetadataProvider;
-    chain
-        .iter()
-        .filter_map(|key| fonts.font_data.get(key))
-        .any(|data| skrifa::FontRef::from_index((*data.font).as_ref(), data.index).is_ok_and(|font| font.charmap().map(ch).is_some()))
-}
-
-#[test]
-/// A workbook font with no Arabic or Hangul still shows them through the system script faces.
-fn installed_latin_fonts_keep_system_script_fallbacks() {
-    let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let fonts = with_installed_latin_font().expect("Latin-only fixture");
-    let loaded: Vec<&str> =
-        fallback_faces(HanOrder::Chinese).into_iter().map(|(key, _)| key).filter(|key| fonts.font_data.contains_key(*key)).collect();
-    for (family, chain) in installed_latin_chains(&fonts) {
-        let chain = chain.expect("bound fixture family");
-        for key in &loaded {
-            assert!(chain.iter().any(|k| k == key), "{family:?} lost the {key} fallback");
-        }
-        if fonts.font_data.contains_key("sys-arabic") {
-            assert!(chain_covers(&fonts, chain, 'ع'), "{family:?} has no glyph for ع");
-        }
-    }
-}
-
-#[test]
-/// The craft Arabic face reaches workbook fonts and the pinned web set, without help from system faces.
-fn the_craft_arabic_face_reaches_every_chain() {
-    assert!(crate::craft_fonts_policy::web_allowed("Noto Sans Arabic", "Regular"));
-    if !craft_fonts_cover("العربية١٢٣") {
-        assert!(!craft_fonts_required(), "CRAFT_FONTS_REQUIRED=1 but no craft-fonts face covers Arabic");
-        return;
-    }
-    let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut fonts = with_installed_latin_font().expect("Latin-only fixture");
-    fonts.font_data.retain(|key, _| !key.starts_with("sys-"));
-    for (family, chain) in installed_latin_chains(&fonts) {
-        let chain = chain.expect("bound fixture family");
-        assert!("العربية١٢٣".chars().all(|ch| chain_covers(&fonts, chain, ch)), "{family:?} has no Arabic glyphs");
-    }
-    let pinned = pinned_font_definitions();
-    for (family, chain) in &pinned.families {
-        assert!("العربية".chars().all(|ch| chain_covers(&pinned, chain, ch)), "pinned {family:?} has no Arabic glyphs");
-    }
-}
-
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
-/// fontconfig's Arabic face, when it has Arabic letters, comes first among the Arabic fallbacks in every chain (#229). A
-/// UI or cell face with Arabic of its own sits ahead of every fallback and still draws Arabic first.
-fn the_fontconfig_arabic_choice_comes_first() {
+/// fontconfig's Arabic face, when it has Arabic letters, leads the Arabic fallbacks (#229). A UI
+/// or cell face with Arabic of its own sits ahead of every fallback and still draws Arabic first.
+fn the_fontconfig_arabic_choice_leads_the_arabic_fallbacks() {
     assert_eq!(
         parse_fc_match("/home/u/.local/share/fonts/Vazirmatn-Regular.ttf\n0\n"),
         Some(("/home/u/.local/share/fonts/Vazirmatn-Regular.ttf".into(), 0))
@@ -341,16 +274,41 @@ fn the_fontconfig_arabic_choice_comes_first() {
     );
     assert_eq!(parse_fc_match(""), None);
     assert!(!covers_arabic(epaint_default_fonts::UBUNTU_LIGHT, 0), "a Latin-only face is not an Arabic choice");
-    if fontconfig_arabic().is_some() {
-        let fonts = font_definitions();
-        for (family, chain) in fonts.families.iter().filter(|(_, chain)| chain.iter().any(|key| key.starts_with("sys-"))) {
-            let preferred = chain.iter().position(|key| key == PREFERRED_ARABIC);
-            let other_arabic = chain.iter().position(|key| key == "sys-arabic" || key.starts_with("craft-"));
-            assert!(preferred.is_some(), "{family:?} lacks the preferred Arabic face");
-            assert!(other_arabic.is_none_or(|other| preferred < Some(other)), "{family:?} puts another Arabic face first");
-        }
-        if let (Some(preferred), Some(system)) = (fonts.font_data.get(PREFERRED_ARABIC), fonts.font_data.get("sys-arabic")) {
-            assert!((*preferred.font).as_ref() != (*system.font).as_ref(), "the system Arabic fallback is a different file from the preferred face");
+    if let Some(preferred) = fontconfig_arabic() {
+        assert_eq!(arabic().first(), Some(&preferred), "the fontconfig choice must lead the Arabic candidates");
+    }
+}
+
+#[test]
+/// The craft Arabic face reaches the pinned web set and every role chain, without help from system
+/// faces.
+fn the_craft_arabic_face_reaches_every_chain() {
+    assert!(crate::craft_fonts_policy::web_allowed("Noto Sans Arabic", "Regular"));
+    if !craft_fonts_cover("العربية١٢٣") {
+        assert!(!craft_fonts_required(), "CRAFT_FONTS_REQUIRED=1 but no craft-fonts face covers Arabic");
+        return;
+    }
+    let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let pinned = pinned_font_definitions();
+    for (family, chain) in &pinned.families {
+        assert!("العربية".chars().all(|ch| chain_covers(&pinned, chain, ch)), "pinned {family:?} has no Arabic glyphs");
+    }
+    let fonts = font_definitions();
+    for (family, chain) in fonts.families.iter().filter(|(_, chain)| chain.iter().any(|key| key.starts_with("sys-"))) {
+        assert!("العربية".chars().all(|ch| chain_covers(&fonts, chain, ch)), "{family:?} has no Arabic glyphs");
+    }
+}
+
+#[test]
+/// The system script faces reach the role chains even when no workbook font is bound.
+fn role_chains_keep_system_script_fallbacks() {
+    let fonts = font_definitions();
+    let loaded: Vec<&str> =
+        fallback_faces(HanOrder::Chinese).into_iter().map(|face| face.key).filter(|key| fonts.font_data.contains_key(*key)).collect();
+    for family in [FontFamily::Proportional, FontFamily::Name(CELL.into())] {
+        let chain = fonts.families.get(&family).expect("role chain");
+        for key in &loaded {
+            assert!(chain.iter().any(|k| k == key), "{family:?} lost the {key} fallback");
         }
     }
 }
@@ -475,7 +433,9 @@ fn fedora_package_folders_are_searched_after_the_other_linux_layouts() {
         ("hebrew", paths(hebrew()), "google-noto-vf/NotoSansHebrew[wght].ttf", "/NotoSansHebrew-Regular.ttf"),
     ];
     for (role, list, fedora_file, earlier) in &cases {
-        let at = list.iter().position(|p| *p == format!("/usr/share/fonts/{fedora_file}"));
+        // fontconfig's own answer can name the same file before the hard-coded list, so ask for
+        // the last occurrence: that one is the fallback entry this test is about.
+        let at = list.iter().rposition(|p| *p == format!("/usr/share/fonts/{fedora_file}"));
         let last_earlier = list.iter().rposition(|p| p.ends_with(earlier));
         assert!(at.is_some(), "{role}: Fedora's {fedora_file} is not a candidate");
         assert!(last_earlier.is_some(), "{role}: no existing {earlier} candidate to compare with");

@@ -1,37 +1,90 @@
+//! The non-Latin faces every family carries as its last resort, and the loader that puts them in
+//! the font set. Split out of `theme` so the lists stay next to the code that chooses between them.
+
 #[cfg(not(target_arch = "wasm32"))]
 use super::Arc;
 use super::FontDefinitions;
 use super::font_setup::HanOrder;
 #[cfg(not(target_arch = "wasm32"))]
-use super::font_setup::{in_dirs, try_load};
+use super::font_setup::try_load;
+use crate::script::{ScriptClass, ScriptSet};
+
+/// Every face `fc-match` answers for the given patterns, in order.
+#[cfg(target_os = "linux")]
+fn fc_match_candidates(patterns: &[&str]) -> Vec<(String, u32)> {
+    let mut candidates = Vec::new();
+    for pattern in patterns {
+        if let Some(font) = crate::fonts::fc_match(pattern)
+            && !candidates.contains(&font)
+        {
+            candidates.push(font);
+        }
+    }
+    candidates
+}
+
+pub(super) struct ScriptFace {
+    pub(super) key: &'static str,
+    sans: Vec<(String, u32)>,
+    serif: Option<(&'static str, Vec<(String, u32)>)>,
+    /// The scripts this face exists for: it is loaded only when the text or the interface needs one.
+    covers: ScriptSet,
+}
+
+/// The scripts the interface itself draws: a Chinese, Japanese or Korean interface needs its
+/// script loaded even when the workbook holds only Latin text.
+fn interface_scripts(language: crate::i18n::Language) -> ScriptSet {
+    match language {
+        crate::i18n::Language::Zh => ScriptSet::EMPTY.with(ScriptClass::Han),
+        crate::i18n::Language::Ja => ScriptSet::EMPTY.with(ScriptClass::Han).with(ScriptClass::Japanese),
+        crate::i18n::Language::Ko => ScriptSet::EMPTY.with(ScriptClass::Korean),
+        _ => ScriptSet::EMPTY,
+    }
+}
+
+/// The scripts whose fallback faces to load: the workbook's, the interface's and the symbols every
+/// interface draws. An empty workbook set (no text yet, or nothing scanned) keeps the old
+/// behaviour and loads every face.
+pub(super) fn wanted_scripts(language: crate::i18n::Language, scripts: ScriptSet) -> ScriptSet {
+    if scripts.is_empty() {
+        return ScriptSet::all();
+    }
+    scripts.union(interface_scripts(language)).with(ScriptClass::Symbols)
+}
 
 /// Loads the system non-Latin fallback faces (one file per script family) and returns their keys so
 /// every family can carry them as fallback. egui's bundled fonts have no coverage beyond Latin, so
 /// without this a Thai, Hebrew, Japanese or Chinese workbook shows tofu boxes even though the text
 /// was read correctly. With a face installed those scripts get real glyphs instead of tofu; nothing
 /// is bundled, and a machine without the face keeps the old behaviour.
+///
+/// `serif` loads the serif companion faces instead of the sans ones. The caller loads those only
+/// when a workbook or role actually asks for a serif face: Noto Serif CJK alone is ~55 MB, so
+/// paying for it on startup would be wrong for the common case.
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn load_fallback(fonts: &mut FontDefinitions, han: HanOrder) -> Vec<String> {
-    let loaded = preferred_file(fonts, fontconfig_arabic());
-    load_faces(fonts, fallback_faces(han), loaded)
-}
-
-/// The preferred Arabic file, once [`load_preferred_arabic`] has loaded it: a file that failed to
-/// load must not keep the system Arabic faces out of the chains.
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn preferred_file(fonts: &FontDefinitions, preferred: Option<(String, u32)>) -> Vec<String> {
-    preferred.filter(|_| fonts.font_data.contains_key(PREFERRED_ARABIC)).map(|(path, _)| path).into_iter().collect()
-}
-
-/// Loads the first candidate of each fallback face that loads and returns their keys. `loaded`
-/// holds the files already loaded as a fallback face. A file serves at most one key: the
-/// region-merged Noto Sans CJK .ttc found for Han also carries Hangul (and Tahoma carries both Thai
-/// and Hebrew), so loading it again for a later script would only duplicate tens of MB in memory.
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn load_faces(fonts: &mut FontDefinitions, faces: Vec<(&'static str, Vec<(String, u32)>)>, mut loaded: Vec<String>) -> Vec<String> {
+pub(super) fn load_fallback(fonts: &mut FontDefinitions, han: HanOrder, serif: bool, wanted: ScriptSet, known: bool) -> Vec<String> {
     let mut keys = Vec::new();
-    for (key, cands) in faces {
-        for (path, index) in &cands {
+    // Files already loaded as a fallback face. A file serves at most one key: the region-merged
+    // Noto Sans CJK .ttc found for Han also carries Hangul (and Tahoma carries both Thai and
+    // Hebrew), so loading it again for a later script would only duplicate tens of MB in memory.
+    let mut loaded: Vec<String> = Vec::new();
+    // The scripts the faces above actually answered for. A script can be wanted and still have no
+    // face: the chains name files by path, and a host may install the script under a family those
+    // paths do not name (a different package layout, or only one weight).
+    let mut covered = ScriptSet::EMPTY;
+    for face in fallback_faces(han) {
+        if !face.covers.intersects(wanted) {
+            continue; // nothing in this workbook or interface asks for the script
+        }
+        let (key, cands) = if serif {
+            match &face.serif {
+                Some((key, cands)) => (*key, cands),
+                None => continue,
+            }
+        } else {
+            (face.key, &face.sans)
+        };
+        for (path, index) in cands {
             if loaded.contains(path) {
                 break; // a face loaded for an earlier script already covers this one
             }
@@ -39,35 +92,90 @@ pub(super) fn load_faces(fonts: &mut FontDefinitions, faces: Vec<(&'static str, 
                 fonts.font_data.insert(key.to_string(), Arc::new(fd));
                 keys.push(key.to_string());
                 loaded.push(path.clone());
+                covered = covered.union(face.covers);
                 break;
             }
         }
+    }
+    if known {
+        keys.extend(load_catalog_fallback(fonts, wanted, covered, serif, &mut loaded));
+    }
+    keys
+}
+
+/// Loads one face from the installed catalog for every wanted script the hand-written chains did
+/// not cover, so a script the system can draw is drawn even when its file sits where the chains do
+/// not look (a package that names the family differently, or installs only the regular weight).
+/// The catalog's choice is a single face per script — a fallback face only has to have the glyph,
+/// and a cell asking for bold gets the closest face epaint finds in the chain, exactly as the
+/// hand-written fallbacks already behave. Returns the keys of the faces it loaded.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_catalog_fallback(fonts: &mut FontDefinitions, wanted: ScriptSet, covered: ScriptSet, serif: bool, loaded: &mut Vec<String>) -> Vec<String> {
+    let Some(catalog) = crate::catalog::FontCatalog::installed() else { return Vec::new() };
+    let mut keys = Vec::new();
+    for script in ScriptClass::ALL {
+        // Latin is drawn by the interface font and by every bound workbook font; adding a Latin
+        // fallback face would put another Latin font at the end of chains that already have one.
+        if script == ScriptClass::Latin {
+            continue;
+        }
+        let single = ScriptSet::EMPTY.with(script);
+        if !wanted.intersects(single) || covered.intersects(single) {
+            continue;
+        }
+        let Some(entry) = catalog.font_for_script(script, serif, false) else { continue };
+        let path = entry.path.to_string_lossy().into_owned();
+        // A file already in the font set serves every script it covers; loading it again under a
+        // second key would duplicate its bytes in memory (a CJK collection is tens of megabytes).
+        if loaded.contains(&path) {
+            continue;
+        }
+        let Some(fd) = try_load(&[(path.as_str(), entry.index)]) else { continue };
+        let key = format!("sys-script-{}{}", script.name(), if serif { "-serif" } else { "" });
+        fonts.font_data.insert(key.clone(), Arc::new(fd));
+        keys.push(key);
+        loaded.push(path);
+    }
+    keys
+}
+
+/// Faces for the scripts the workbook sets in bold, when the host has them.
+///
+/// A Calibri cell takes its Latin from Carlito Bold, so the Han glyphs have to come from a bold CJK
+/// face or half the cell stays regular. Resolving through the catalog keeps Flatpak honest: the
+/// sandbox installs no CJK font, it sees the host's faces, and a host without a bold face simply
+/// leaves the chain as it is (#1231).
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn load_bold_script_faces(fonts: &mut FontDefinitions, wanted_bold: ScriptSet, serif: bool) -> Vec<String> {
+    let Some(catalog) = crate::catalog::FontCatalog::installed() else { return Vec::new() };
+    let mut keys = Vec::new();
+    let mut loaded: Vec<String> = Vec::new();
+    for script in ScriptClass::ALL {
+        // Latin comes from the bound family's own bold face (Carlito Bold, Liberation Sans Bold).
+        if script == ScriptClass::Latin || !wanted_bold.intersects(ScriptSet::EMPTY.with(script)) {
+            continue;
+        }
+        let Some(entry) = catalog.font_for_script(script, serif, true) else { continue };
+        if entry.weight < 600.0 {
+            continue; // no bold face for this script on this host
+        }
+        let path = entry.path.to_string_lossy().into_owned();
+        if loaded.contains(&path) {
+            continue; // one file, several scripts
+        }
+        let Some(fd) = try_load(&[(path.as_str(), entry.index)]) else { continue };
+        let key = format!("sys-script-{}-bold{}", script.name(), if serif { "-serif" } else { "" });
+        fonts.font_data.insert(key.clone(), Arc::new(fd));
+        keys.push(key);
+        loaded.push(path);
     }
     keys
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(super) fn load_fallback(_fonts: &mut FontDefinitions, _han: HanOrder) -> Vec<String> {
+fn load_fallback(_fonts: &mut FontDefinitions, _han: HanOrder, _serif: bool, _wanted: ScriptSet, _known: bool) -> Vec<String> {
     Vec::new()
 }
-
-/// The face fontconfig prefers for Arabic leads the script faces (#229), ahead of the system and
-/// bundled Arabic faces.
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn load_preferred_arabic(fonts: &mut FontDefinitions) -> Vec<String> {
-    let Some((path, index)) = fontconfig_arabic() else { return Vec::new() };
-    let Some(fd) = try_load(&[(path.as_str(), index)]) else { return Vec::new() };
-    fonts.font_data.insert(PREFERRED_ARABIC.into(), Arc::new(fd));
-    vec![PREFERRED_ARABIC.into()]
-}
-
-#[cfg(target_arch = "wasm32")]
-pub(super) fn load_preferred_arabic(_fonts: &mut FontDefinitions) -> Vec<String> {
-    Vec::new()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) const PREFERRED_ARABIC: &str = "sys-arabic-preferred";
 
 /// The face fontconfig prefers for Arabic, such as a Vazirmatn the user set as their Arabic font
 /// (#229), kept only when it has Arabic letters. Asked once per process.
@@ -105,14 +213,31 @@ pub(super) fn covers_arabic(bytes: &[u8], index: u32) -> bool {
     skrifa::FontRef::from_index(bytes, index).is_ok_and(|font| "العربية".chars().all(|ch| font.charmap().map(ch).is_some()))
 }
 
-/// Every fallback face we look for, in chain order: `(key, candidate files)`. One file per script
-/// family is enough — epaint picks the first face with the glyph, and a script's glyphs live in one
-/// file. Order only matters between faces that both cover a glyph (Japanese vs Chinese kanji), so
-/// the interface language reorders the two Han entries and nothing else.
+#[cfg(target_arch = "wasm32")]
+fn load_bold_script_faces(_fonts: &mut FontDefinitions, _wanted_bold: ScriptSet, _serif: bool) -> Vec<String> {
+    Vec::new()
+}
+
+/// Every fallback face we look for, in chain order, with its sans and (where it exists) serif
+/// lists. One file per script family is enough — epaint picks the first face with the glyph, and a
+/// script's glyphs live in one file. Order only matters between faces that both cover a glyph
+/// (Japanese vs Chinese kanji), so the interface language reorders the two Han entries and nothing
+/// else.
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn fallback_faces(han: HanOrder) -> Vec<(&'static str, Vec<(String, u32)>)> {
-    let ja = ("sys-cjk-han-ja", cjk_han_japanese());
-    let zh = ("sys-cjk-han-zh", cjk_han_simplified());
+pub(super) fn fallback_faces(han: HanOrder) -> Vec<ScriptFace> {
+    let han_scripts = ScriptSet::EMPTY.with(ScriptClass::Han);
+    let ja = ScriptFace {
+        key: "sys-cjk-han-ja",
+        sans: cjk_han_japanese(),
+        serif: Some(("sys-cjk-han-ja-serif", cjk_han_japanese_serif())),
+        covers: han_scripts.with(ScriptClass::Japanese),
+    };
+    let zh = ScriptFace {
+        key: "sys-cjk-han-zh",
+        sans: cjk_han_simplified(),
+        serif: Some(("sys-cjk-han-zh-serif", cjk_han_simplified_serif())),
+        covers: han_scripts,
+    };
     let (first, second) = match han {
         HanOrder::Japanese => (ja, zh),
         HanOrder::Chinese => (zh, ja),
@@ -120,22 +245,52 @@ pub(super) fn fallback_faces(han: HanOrder) -> Vec<(&'static str, Vec<(String, u
     vec![
         first,
         second,
-        ("sys-cjk-hangul", cjk_hangul()),
-        ("sys-thai", thai()),
-        ("sys-lao", lao()),
-        ("sys-hebrew", hebrew()),
-        ("sys-arabic", arabic()),
-        ("sys-symbols", symbols()),
-        ("sys-symbols-2", symbols_more()),
+        ScriptFace {
+            key: "sys-cjk-hangul",
+            sans: cjk_hangul(),
+            serif: Some(("sys-cjk-hangul-serif", cjk_hangul_serif())),
+            covers: ScriptSet::EMPTY.with(ScriptClass::Korean),
+        },
+        ScriptFace { key: "sys-thai", sans: thai(), serif: Some(("sys-thai-serif", thai_serif())), covers: ScriptSet::EMPTY.with(ScriptClass::Thai) },
+        ScriptFace { key: "sys-lao", sans: lao(), serif: Some(("sys-lao-serif", lao_serif())), covers: ScriptSet::EMPTY.with(ScriptClass::Lao) },
+        ScriptFace {
+            key: "sys-khmer",
+            sans: khmer(),
+            serif: Some(("sys-khmer-serif", khmer_serif())),
+            covers: ScriptSet::EMPTY.with(ScriptClass::Khmer),
+        },
+        ScriptFace {
+            key: "sys-hebrew",
+            sans: hebrew(),
+            serif: Some(("sys-hebrew-serif", hebrew_serif())),
+            covers: ScriptSet::EMPTY.with(ScriptClass::Hebrew),
+        },
+        ScriptFace {
+            key: "sys-arabic",
+            sans: arabic(),
+            serif: Some(("sys-arabic-serif", arabic_serif())),
+            covers: ScriptSet::EMPTY.with(ScriptClass::Arabic),
+        },
+        ScriptFace {
+            key: "sys-devanagari",
+            sans: devanagari(),
+            serif: Some(("sys-devanagari-serif", devanagari_serif())),
+            covers: ScriptSet::EMPTY.with(ScriptClass::Devanagari),
+        },
+        ScriptFace { key: "sys-myanmar", sans: myanmar(), serif: None, covers: ScriptSet::EMPTY.with(ScriptClass::Myanmar) },
+        ScriptFace { key: "sys-tibetan", sans: tibetan(), serif: None, covers: ScriptSet::EMPTY.with(ScriptClass::Tibetan) },
+        ScriptFace { key: "sys-yi", sans: yi(), serif: None, covers: ScriptSet::EMPTY.with(ScriptClass::Yi) },
+        ScriptFace { key: "sys-symbols", sans: symbols(), serif: None, covers: ScriptSet::EMPTY.with(ScriptClass::Symbols) },
+        ScriptFace { key: "sys-symbols-2", sans: symbols_more(), serif: None, covers: ScriptSet::EMPTY.with(ScriptClass::Symbols) },
     ]
 }
 
 /// Linux directories that hold CJK fonts across distributions: Debian/Ubuntu (`opentype/noto`,
 /// `truetype/wqy`), Fedora (`google-noto-cjk`), Arch (`noto-cjk`, `wenquanyi`), ChromeOS's Linux
-/// container (`chromeos/notocjk`, #1762), plus local and
-/// flat layouts. Flatpak exposes the same host layouts through read-only font mounts.
+/// container (`chromeos/notocjk`, #1762), plus local and flat layouts. These are fallbacks used
+/// only after fontconfig has been asked.
 #[cfg(not(target_arch = "wasm32"))]
-const LINUX_CJK_DIRS: [&str; 22] = [
+const LINUX_CJK_FALLBACK_DIRS: [&str; 22] = [
     // Flatpak mounts host fonts here without a broad filesystem permission. Keep the same
     // distribution layouts as below; /usr/share/fonts inside the sandbox belongs to the runtime.
     "/run/host/fonts/opentype/noto",
@@ -162,24 +317,6 @@ const LINUX_CJK_DIRS: [&str; 22] = [
     "/usr/share/fonts/chromeos/notocjk",
 ];
 
-/// The Windows fonts folder (`%WINDIR%\Fonts`, or the default install location).
-#[cfg(not(target_arch = "wasm32"))]
-fn windows_fonts() -> String {
-    std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into())
-}
-
-/// The Noto Sans CJK faces for one locale (`jp`, `sc`, `kr`): the per-locale OTF, then the
-/// region-merged TTC at `face`, in every Linux font directory.
-#[cfg(not(target_arch = "wasm32"))]
-fn noto_cjk(locale: &str, face: u32) -> Vec<(String, u32)> {
-    let mut v = Vec::new();
-    for d in LINUX_CJK_DIRS {
-        v.push((format!("{d}/NotoSansCJK{locale}-Regular.otf"), 0));
-        v.push((format!("{d}/NotoSansCJK-Regular.ttc"), face));
-    }
-    v
-}
-
 /// Japanese Han + Kana faces (Japanese kanji glyph shapes).
 ///
 /// The region-merged `NotoSansCJK-Regular.ttc` holds one face per locale (JP 0, KR 1, SC 2, TC 3,
@@ -188,12 +325,17 @@ fn noto_cjk(locale: &str, face: u32) -> Vec<(String, u32)> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn cjk_han_japanese() -> Vec<(String, u32)> {
     let mac = "/System/Library/Fonts";
-    let win = windows_fonts();
+    let win = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
     let mut v: Vec<(String, u32)> = Vec::new();
     v.push((format!("{win}\\YuGothR.ttc"), 0)); // Yu Gothic
     v.push((format!("{win}\\msgothic.ttc"), 0)); // MS Gothic
     v.push((format!("{mac}/ヒラギノ角ゴシック W3.ttc"), 0)); // Hiragino Sans
-    v.extend(noto_cjk("jp", 0));
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=ja", "serif:lang=ja"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
+        v.push((format!("{d}/NotoSansCJKjp-Regular.otf"), 0));
+        v.push((format!("{d}/NotoSansCJK-Regular.ttc"), 0)); // JP face
+    }
     v
 }
 
@@ -202,16 +344,20 @@ pub(super) fn cjk_han_japanese() -> Vec<(String, u32)> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn cjk_han_simplified() -> Vec<(String, u32)> {
     let mac = "/System/Library/Fonts";
-    let win = windows_fonts();
-    let mut v: Vec<(String, u32)> = vec![
-        (format!("{win}\\msyh.ttc"), 0),            // Microsoft YaHei
-        (format!("{win}\\simsun.ttc"), 0),          // SimSun
-        (format!("{win}\\simhei.ttf"), 0),          // SimHei
-        (format!("{mac}/Hiragino Sans GB.ttc"), 0), // ships on every recent macOS
-        (format!("{mac}/PingFang.ttc"), 0),         // older macOS only; now a downloadable asset
-    ];
-    v.extend(noto_cjk("sc", 2));
-    for d in LINUX_CJK_DIRS {
+    let win = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
+    let mut v: Vec<(String, u32)> = Vec::new();
+    v.push((format!("{win}\\msyh.ttc"), 0)); // Microsoft YaHei
+    v.push((format!("{win}\\simsun.ttc"), 0)); // SimSun
+    v.push((format!("{win}\\simhei.ttf"), 0)); // SimHei
+    v.push((format!("{mac}/Hiragino Sans GB.ttc"), 0)); // ships on every recent macOS
+    v.push((format!("{mac}/PingFang.ttc"), 0)); // older macOS only; now a downloadable asset
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=zh-cn", "serif:lang=zh-cn"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
+        v.push((format!("{d}/NotoSansCJKsc-Regular.otf"), 0));
+        v.push((format!("{d}/NotoSansCJK-Regular.ttc"), 2)); // SC face
+    }
+    for d in LINUX_CJK_FALLBACK_DIRS {
         v.push((format!("{d}/wqy/wqy-microhei.ttc"), 0));
         v.push((format!("{d}/wenquanyi/wqy-microhei.ttc"), 0));
         v.push((format!("{d}/wqy-microhei.ttc"), 0));
@@ -224,50 +370,49 @@ pub(super) fn cjk_han_simplified() -> Vec<(String, u32)> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn cjk_hangul() -> Vec<(String, u32)> {
     let mac = "/System/Library/Fonts";
-    let win = windows_fonts();
+    let win = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
     let mut v: Vec<(String, u32)> = Vec::new();
     v.push((format!("{win}\\malgun.ttf"), 0)); // Malgun Gothic
     v.push((format!("{mac}/AppleSDGothicNeo.ttc"), 0));
-    v.extend(noto_cjk("kr", 1));
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=ko", "serif:lang=ko"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
+        v.push((format!("{d}/NotoSansCJKkr-Regular.otf"), 0));
+        v.push((format!("{d}/NotoSansCJK-Regular.ttc"), 1)); // KR face
+    }
     v
 }
 
 /// Thai faces. Windows ships Leelawadee UI and Tahoma/Microsoft Sans Serif (both carry Thai);
-/// Linux font directories searched by the Thai and Hebrew faces, in priority order.
+/// macOS has Thonburi; Linux usually has Noto Sans Thai or Garuda.
 #[cfg(not(target_arch = "wasm32"))]
-fn linux_noto_dirs() -> [&'static str; 5] {
-    [
+pub(super) fn thai() -> Vec<(String, u32)> {
+    let mac_sys = "/System/Library/Fonts";
+    let mac_sup = "/System/Library/Fonts/Supplemental";
+    let win = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
+    let lin = [
         "/usr/share/fonts/truetype/noto",
         "/usr/share/fonts/opentype/noto",
         "/usr/share/fonts/truetype",
         "/usr/share/fonts",
         "/usr/share/fonts/chromeos/noto", // ChromeOS's Linux container (#1762)
-    ]
-}
-
-/// Faces for one script: Windows files under `WINDIR\Fonts` first, then macOS paths, then the
-/// Noto/Linux files in every [`linux_noto_dirs`] directory, then the Fedora variable font.
-#[cfg(not(target_arch = "wasm32"))]
-fn script_fonts(win: &[&str], mac: &[&str], lin_files: &[&str], variable: &str) -> Vec<(String, u32)> {
-    let w = windows_fonts();
-    let mut v: Vec<(String, u32)> = win.iter().map(|f| (format!("{w}\\{f}"), 0)).collect();
-    v.extend(mac.iter().map(|p| (p.to_string(), 0)));
-    v.extend(in_dirs(&linux_noto_dirs(), lin_files).into_iter().map(|p| (p, 0)));
-    v.push((variable.into(), 0));
+    ];
+    let mut v: Vec<(String, u32)> = Vec::new();
+    v.push((format!("{win}\\LeelawUI.ttf"), 0)); // Leelawadee UI
+    v.push((format!("{win}\\tahoma.ttf"), 0)); // Tahoma
+    v.push((format!("{win}\\micross.ttf"), 0)); // Microsoft Sans Serif
+    v.push((format!("{mac_sup}/Thonburi.ttc"), 0));
+    v.push((format!("{mac_sys}/SukhumvitSet.ttc"), 0));
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=th"]));
+    for d in lin {
+        v.push((format!("{d}/NotoSansThai-Regular.ttf"), 0));
+        v.push((format!("{d}/tlwg/Garuda.ttf"), 0));
+        v.push((format!("{d}/garuda/Garuda.ttf"), 0));
+    }
+    // Fedora ships the variable Noto Sans Thai; its default instance is Regular.
+    v.push(("/usr/share/fonts/google-noto-vf/NotoSansThai[wght].ttf".into(), 0));
     v
-}
-
-/// macOS has Thonburi; Linux usually has Noto Sans Thai or Garuda.
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn thai() -> Vec<(String, u32)> {
-    script_fonts(
-        // Leelawadee UI, Tahoma, Microsoft Sans Serif
-        &["LeelawUI.ttf", "tahoma.ttf", "micross.ttf"],
-        &["/System/Library/Fonts/Supplemental/Thonburi.ttc", "/System/Library/Fonts/SukhumvitSet.ttc"],
-        &["NotoSansThai-Regular.ttf", "tlwg/Garuda.ttf", "garuda/Garuda.ttf"],
-        // Fedora ships the variable Noto Sans Thai; its default instance is Regular.
-        "/usr/share/fonts/google-noto-vf/NotoSansThai[wght].ttf",
-    )
 }
 
 /// Lao faces. Windows ships Leelawadee UI (and DokChampa on older versions); macOS has Lao Sangam
@@ -275,14 +420,13 @@ pub(super) fn thai() -> Vec<(String, u32)> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn lao() -> Vec<(String, u32)> {
     let mac_sup = "/System/Library/Fonts/Supplemental";
-    let win = windows_fonts();
+    let win = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
     let lin = ["/usr/share/fonts/truetype/noto", "/usr/share/fonts/opentype/noto", "/usr/share/fonts/truetype", "/usr/share/fonts"];
-    let mut v: Vec<(String, u32)> = vec![
-        (format!("{win}\\LeelawUI.ttf"), 0), // Leelawadee UI
-        (format!("{win}\\dokchamp.ttf"), 0), // DokChampa
-        (format!("{mac_sup}/Lao Sangam MN.ttf"), 0),
-        (format!("{mac_sup}/Lao MN.ttc"), 0),
-    ];
+    let mut v: Vec<(String, u32)> = Vec::new();
+    v.push((format!("{win}\\LeelawUI.ttf"), 0)); // Leelawadee UI
+    v.push((format!("{win}\\dokchamp.ttf"), 0)); // DokChampa
+    v.push((format!("{mac_sup}/Lao Sangam MN.ttf"), 0));
+    v.push((format!("{mac_sup}/Lao MN.ttc"), 0));
     for d in lin {
         v.push((format!("{d}/NotoSansLao-Regular.ttf"), 0));
         v.push((format!("{d}/lao/Phetsarath_OT.ttf"), 0));
@@ -295,38 +439,185 @@ pub(super) fn lao() -> Vec<(String, u32)> {
 /// Arial Hebrew and David; Linux usually has Noto Sans Hebrew or DejaVu Sans.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn hebrew() -> Vec<(String, u32)> {
-    script_fonts(
-        // David, FrankRuehl, Tahoma
-        &["david.ttf", "frank.ttf", "tahoma.ttf"],
-        &[
-            "/System/Library/Fonts/ArialHB.ttc",
-            "/System/Library/Fonts/SFHebrew.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Hebrew.ttf",
-            "/System/Library/Fonts/Supplemental/David.ttf",
-            "/System/Library/Fonts/LucidaGrande.ttc",
-            "/System/Library/Fonts/Lucida Grande.ttc",
-        ],
-        &["NotoSansHebrew-Regular.ttf", "dejavu/DejaVuSans.ttf", "freefont/FreeSans.ttf"],
-        "/usr/share/fonts/google-noto-vf/NotoSansHebrew[wght].ttf",
-    )
+    let mac_sys = "/System/Library/Fonts";
+    let mac_sup = "/System/Library/Fonts/Supplemental";
+    let win = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
+    let lin = [
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/opentype/noto",
+        "/usr/share/fonts/truetype",
+        "/usr/share/fonts",
+        "/usr/share/fonts/chromeos/noto", // ChromeOS's Linux container (#1762)
+    ];
+    let mut v: Vec<(String, u32)> = Vec::new();
+    v.push((format!("{win}\\david.ttf"), 0)); // David
+    v.push((format!("{win}\\frank.ttf"), 0)); // FrankRuehl
+    v.push((format!("{win}\\tahoma.ttf"), 0)); // Tahoma
+    v.push((format!("{mac_sys}/ArialHB.ttc"), 0)); // Arial Hebrew
+    v.push((format!("{mac_sys}/SFHebrew.ttf"), 0));
+    v.push((format!("{mac_sup}/Arial Hebrew.ttf"), 0));
+    v.push((format!("{mac_sup}/David.ttf"), 0));
+    v.push((format!("{mac_sys}/LucidaGrande.ttc"), 0));
+    v.push((format!("{mac_sys}/Lucida Grande.ttc"), 0));
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["sans-serif:lang=he"]));
+    for d in lin {
+        v.push((format!("{d}/NotoSansHebrew-Regular.ttf"), 0));
+        v.push((format!("{d}/dejavu/DejaVuSans.ttf"), 0));
+        v.push((format!("{d}/freefont/FreeSans.ttf"), 0));
+    }
+    v.push(("/usr/share/fonts/google-noto-vf/NotoSansHebrew[wght].ttf".into(), 0));
+    v
 }
 
-/// Arabic faces. Windows has Tahoma, Arial and Segoe UI with Arabic; macOS has Geeza Pro; Linux
-/// usually has Noto Sans Arabic or Noto Naskh Arabic. Installed Noto and Amiri faces found by the
-/// font scan come last, for layouts the paths miss.
+/// Fallback candidates for a script's sans face: fontconfig first (distributions place fonts
+/// differently), then the common file names in the standard Noto layouts.
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn arabic() -> Vec<(String, u32)> {
-    let mut v = script_fonts(
-        &["tahoma.ttf", "arial.ttf", "segoeui.ttf"],
-        &["/System/Library/Fonts/GeezaPro.ttc", "/System/Library/Fonts/Supplemental/GeezaPro.ttc"],
-        &["NotoSansArabic-Regular.ttf", "NotoNaskhArabic-Regular.ttf", "noto/NotoSansArabic-Regular.ttf", "noto/NotoNaskhArabic-Regular.ttf"],
-        "/usr/share/fonts/google-noto-vf/NotoSansArabic[wght].ttf",
-    );
-    for family in ["Noto Sans Arabic", "Noto Naskh Arabic", "Amiri"] {
-        v.extend(crate::fonts::faces_of(family).into_iter().map(|face| (face.path.to_string_lossy().into_owned(), face.index)));
+fn script_face(lang: &str, files: &[&str]) -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let pattern = format!("sans-serif:lang={lang}");
+        v.extend(fc_match_candidates(&[pattern.as_str()]));
+    }
+    for d in ["/usr/share/fonts/google-noto-vf", "/usr/share/fonts/truetype/noto", "/usr/share/fonts/opentype/noto", "/usr/share/fonts"] {
+        for file in files {
+            v.push((format!("{d}/{file}"), 0));
+        }
     }
     v
 }
+
+/// Same for a script's serif face. Asking fontconfig for `serif:lang=…` picks the serif design
+/// (Noto Serif Thai, Naskh Arabic, …) where the plain name would return the sans one.
+#[cfg(not(target_arch = "wasm32"))]
+fn script_serif(lang: &str, files: &[&str]) -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let pattern = format!("serif:lang={lang}");
+        v.extend(fc_match_candidates(&[pattern.as_str()]));
+    }
+    for d in ["/usr/share/fonts/google-noto-vf", "/usr/share/fonts/truetype/noto", "/usr/share/fonts/opentype/noto", "/usr/share/fonts"] {
+        for file in files {
+            v.push((format!("{d}/{file}"), 0));
+        }
+    }
+    v
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn lao_serif() -> Vec<(String, u32)> {
+    script_serif("lo", &["NotoSerifLao-Regular.ttf", "NotoSerifLao[wght].ttf"])
+}
+
+/// Khmer faces.
+#[cfg(not(target_arch = "wasm32"))]
+fn khmer() -> Vec<(String, u32)> {
+    script_face("km", &["NotoSansKhmer-Regular.ttf", "NotoSansKhmer[wght].ttf"])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn khmer_serif() -> Vec<(String, u32)> {
+    script_serif("km", &["NotoSerifKhmer-Regular.ttf", "NotoSerifKhmer[wght].ttf"])
+}
+
+/// Arabic faces. The serif companion is Naskh (the traditional book design), not a Latin serif.
+#[cfg(not(target_arch = "wasm32"))]
+fn arabic() -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    // The face fontconfig prefers for Arabic, such as a Vazirmatn the user set as their Arabic
+    // font (#229), leads the script faces when it actually has Arabic letters.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    v.extend(fontconfig_arabic());
+    v.extend(script_face("ar", &["NotoSansArabic-Regular.ttf", "NotoSansArabic[wdth,wght].ttf"]));
+    v
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn arabic_serif() -> Vec<(String, u32)> {
+    script_serif("ar", &["NotoNaskhArabic-Regular.ttf", "NotoNaskhArabic[wght].ttf"])
+}
+
+/// Devanagari faces.
+#[cfg(not(target_arch = "wasm32"))]
+fn devanagari() -> Vec<(String, u32)> {
+    script_face("hi", &["NotoSansDevanagari-Regular.ttf", "NotoSansDevanagari[wdth,wght].ttf"])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn devanagari_serif() -> Vec<(String, u32)> {
+    script_serif("hi", &["NotoSerifDevanagari-Regular.ttf", "NotoSerifDevanagari[wdth,wght].ttf"])
+}
+
+/// Myanmar faces (Padauk is the common one; it has no serif companion).
+#[cfg(not(target_arch = "wasm32"))]
+fn myanmar() -> Vec<(String, u32)> {
+    script_face("my", &["Padauk-Regular.ttf"])
+}
+
+/// Tibetan faces (Jomolhari is the common one; no serif companion).
+#[cfg(not(target_arch = "wasm32"))]
+fn tibetan() -> Vec<(String, u32)> {
+    script_face("bo", &["Jomolhari-Regular.ttf"])
+}
+
+/// Yi (Nuosu) faces; Noto Sans Yi has no serif companion.
+#[cfg(not(target_arch = "wasm32"))]
+fn yi() -> Vec<(String, u32)> {
+    script_face("ii", &["NotoSansYi-Regular.ttf"])
+}
+
+/// Thai serif faces (Noto Serif Thai where installed).
+#[cfg(not(target_arch = "wasm32"))]
+fn thai_serif() -> Vec<(String, u32)> {
+    script_serif("th", &["NotoSerifThai-Regular.ttf", "NotoSerifThai[wght].ttf"])
+}
+
+/// Hebrew serif faces (Noto Serif Hebrew where installed).
+#[cfg(not(target_arch = "wasm32"))]
+fn hebrew_serif() -> Vec<(String, u32)> {
+    script_serif("he", &["NotoSerifHebrew-Regular.ttf", "NotoSerifHebrew[wght].ttf"])
+}
+
+/// Japanese Han serif faces (Noto Serif CJK JP). The region-merged `NotoSerifCJK-Regular.ttc`
+/// carries one face per locale (JP 0, KR 1, SC 2, TC 3, HK 4).
+#[cfg(not(target_arch = "wasm32"))]
+fn cjk_han_japanese_serif() -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["serif:lang=ja"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
+        v.push((format!("{d}/NotoSerifCJKjp-Regular.otf"), 0));
+        v.push((format!("{d}/NotoSerifCJK-Regular.ttc"), 0));
+    }
+    v
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cjk_han_simplified_serif() -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["serif:lang=zh-cn"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
+        v.push((format!("{d}/NotoSerifCJKsc-Regular.otf"), 0));
+        v.push((format!("{d}/NotoSerifCJK-Regular.ttc"), 2));
+    }
+    v
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cjk_hangul_serif() -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["serif:lang=ko"]));
+    for d in LINUX_CJK_FALLBACK_DIRS {
+        v.push((format!("{d}/NotoSerifCJKkr-Regular.otf"), 0));
+        v.push((format!("{d}/NotoSerifCJK-Regular.ttc"), 1));
+    }
+    v
+}
+
 
 /// Symbol faces behind the UI font. Interface fonts such as Noto Sans and Cantarell (and egui's
 /// built-in Ubuntu) lack arrows, check marks, geometric shapes and keyboard symbols (▾ ✓ ✕ ▲ ↳ ⇧),
@@ -334,9 +625,11 @@ pub(super) fn arabic() -> Vec<(String, u32)> {
 /// Debian/Ubuntu, Fedora and Arch layouts. [`load_fallback`] skips the file if Hebrew already
 /// loaded it.
 #[cfg(not(target_arch = "wasm32"))]
-fn symbols() -> Vec<(String, u32)> {
+pub(super) fn symbols() -> Vec<(String, u32)> {
     let win = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
     let mut v: Vec<(String, u32)> = vec![(format!("{win}\\seguisym.ttf"), 0), ("/System/Library/Fonts/Apple Symbols.ttf".into(), 0)];
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["DejaVu Sans", "Symbola", "Noto Sans Symbols 2", "Noto Sans Symbols"]));
     for d in [
         "/usr/share/fonts/truetype/dejavu",
         "/usr/share/fonts/dejavu-sans-fonts",
@@ -356,6 +649,8 @@ fn symbols() -> Vec<(String, u32)> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn symbols_more() -> Vec<(String, u32)> {
     let mut v: Vec<(String, u32)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    v.extend(fc_match_candidates(&["Noto Sans Symbols 2", "Symbola", "Noto Sans Symbols"]));
     for d in [
         "/usr/share/fonts/noto",
         "/usr/share/fonts/truetype/noto",

@@ -593,6 +593,11 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
     bound
 }
 
+/// Binds every face the catalog holds for an installed `family` (see [`faces_of`]).
+pub fn bind_family(fonts: &mut egui::FontDefinitions, family: &str) -> Vec<String> {
+    bind_faces(fonts, family, &faces_of(family))
+}
+
 /// The role families currently bound to font data. `cell_family` consults this, so it never names a
 /// family egui hasn't been given.
 static BOUND: OnceLock<std::sync::RwLock<HashSet<String>>> = OnceLock::new();

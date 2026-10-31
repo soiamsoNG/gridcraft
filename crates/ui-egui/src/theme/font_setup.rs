@@ -1,6 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
 use super::Blob;
-use super::font_fallback::{load_fallback, load_preferred_arabic};
+use super::font_fallback;
 use super::{Arc, Color32, FontData, FontDefinitions, FontFamily, FontId};
 
 /// A font from the optional craft-fonts build input (`CRAFT_FONTS_DIR` at build time; see
@@ -456,7 +456,7 @@ impl HanOrder {
 
 /// Builds the font set with the Han fallback faces ordered for the interface language.
 pub fn font_definitions_for_language(language: crate::i18n::Language) -> FontDefinitions {
-    font_definitions_with(language, &[])
+    font_definitions_with(language, &[], crate::script::ScriptSet::EMPTY, crate::script::ScriptSet::EMPTY)
 }
 
 /// The bundled faces plus the pinned craft-fonts faces, with no system-font probing or installed
@@ -466,24 +466,27 @@ pub fn font_definitions_for_language(language: crate::i18n::Language) -> FontDef
 /// machine see the same font set. Craft-fonts remains a pinned build input rather than a repository
 /// asset; without it only egui's bundled faces are available, which is the documented no-font mode.
 pub fn pinned_font_definitions() -> FontDefinitions {
-    font_definitions_impl(crate::i18n::Language::En, Vec::new(), false)
+    font_definitions_impl(crate::i18n::Language::En, &[], crate::script::ScriptSet::EMPTY, crate::script::ScriptSet::EMPTY, false)
 }
 
 /// [`font_definitions_for_language`] that also binds the workbook fonts in `used` that are
 /// installed, so cells set in them render with them; the rest fall back to the roles. The bound
 /// families are recorded in [`crate::fonts`] so [`cell_family`] only names a family egui has.
-pub fn font_definitions_with(language: crate::i18n::Language, used: &[String]) -> FontDefinitions {
-    let installed = crate::fonts::installed_among(used).into_iter().map(|family| {
-        let faces = crate::fonts::faces_of(&family);
-        (family, faces)
-    });
-    font_definitions_impl(language, installed.collect(), true)
+pub fn font_definitions_with(
+    language: crate::i18n::Language,
+    used: &[String],
+    scripts: crate::script::ScriptSet,
+    bold_scripts: crate::script::ScriptSet,
+) -> FontDefinitions {
+    font_definitions_impl(language, used, scripts, bold_scripts, true)
 }
 
 /// Builds the role font chains, script fallbacks, installed workbook fonts and optional craft-font faces, drops unparseable data and records which families were bound.
-pub(super) fn font_definitions_impl(
+fn font_definitions_impl(
     language: crate::i18n::Language,
-    installed: Vec<(String, Vec<crate::fonts::Face>)>,
+    used: &[String],
+    scripts: crate::script::ScriptSet,
+    bold_scripts: crate::script::ScriptSet,
     system: bool,
 ) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
@@ -492,18 +495,59 @@ pub(super) fn font_definitions_impl(
     let mut bound: Vec<String> = Vec::new();
     // The non-Latin fallback faces have to sit at the end of each chain: a Latin font owns Latin,
     // and epaint picks the first face that has the glyph, so they only catch their own scripts.
-    let fallback = if system {
-        let mut fallback = load_preferred_arabic(&mut fonts);
-        fallback.extend(load_fallback(&mut fonts, HanOrder::of(language)));
-        fallback
-    } else {
-        Vec::new()
-    };
+    let han = HanOrder::of(language);
+    let wanted = font_fallback::wanted_scripts(language, scripts);
+    // A workbook that has not been scanned reports no scripts and is handed every face; there is
+    // nothing to draw yet, so the catalog supplement waits for the first scan rather than loading a
+    // face per installed script on startup.
+    let known = !scripts.is_empty();
+    let fallback = if system { font_fallback::load_fallback(&mut fonts, han, false, wanted, known) } else { Vec::new() };
+    // Serif companions (Noto Serif CJK alone is ~55 MB) are loaded only when something asks for a
+    // serif face: a workbook font whose name reads as serif, or the serif role.
+    let want_serif = used.iter().any(|name| crate::fonts::family_name_is_serif(name));
+    let serif_fallback = if system && want_serif { font_fallback::load_fallback(&mut fonts, han, true, wanted, known) } else { Vec::new() };
+    // Bold script faces, for the scripts the workbook actually sets in bold.
+    let bold_sans = if system { font_fallback::load_bold_script_faces(&mut fonts, bold_scripts, false) } else { Vec::new() };
+    let bold_serif = if system && want_serif { font_fallback::load_bold_script_faces(&mut fonts, bold_scripts, true) } else { Vec::new() };
     let hack = fonts.font_data.contains_key(HACK).then_some(HACK);
     for role in [UI, UI_BOLD, CELL, CELL_BOLD, CELL_ITALIC, CELL_BOLD_ITALIC, SERIF, MONO, MATH, MATH_ITALIC, MATH_BOLD] {
-        let chain = build_role_chain(&mut fonts, role, &base_prop, &base_mono, &fallback, hack, system);
+        // A bold role takes the bold script faces: a Calibri cell draws its Latin in Carlito Bold,
+        // so its Han has to come from a bold CJK face or half the cell stays regular.
+        let role_fallback = if role == SERIF && want_serif {
+            &serif_fallback
+        } else if matches!(role, UI_BOLD | CELL_BOLD | CELL_BOLD_ITALIC) && !bold_sans.is_empty() {
+            &bold_sans
+        } else if matches!(role, UI_BOLD | CELL_BOLD | CELL_BOLD_ITALIC) && !bold_serif.is_empty() {
+            &bold_serif
+        } else {
+            &fallback
+        };
+        let chain = build_role_chain(&mut fonts, role, &base_prop, &base_mono, role_fallback, hack, system);
         fonts.families.insert(FontFamily::Name(role.into()), chain);
         bound.push(role.to_string());
+    }
+    // Installed workbook fonts, so a cell's chosen font actually renders in it.
+    if system {
+        for family in crate::fonts::installed_among(used) {
+            bound.extend(crate::fonts::bind_family(&mut fonts, &family));
+        }
+        // A standard name this machine does not have is bound to the face the desktop substitutes
+        // for it, under the name the workbook uses: Times New Roman cells keep bold and italic
+        // even though only Liberation Serif is installed (#1231).
+        let mut seen: Vec<String> = Vec::new();
+        for name in used {
+            let key = name.to_lowercase();
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let Some(resolved) = crate::fonts::substitute_family(name) else { continue };
+            let faces = crate::fonts::faces_of(&resolved);
+            if faces.is_empty() {
+                continue;
+            }
+            bound.extend(crate::fonts::bind_faces(&mut fonts, name, &faces));
+        }
     }
     // Interface text (formula bar, name box, dialogs) falls back to the cell font before the
     // script faces: whatever a cell can draw, the formula bar can draw too, even where no script
@@ -512,11 +556,6 @@ pub(super) fn font_definitions_impl(
     // Default proportional text in widgets uses the UI font.
     if let Some(ui) = fonts.families.get(&FontFamily::Name(UI.into())).cloned() {
         fonts.families.insert(FontFamily::Proportional, ui);
-    }
-    // Installed workbook fonts, so a cell's chosen font actually renders in it. They are bound
-    // after the proportional chain has the script faces, which their chains end with.
-    for (family, faces) in installed {
-        bound.extend(crate::fonts::bind_faces(&mut fonts, &family, &faces));
     }
     // The optional craft-fonts faces go at the very end of every family: a system or bundled face
     // that has the script keeps its glyph shapes, while the permitted OFL faces cover scripts and
