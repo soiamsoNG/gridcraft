@@ -278,6 +278,22 @@ pub(super) fn in_dirs(dirs: &[&str], files: &[&str]) -> Vec<String> {
 }
 
 /// Candidate font files per role, in preference order.
+/// The fontconfig pattern that names this role's design, on platforms that have fontconfig.
+fn fontconfig_role(role: &str) -> Option<&'static str> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    Some(match role {
+        UI | CELL => "sans-serif",
+        UI_BOLD | CELL_BOLD => "sans-serif:weight=bold",
+        CELL_ITALIC => "sans-serif:slant=italic",
+        CELL_BOLD_ITALIC => "sans-serif:weight=bold:slant=italic",
+        SERIF => "serif",
+        MONO => "monospace",
+        _ => return None,
+    })
+}
+
 pub(super) fn candidates(role: &str) -> Vec<(String, u32)> {
     let mac_sys = "/System/Library/Fonts";
     let mac_sup = "/System/Library/Fonts/Supplemental";
@@ -612,7 +628,9 @@ fn build_role_chain(
     hack: Option<&str>,
     system: bool,
 ) -> Vec<String> {
-    let paths = candidates(role);
+    // Linux asks fontconfig which file draws this role, instead of guessing from a path table:
+    // the same answer the user's desktop gets, with bold and italic resolved by weight and slant.
+    let paths = fontconfig_role(role).filter(|_| system).and_then(crate::fonts::fc_match).map(|p| vec![p]).unwrap_or_else(|| candidates(role));
     let refs: Vec<(&str, u32)> = paths.iter().map(|(p, i)| (p.as_str(), *i)).collect();
     let mut chain: Vec<String> = Vec::new();
     let loaded = if system { try_load(&refs) } else { None };
