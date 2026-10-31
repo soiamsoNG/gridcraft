@@ -148,7 +148,10 @@ pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32) -
 pub(crate) fn cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32) -> f32 {
     let top_inset = 1.0 * z;
     let y_top = rect.top() - top_inset;
-    let y_bottom = (rect.bottom() - gh - 0.5 * z).max(y_top);
+    // Not clamped to `y_top`: a line mixing scripts sits taller than the row (its fallback faces are
+    // put on the baseline, #1231), so Bottom lets the extra ascent overflow above and the cell's clip
+    // trims it there. Clamping would push the baseline down and hang the glyphs under the row.
+    let y_bottom = rect.bottom() - gh - 0.5 * z;
     match valign {
         VAlign::Top => y_top,
         VAlign::Center | VAlign::Justify | VAlign::Distributed => (y_top + y_bottom) / 2.0,
