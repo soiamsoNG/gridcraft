@@ -541,7 +541,7 @@ fn face_key(face: &Face) -> String {
 ///
 /// Each role's chain ends with egui's default proportional fonts, so glyphs the installed font
 /// lacks (emoji, a stray script) still render.
-pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face]) -> Vec<String> {
+pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face], fallback: &[String], bold_fallback: &[String]) -> Vec<String> {
     if faces.is_empty() {
         return Vec::new();
     }
@@ -573,6 +573,9 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
         if chain.is_empty() {
             continue;
         }
+        // A workbook font's role chain needs the script faces too: Carlito has no Han, so a Calibri
+        // cell would draw tofu without them (#1231).
+        chain.extend(if bold { bold_fallback } else { fallback }.iter().cloned());
         chain.extend(base.iter().cloned());
         fonts.families.insert(egui::FontFamily::Name(role.clone().into()), chain);
         bound.push(role);
@@ -581,8 +584,8 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
 }
 
 /// Bind every installed face of `family`, found by any of its names (see [`bind_faces`]).
-pub fn bind_family(fonts: &mut egui::FontDefinitions, family: &str) -> Vec<String> {
-    bind_faces(fonts, family, &faces_of(family))
+pub fn bind_family(fonts: &mut egui::FontDefinitions, family: &str, fallback: &[String], bold_fallback: &[String]) -> Vec<String> {
+    bind_faces(fonts, family, &faces_of(family), fallback, bold_fallback)
 }
 
 /// The role families currently bound to font data. `cell_family` consults this, so it never names a
@@ -809,14 +812,14 @@ mod tests {
         };
 
         let mut fonts = egui::FontDefinitions::default();
-        let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face));
+        let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face), &[], &[]);
         assert_eq!(bound.len(), 4, "regular, bold, italic and bold-italic roles");
         for key in &bound {
             let chain = fonts.families.get(&egui::FontFamily::Name(key.as_str().into())).expect("role family");
             assert!(chain.iter().all(|k| fonts.font_data.contains_key(k)), "every chained key has data");
         }
         // A family with no faces binds nothing and never touches the map.
-        assert!(bind_faces(&mut fonts, "No Such Font", &[]).is_empty());
+        assert!(bind_faces(&mut fonts, "No Such Font", &[], &[], &[]).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -861,7 +864,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let regular = face("Upright Only", &["Upright Only"], "/nonexistent/Upright.ttf", 400.0);
         let mut fonts = egui::FontDefinitions::default();
-        bind_faces(&mut fonts, "Upright Only", std::slice::from_ref(&regular));
+        bind_faces(&mut fonts, "Upright Only", std::slice::from_ref(&regular), &[], &[]);
         let italic = egui::FontFamily::Name(role_key("Upright Only", false, true).into());
         assert_eq!(italic_coverage(&italic), Some(Some(ScriptSet::EMPTY)), "no italic file, so every script is slanted");
         let roman = egui::FontFamily::Name(role_key("Upright Only", false, false).into());
@@ -872,7 +875,7 @@ mod tests {
         slanted.italic = true;
         slanted.scripts = ScriptSet::of_text("A");
         let mut fonts = egui::FontDefinitions::default();
-        bind_faces(&mut fonts, "Latin Italic", std::slice::from_ref(&slanted));
+        bind_faces(&mut fonts, "Latin Italic", std::slice::from_ref(&slanted), &[], &[]);
         let real = egui::FontFamily::Name(role_key("Latin Italic", false, true).into());
         let coverage = italic_coverage(&real).flatten().expect("italic role");
         assert!(coverage.has(crate::script::ScriptClass::Latin), "the real italic face draws Latin");
@@ -989,8 +992,8 @@ mod tests {
 
         let mut fonts = egui::FontDefinitions::default();
         let before = fonts.font_data.len();
-        let mut bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&f));
-        bound.extend(bind_faces(&mut fonts, "우분투", std::slice::from_ref(&f)));
+        let mut bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&f), &[], &[]);
+        bound.extend(bind_faces(&mut fonts, "우분투", std::slice::from_ref(&f), &[], &[]));
         assert!(bound.contains(&role_key("우분투", false, false)), "bound under the workbook's name");
         assert!(bound.contains(&role_key("Ubuntu", true, true)));
         assert_eq!(fonts.font_data.len(), before + 1, "one file, loaded once");

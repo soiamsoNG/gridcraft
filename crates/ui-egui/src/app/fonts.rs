@@ -149,6 +149,7 @@ impl SheetApp {
     fn install_first_font_set(&mut self, ctx: &egui::Context) {
         let used = self.used_fonts();
         let scripts = self.used_scripts();
+
         if scripts.is_empty() {
             // Nothing to draw yet (an empty workbook, or a fresh session): keep the non-blocking
             // startup path so opening the app does not wait for the font catalog.
