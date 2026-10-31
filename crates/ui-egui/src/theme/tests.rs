@@ -24,6 +24,24 @@ fn fallback_faces_are_appended_to_every_family() {
 }
 
 #[test]
+/// Script faces are put on the baseline of the family that lacks their script (#1231).
+fn script_faces_align_on_the_family_baseline() {
+    use egui::epaint::text::FallbackAlign;
+    let fonts = font_definitions_for_language(Language::En);
+    let mut checked = 0;
+    for (key, fd) in &fonts.font_data {
+        // Craft faces and system script faces are the ones that draw beside a Latin text face; the
+        // egui defaults are inserted by epaint itself and keep their own alignment.
+        if key.starts_with("craft-") || key.starts_with("sys-") {
+            let expected = if crate::fonts::is_symbol_family(key) { FallbackAlign::Center } else { FallbackAlign::Baseline };
+            assert_eq!(fd.tweak.fallback_align, expected, "{key}");
+            checked += 1;
+        }
+    }
+    let _ = checked;
+}
+
+#[test]
 /// Every font family ends with exactly the permitted craft faces in manifest order.
 fn craft_fonts_are_the_last_fallback_in_every_family() {
     // Ordering: app/bundled faces, Hack/emoji, system script fallbacks, permitted craft faces.

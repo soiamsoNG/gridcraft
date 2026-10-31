@@ -312,6 +312,26 @@ fn fc_weight(value: u32) -> f32 {
     POINTS.iter().min_by_key(|(fc, _)| fc.abs_diff(value)).map(|(_, weight)| *weight).unwrap_or(400.0)
 }
 
+/// Whether a family draws emoji, symbols or icons rather than text.
+pub fn is_symbol_family(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["emoji", "symbol", "dingbat", "icon", "webding", "wingding", "awesome"].iter().any(|word| lower.contains(word))
+}
+
+/// Where a face sits vertically when it draws for a family whose first font is another design.
+///
+/// Text faces go on the first font's baseline: epaint's default centres a fallback in the row, which
+/// sinks CJK, Thai or Devanagari against the Latin beside it (#1231). Emoji and icon faces keep the
+/// centred default, because their glyphs fill the whole row and would drop below the baseline.
+pub fn fallback_align(family: &str) -> egui::epaint::text::FallbackAlign {
+    if is_symbol_family(family) { egui::epaint::text::FallbackAlign::Center } else { egui::epaint::text::FallbackAlign::Baseline }
+}
+
+/// Sets [`fallback_align`] on a face built from `family`.
+pub fn align_fallback(fd: &mut egui::FontData, family: &str) {
+    fd.tweak.fallback_align = fallback_align(family);
+}
+
 /// Whether a family name reads as a serif family, for a face fontconfig describes without a panose.
 pub(crate) fn family_name_is_serif(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -566,6 +586,7 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
                 let Ok(bytes) = std::fs::read(&face.path) else { continue };
                 let mut fd = egui::FontData::from_owned(bytes);
                 fd.index = face.index;
+                align_fallback(&mut fd, &face.family);
                 fonts.font_data.insert(key.clone(), std::sync::Arc::new(fd));
             }
             chain.push(key);
@@ -663,6 +684,24 @@ mod tests {
         assert!(!style_italic("Bold"));
         // The weight table is checked in order, so "extralight" wins over "light".
         assert_eq!(style_weight("ExtraLight"), 200.0);
+    }
+
+    #[test]
+    fn text_faces_sit_on_the_baseline_and_symbol_faces_stay_centred() {
+        use egui::epaint::text::FallbackAlign;
+        // A fallback face's default is `Center`, which sinks CJK against the Latin beside it (#1231).
+        assert_eq!(fallback_align("Noto Sans CJK SC"), FallbackAlign::Baseline);
+        assert_eq!(fallback_align("Carlito"), FallbackAlign::Baseline);
+        assert_eq!(fallback_align("Noto Sans Thai"), FallbackAlign::Baseline);
+        assert_eq!(fallback_align("Noto Sans Symbols 2"), FallbackAlign::Center);
+        assert_eq!(fallback_align("Noto Color Emoji"), FallbackAlign::Center);
+        assert_eq!(fallback_align("Font Awesome 6 Free"), FallbackAlign::Center);
+        // A face keeps its own family's rule wherever it is used.
+        let mut fd = egui::FontData::from_owned(vec![0, 1, 0, 0, 0, 0xFF, 0, 0]);
+        align_fallback(&mut fd, "Noto Color Emoji");
+        assert_eq!(fd.tweak.fallback_align, FallbackAlign::Center);
+        align_fallback(&mut fd, "Noto Sans Devanagari");
+        assert_eq!(fd.tweak.fallback_align, FallbackAlign::Baseline);
     }
 
     #[test]
