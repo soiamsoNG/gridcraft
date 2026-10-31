@@ -566,6 +566,12 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
     let base: Vec<String> = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
     let mut bound: Vec<String> = Vec::new();
     for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+        let role = role_key(family, bold, italic);
+        // What the family's real italic faces can draw: no italic file at all, or one whose italic
+        // covers only Latin, leaves the rest of the text to the renderer's slant (#1231).
+        if italic {
+            set_italic_coverage(&role, Some(faces.iter().filter(|face| face.italic).fold(ScriptSet::EMPTY, |set, face| set.union(face.scripts))));
+        }
         let Some(primary) = pick_face(faces, bold, italic) else { continue };
         let mut chain: Vec<String> = Vec::new();
         for face in [Some(primary), pick_face(faces, false, false)] {
@@ -586,7 +592,6 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
             continue;
         }
         chain.extend(base.iter().cloned());
-        let role = role_key(family, bold, italic);
         fonts.families.insert(egui::FontFamily::Name(role.clone().into()), chain);
         bound.push(role);
     }
@@ -600,20 +605,51 @@ pub fn bind_family(fonts: &mut egui::FontDefinitions, family: &str) -> Vec<Strin
 
 /// The role families currently bound to font data. `cell_family` consults this, so it never names a
 /// family egui hasn't been given.
-static BOUND: OnceLock<std::sync::RwLock<HashSet<String>>> = OnceLock::new();
+static BOUND: OnceLock<std::sync::RwLock<std::collections::HashMap<String, Option<ScriptSet>>>> = OnceLock::new();
 
-fn bound() -> &'static std::sync::RwLock<HashSet<String>> {
-    BOUND.get_or_init(|| std::sync::RwLock::new(HashSet::new()))
+fn bound() -> &'static std::sync::RwLock<std::collections::HashMap<String, Option<ScriptSet>>> {
+    BOUND.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
-/// Record the role families a freshly built [`egui::FontDefinitions`] bound.
+/// Record the role families a freshly built [`egui::FontDefinitions`] bound, with the scripts their
+/// italic face covers.
 pub fn set_bound(keys: impl IntoIterator<Item = String>) {
-    *bound().write().unwrap_or_else(std::sync::PoisonError::into_inner) = keys.into_iter().collect();
+    set_bound_for_roles(keys.into_iter().map(|key| (key, None)));
+}
+
+/// [`set_bound`] from a finished font set: only the roles the definitions actually carry are
+/// recorded, so a role the old set advertised and the new one dropped cannot be named.
+pub fn set_bound_for(defs: &egui::FontDefinitions, roles: Vec<String>) {
+    set_bound_for_roles(roles.into_iter().map(|role| {
+        let present = defs.families.get(&egui::FontFamily::Name(role.as_str().into())).is_some_and(|c| !c.is_empty());
+        (role, present.then_some(None).flatten())
+    }));
+}
+
+fn set_bound_for_roles(entries: impl Iterator<Item = (String, Option<ScriptSet>)>) {
+    let mut next = std::collections::HashMap::new();
+    let previous = bound().read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    for (role, coverage) in entries {
+        // `bind_faces` records the italic coverage as it binds, just before this runs: keep it.
+        next.insert(role.clone(), coverage.or_else(|| previous.get(&role).copied().flatten()));
+    }
+    *bound().write().unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+}
+
+/// The scripts a role's real italic face covers. `None` means the family has no italic face at all,
+/// so every script has to be slanted; `Some(set)` means only the scripts outside `set` are.
+pub fn italic_coverage(family: &egui::FontFamily) -> Option<Option<ScriptSet>> {
+    let egui::FontFamily::Name(name) = family else { return None };
+    bound().read().unwrap_or_else(std::sync::PoisonError::into_inner).get(name.as_ref()).copied()
+}
+
+pub fn set_italic_coverage(role: &str, coverage: Option<ScriptSet>) {
+    bound().write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(role.to_string(), coverage);
 }
 
 /// Is this exact role family bound to font data?
 pub fn is_bound(role: &str) -> bool {
-    bound().read().unwrap_or_else(std::sync::PoisonError::into_inner).contains(role)
+    bound().read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(role)
 }
 
 /// Serializes tests that mutate the process-wide bound-family registry.
@@ -839,6 +875,29 @@ mod tests {
 
     const EN: u16 = 0x0409;
     const KO: u16 = 0x0412;
+
+    #[test]
+    fn a_family_records_which_scripts_its_italic_covers() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let regular = face("Upright Only", &["Upright Only"], "/nonexistent/Upright.ttf", 400.0);
+        let mut fonts = egui::FontDefinitions::default();
+        bind_faces(&mut fonts, "Upright Only", std::slice::from_ref(&regular));
+        let italic = egui::FontFamily::Name(role_key("Upright Only", false, true).into());
+        assert_eq!(italic_coverage(&italic), Some(Some(ScriptSet::EMPTY)), "no italic file, so every script is slanted");
+        let roman = egui::FontFamily::Name(role_key("Upright Only", false, false).into());
+        assert_eq!(italic_coverage(&roman), None, "upright text is never slanted");
+        assert_eq!(italic_coverage(&egui::FontFamily::Proportional), None, "built-in families are not slanted");
+        // A Latin-only italic (Carlito Italic behind Calibri) leaves Han to the renderer's slant.
+        let mut slanted = regular.clone();
+        slanted.italic = true;
+        slanted.scripts = ScriptSet::of_text("A");
+        let mut fonts = egui::FontDefinitions::default();
+        bind_faces(&mut fonts, "Latin Italic", std::slice::from_ref(&slanted));
+        let real = egui::FontFamily::Name(role_key("Latin Italic", false, true).into());
+        let coverage = italic_coverage(&real).flatten().expect("italic role");
+        assert!(coverage.has(crate::script::ScriptClass::Latin), "the real italic face draws Latin");
+        assert!(!coverage.has(crate::script::ScriptClass::Han), "Han has no italic face, so it is slanted");
+    }
 
     fn face(family: &str, names: &[&str], path: &str, weight: f32) -> Face {
         Face {

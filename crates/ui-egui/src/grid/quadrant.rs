@@ -10,6 +10,25 @@ use super::{
     Value, Workbook, pos2, theme, vec2,
 };
 
+/// Lay out cell text with the renderer's slant only where the family's real italic face cannot
+/// draw the script: a Latin-only italic leaves Han upright unless it is slanted here (#1231).
+pub(super) fn cell_job(text: String, font: FontId, color: Color32, wrap: f32, italic: bool) -> egui::text::LayoutJob {
+    let Some(coverage) = italic.then(|| crate::fonts::italic_coverage(&font.family)).flatten() else {
+        return egui::text::LayoutJob::simple(text, font, color, wrap);
+    };
+    // A bound family with no italic face at all slants every script.
+    let coverage = coverage.unwrap_or(crate::script::ScriptSet::EMPTY);
+    let mut job = egui::text::LayoutJob { wrap: egui::text::TextWrapping { max_width: wrap, ..Default::default() }, ..Default::default() };
+    for (range, script) in crate::script::split_runs(&text) {
+        let mut format = egui::TextFormat::simple(font.clone(), color);
+        format.italics = !coverage.has(script);
+        let byte_range = egui::text::ByteIndex(range.start)..egui::text::ByteIndex(range.end);
+        job.sections.push(egui::text::LayoutSection { leading_space: 0.0, byte_range, format });
+    }
+    job.text = text;
+    job
+}
+
 /// Mirror what the grid painted into `layer` (the shape indices in `range`) for a right-to-left
 /// sheet. Geometry is reflected; text and meshes (glyphs, pictures) keep their reading direction
 /// and only move so that their box lands mirrored. Floating objects (`objects`: shape index
@@ -352,6 +371,7 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
     let size = st.font.size * 96.0 / 72.0 * z;
     let fam = theme::cell_family(&st.font.name, st.font.bold, st.font.italic);
     let font = FontId::new(size, fam);
+    let italic = st.font.italic;
     // Digits fit by the cell's own font and size, not the default 11pt (9pt marks in narrow columns).
     let char_w = p.layout_no_wrap("0".to_string(), font.clone(), Color32::PLACEHOLDER).size().x.max(1.0);
     let avail_w = rect.right() - text_left;
@@ -380,10 +400,10 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
     // Rotated text wraps along its own direction (below), not across the column width.
     if !rotated && (st.align.wrap || st.align.h == HAlign::Justify) {
         let wrap_w = (rect.width() - 2.0 * pad - indent).max(4.0);
-        let mut job = egui::text::LayoutJob::simple(text.clone(), font.clone(), color, wrap_w);
+        let mut job = cell_job(text.clone(), font.clone(), color, wrap_w, italic);
         job.direction = direction;
         job.halign_min_is_start = false;
-        job.halign = match painted_halign(halign, geo.rtl) {
+        job.halign = match halign {
             HAlign::Center | HAlign::CenterAcross => egui::Align::Center,
             HAlign::Right => egui::Align::RIGHT,
             _ => egui::Align::LEFT,
@@ -411,7 +431,7 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
     let shrunk = small.is_some();
     let font = small.unwrap_or(font);
     let layout = |text: String| {
-        let mut job = egui::text::LayoutJob::simple(text, font.clone(), color, f32::INFINITY);
+        let mut job = cell_job(text, font.clone(), color, f32::INFINITY, italic);
         job.direction = direction;
         job.halign_min_is_start = false;
         p.layout_job(job)
@@ -505,7 +525,7 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
         let angle = -(st.align.rotation as f32).to_radians();
         // Upright (±90°) wrapped text wraps to the row height: lines then stack across the column.
         let galley = if st.align.wrap && st.align.rotation.abs() == 90 {
-            let mut job = egui::text::LayoutJob::simple(text.clone(), font.clone(), color, (rect.height() - 2.0 * pad).max(4.0));
+            let mut job = cell_job(text.clone(), font.clone(), color, (rect.height() - 2.0 * pad).max(4.0), italic);
             job.direction = direction;
             p.layout_job(job)
         } else {

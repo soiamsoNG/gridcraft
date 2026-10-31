@@ -433,3 +433,24 @@ fn kept_sheet_geometry_and_cf_statistics_follow_every_change() {
     assert!(!Arc::ptr_eq(&kept(&app).0, &ri));
     check_cf(&mut app);
 }
+
+#[test]
+fn only_the_scripts_beyond_the_italic_face_are_slanted() {
+    // A Latin-only italic face (Calibri → Carlito Italic) must not stop Han from being slanted.
+    let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let role = "fnt:Grid Test Sans:ni";
+    crate::fonts::set_bound([role.to_string()]);
+    crate::fonts::set_italic_coverage(role, Some(crate::script::ScriptSet::of_text("A")));
+    let font = FontId::new(14.0, egui::FontFamily::Name(role.into()));
+    let job = super::quadrant::cell_job("中文 A".into(), font.clone(), Color32::BLACK, f32::INFINITY, true);
+    let slanted: Vec<bool> = job.sections.iter().map(|s| s.format.italics).collect();
+    assert_eq!(slanted, vec![true, false], "Han slanted, Latin drawn by its real italic");
+    let job = super::quadrant::cell_job("中文 A".into(), font, Color32::BLACK, f32::INFINITY, false);
+    assert!(job.sections.iter().all(|s| !s.format.italics), "an upright cell is never slanted");
+    // A family with no italic at all slants every run.
+    crate::fonts::set_italic_coverage(role, Some(crate::script::ScriptSet::EMPTY));
+    let font = FontId::new(14.0, egui::FontFamily::Name(role.into()));
+    let job = super::quadrant::cell_job("中文 A".into(), font, Color32::BLACK, f32::INFINITY, true);
+    assert!(job.sections.iter().all(|s| s.format.italics), "no italic file, so every run is slanted");
+    crate::fonts::set_bound([]);
+}
