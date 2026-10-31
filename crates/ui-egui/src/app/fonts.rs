@@ -33,6 +33,10 @@ impl SheetApp {
             // Text boxes and shapes name their own typefaces.
             names.extend(d.wb.sheets.iter().flat_map(|sh| sh.shapes.iter().filter_map(|s| s.format.font.clone())));
         }
+        // One name per family: every style entry repeats the workbook fonts, so a bold toggle that
+        // adds a style must not look like a new font set and rebuild the atlas (#1231).
+        names.sort_unstable();
+        names.dedup();
         names
     }
 
@@ -110,8 +114,12 @@ impl SheetApp {
         if !self.fonts_ready {
             self.start_font_setup(ctx);
         } else if self.fonts_rebind {
-            // A font-set change made last frame is active now.
+            // A font-set change made last frame is active now: publish its roles.
             self.fonts_rebind = false;
+            let roles = std::mem::take(&mut self.pending_roles);
+            if let Some(defs) = &self.fonts_defs {
+                crate::fonts::set_bound_for(defs, roles);
+            }
         } else if !defer_font_change && !self.prepared_fonts && fonts::scan_done() {
             self.rebind_workbook_fonts(ctx);
         }
@@ -160,7 +168,13 @@ impl SheetApp {
         // Blocks until the catalog exists, so a script only the catalog can draw (Bengali, Ethiopic)
         // has its face in the first set instead of a frame of tofu.
         let _ = crate::fonts::catalog();
-        ctx.set_fonts(theme::font_definitions_with(self.ui.language, &used, scripts, bold));
+        let (mut defs, roles) = theme::font_definitions_roles(self.ui.language, &used, scripts, bold);
+        if let Some(old) = &self.fonts_defs {
+            theme::merge_fonts(&mut defs, old);
+        }
+        ctx.set_fonts(defs.clone());
+        self.fonts_defs = Some(defs);
+        self.pending_roles = roles;
         theme::apply(ctx, self.ui.dark);
         self.fonts_bound = used;
         self.fonts_scripts = scripts;
@@ -184,7 +198,13 @@ impl SheetApp {
             return;
         }
         let bold = self.used_bold_scripts();
-        ctx.set_fonts(theme::font_definitions_with(self.ui.language, &used, scripts, bold));
+        let (mut defs, roles) = theme::font_definitions_roles(self.ui.language, &used, scripts, bold);
+        if let Some(old) = &self.fonts_defs {
+            theme::merge_fonts(&mut defs, old);
+        }
+        ctx.set_fonts(defs.clone());
+        self.fonts_defs = Some(defs);
+        self.pending_roles = roles;
         self.fonts_bound = used;
         self.fonts_scripts = scripts;
         self.fonts_rebind = true;

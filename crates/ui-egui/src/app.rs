@@ -61,6 +61,8 @@ impl SheetApp {
             fonts_seen: (0, 0),
             fonts_scripts: crate::script::ScriptSet::EMPTY,
             fonts_rebind: false,
+            fonts_defs: None,
+            pending_roles: Vec::new(),
             fonts_han: None,
             effective_dark: false,
             desktop_theme: desktop_theme::DesktopTheme::default(),
@@ -190,7 +192,7 @@ impl SheetApp {
     /// Lays out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if !self.fonts_ready || self.fonts_rebind {
+        if !self.fonts_ready {
             ctx.request_repaint();
             return;
         }
@@ -357,8 +359,9 @@ mod lifecycle_tests {
     }
 
     #[test]
-    /// A font-gated early-returning pass does not lose the queued step; the hook offers it again and a later real pass applies it.
-    fn a_font_gated_pass_offers_the_synthetic_step_again() {
+    /// A pass that activates a new font set no longer stops painting, so it applies the queued step
+    /// instead of consuming the events and painting nothing (#1231).
+    fn a_rebind_pass_applies_the_queued_synthetic_step() {
         let ctx = egui::Context::default();
         ctx.set_fonts(theme::font_definitions());
         let mut app = app();
@@ -368,23 +371,13 @@ mod lifecycle_tests {
         let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| app.logic(ctx));
         app.synthetic.push_back(vec![key_event(true)]);
 
-        // The font gate returns before input handling; `begin_pass` has still consumed the events.
         app.fonts_rebind = true;
         let mut raw = raw_with_size(egui::vec2(900.0, 700.0));
         app.raw_input_hook(&ctx, &mut raw);
         assert_eq!(raw.events.len(), 1);
         let _ = ui_pass(&ctx, raw, |ui| app.ui(ui));
-        assert!(app.synthetic_pending, "the early-returning pass did not apply the step");
-        assert_eq!(app.synthetic.len(), 1, "the step is still queued");
-
-        // A completed pass that did not apply it made the hook offer it again for a real pass.
-        app.fonts_rebind = false;
-        let mut raw = raw_with_size(egui::vec2(900.0, 700.0));
-        app.raw_input_hook(&ctx, &mut raw);
-        assert_eq!(raw.events.len(), 1, "the step is not lost across the font gate");
-        let _ = ui_pass(&ctx, raw, |ui| app.ui(ui));
-        assert!(!app.synthetic_pending);
-        assert!(app.synthetic.is_empty(), "the real UI pass applied the step");
+        assert!(!app.synthetic_pending, "the pass that rebinds paints, so it applies the step");
+        assert!(app.synthetic.is_empty(), "the step is not left queued");
     }
 
     #[test]

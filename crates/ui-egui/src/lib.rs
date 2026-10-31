@@ -265,9 +265,14 @@ pub struct SheetApp {
     /// The scripts `fonts_bound` was built for: text that gains a script (a Thai cell typed into a
     /// Latin sheet) has to rebuild the font set even though no font name changed.
     fonts_scripts: crate::script::ScriptSet,
-    /// Set while a font-set change is pending activation: skip this frame's paint, like the
-    /// startup `fonts_ready` gate (egui applies new definitions at the next pass).
+    /// Set while a font-set change is pending activation: the new set is live only from the next
+    /// pass, so this frame keeps painting with the previous one (no blank frame).
     fonts_rebind: bool,
+    /// The definitions the last `set_fonts` installed, merged into every later set so a family the
+    /// previous frame painted with can never disappear (#1231).
+    fonts_defs: Option<egui::FontDefinitions>,
+    /// Roles of a pending set: published once egui has applied it, never before.
+    pending_roles: Vec<String>,
     /// Han face order the installed fonts were built with; a language switch rebuilds the fonts
     /// only when it changes this (see `theme::HanOrder`).
     fonts_han: Option<theme::HanOrder>,
