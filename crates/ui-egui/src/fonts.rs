@@ -185,6 +185,30 @@ fn is_serif_panose(panose: &[u8]) -> bool {
         || (panose.first() == Some(&3) && matches!(panose.get(1).copied(), Some(3..=10)))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn is_font_path(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc"))
+}
+
+/// Every face in `path` appended to `out`. Unsupported, unreadable or damaged files, and files
+/// over [`MAX_FONT_FILE`], contribute nothing. The file is read once for its metadata; the bytes
+/// are read again only when a face is bound.
+#[cfg(not(target_arch = "wasm32"))]
+fn scan_file(path: &std::path::Path, out: &mut Vec<Face>) {
+    if !is_font_path(path) {
+        return;
+    }
+    let Ok(metadata) = std::fs::metadata(path) else { return };
+    if metadata.len() > MAX_FONT_FILE {
+        log::warn!("skipping font {}: larger than {MAX_FONT_FILE} bytes", path.display());
+        return;
+    }
+    let Some(data) = read_font(path) else { return };
+    for (index, family, names, style, serif, scripts) in file_faces(&data) {
+        out.push(Face { family, names, path: path.to_path_buf(), index, weight: style_weight(&style), italic: style_italic(&style), serif, scripts });
+    }
+}
+
 /// Catalog every face under `dirs`, recursing into subfolders. A folder reached twice (through a
 /// symlink) is read once, so a link back to a parent ends the walk.
 #[cfg(not(target_arch = "wasm32"))]
@@ -202,31 +226,171 @@ pub fn scan_dirs(dirs: &[PathBuf]) -> Vec<Face> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-                continue;
-            }
-            let is_font = path
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc"));
-            if !is_font || std::fs::metadata(&path).map(|m| m.len() > MAX_FONT_FILE).unwrap_or(true) {
-                continue;
-            }
-            let Some(data) = read_font(&path) else { continue };
-            for (index, family, names, style, serif, scripts) in file_faces(&data) {
-                out.push(Face {
-                    family,
-                    names,
-                    path: path.clone(),
-                    index,
-                    weight: style_weight(&style),
-                    italic: style_italic(&style),
-                    serif,
-                    scripts,
-                });
+            } else {
+                scan_file(&path, &mut out);
             }
         }
     }
     out
+}
+
+/// Every face fontconfig knows, in the order it reports them. `fc-list` is the usual Linux font
+/// source and covers distribution-specific directories that [`system_font_dirs`] cannot know. The
+/// metadata avoids opening each file during startup; a file is read only when a family is bound.
+#[cfg(target_os = "linux")]
+fn fontconfig_faces() -> Vec<Face> {
+    let Ok(output) = std::process::Command::new("fc-list")
+        .env("LC_ALL", "C")
+        .args(["-f", "%{file}\t%{index}\t%{family[0]}\t%{family}\t%{style[0]}\t%{weight}\t%{slant}\t%{charset}\n"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut seen: HashSet<(PathBuf, u32)> = HashSet::new();
+    let mut faces: Vec<Face> = Vec::new();
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        let Some(face) = fontconfig_face(line) else { continue };
+        if face.path.is_file() && seen.insert((face.path.clone(), face.index)) {
+            faces.push(face);
+        }
+    }
+    faces
+}
+
+/// One tab-separated `fc-list` record, or `None` for a blank or unusable line.
+#[cfg(target_os = "linux")]
+fn fontconfig_face(line: &[u8]) -> Option<Face> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut fields = line.split(|byte| *byte == b'\t');
+    let file = fields.next()?;
+    let index = fields.next()?;
+    let family = fields.next()?;
+    let names = fields.next()?;
+    let style = fields.next()?;
+    let weight = fields.next()?;
+    let slant = fields.next()?;
+    let charset = fields.next()?;
+    if fields.next().is_some() || file.is_empty() || family.is_empty() {
+        return None;
+    }
+    // A variable font also reports a range row for its default instance (`[80 200]`, empty
+    // style). Only concrete named instances and static faces are usable as catalog entries.
+    if style.is_empty() {
+        return None;
+    }
+    let index: u32 = std::str::from_utf8(index).ok()?.trim().parse().ok()?;
+    let weight = fc_weight(std::str::from_utf8(weight).ok()?.trim().parse().ok()?);
+    let slant: u32 = std::str::from_utf8(slant).ok()?.trim().parse().unwrap_or(0);
+    let family = std::str::from_utf8(family).ok()?.trim();
+    let path = PathBuf::from(OsStr::from_bytes(file));
+    if !is_font_path(&path) {
+        return None;
+    }
+    // `%{family}` lists every name fontconfig knows for the face — localized names and aliases
+    // included (`Malgun Gothic, 맑은 고딕`), which a workbook may use (#1898).
+    let names = match std::str::from_utf8(names) {
+        Ok(all) => family_names(family, all),
+        Err(_) => vec![family.to_string()],
+    };
+    let scripts = ScriptSet::of_charset(&String::from_utf8_lossy(charset));
+    Some(Face { family: family.to_string(), names, path, index, weight, italic: slant >= 100, serif: family_name_is_serif(family), scripts })
+}
+
+/// `family` first, then each comma-separated name in `all`, trimmed, deduplicated
+/// case-insensitively and capped at [`MAX_FAMILY_NAMES`].
+#[cfg(target_os = "linux")]
+fn family_names(family: &str, all: &str) -> Vec<String> {
+    let mut names = vec![family.to_string()];
+    for name in all.split(',') {
+        if names.len() >= MAX_FAMILY_NAMES {
+            break;
+        }
+        let name = name.trim();
+        if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// The egui weight for a fontconfig weight. fontconfig's constants follow the OpenType
+/// convention (`FC_WEIGHT_REGULAR` 80, `FC_WEIGHT_BOLD` 200), not CSS numbers, and
+/// `FC_WEIGHT_EXTRABOLD` (205) sits as close to Bold as to Black — without its own point it would
+/// round down to 700 and tie with Bold.
+#[cfg(any(target_os = "linux", test))]
+fn fc_weight(value: u32) -> f32 {
+    const POINTS: &[(u32, f32)] =
+        &[(0, 100.0), (40, 200.0), (50, 300.0), (80, 400.0), (100, 500.0), (180, 600.0), (200, 700.0), (205, 800.0), (210, 900.0)];
+    POINTS.iter().min_by_key(|(fc, _)| fc.abs_diff(value)).map(|(_, weight)| *weight).unwrap_or(400.0)
+}
+
+/// Whether a family name reads as a serif family, for a face fontconfig describes without a panose.
+pub(crate) fn family_name_is_serif(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("times")
+        || lower.contains("georgia")
+        || lower.contains("cambria")
+        || lower.contains("serif") && !lower.contains("sans")
+        || lower.contains("garamond")
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    static FC_MATCH_CACHE: std::cell::RefCell<std::collections::HashMap<String, Option<(String, u32)>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Asks fontconfig (`fc-match`, part of the standard Linux font stack) for the best face for
+/// `pattern`. The answer is cached for the session: a match is a subprocess, and the same name is
+/// asked for every frame a re-bind is considered.
+#[cfg(target_os = "linux")]
+pub(crate) fn fc_match(pattern: &str) -> Option<(String, u32)> {
+    if let Some(answer) = FC_MATCH_CACHE.with(|cache| cache.borrow().get(pattern).cloned()) {
+        return answer;
+    }
+    let answer = fc_match_uncounted(pattern);
+    FC_MATCH_CACHE.with(|cache| {
+        cache.borrow_mut().insert(pattern.to_owned(), answer.clone());
+    });
+    answer
+}
+
+#[cfg(target_os = "linux")]
+fn fc_match_uncounted(pattern: &str) -> Option<(String, u32)> {
+    let output = std::process::Command::new("fc-match").args(["-f", "%{file}\n%{index}\n", pattern]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut lines = stdout.lines();
+    let file = lines.next()?.trim();
+    if file.is_empty() || !std::path::Path::new(file).is_file() {
+        return None;
+    }
+    // fontconfig stores a named instance in the high 16 bits (1-based, 0 = default) and the face
+    // index in the low 16. Both are kept: `try_load` splits them, and the instance is applied
+    // through `FontTweak::coords` so a variable font keeps the weight fontconfig matched.
+    let index = lines.next().and_then(|line| line.trim().parse().ok()).unwrap_or(0);
+    Some((file.to_owned(), index))
+}
+
+/// The installed faces, preferring fontconfig's list on Linux and falling back to the platform's
+/// font folders when fontconfig is unavailable or empty.
+fn scan_installed() -> Vec<Face> {
+    #[cfg(target_os = "linux")]
+    {
+        let faces = fontconfig_faces();
+        if !faces.is_empty() {
+            return faces;
+        }
+    }
+    scan_dirs(&system_font_dirs())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -238,7 +402,7 @@ static CATALOG: OnceLock<Vec<Face>> = OnceLock::new();
 
 /// The catalog of installed faces, scanned on first use. Blocks until the scan finishes.
 pub fn catalog() -> &'static [Face] {
-    CATALOG.get_or_init(|| scan_dirs(&system_font_dirs()))
+    CATALOG.get_or_init(scan_installed)
 }
 
 /// The catalog if the scan has finished, else `None` — never blocks, for use while painting.
@@ -311,6 +475,34 @@ fn installed_in(cat: &[Face], names: &[String]) -> Vec<String> {
     }
     out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
     out
+}
+
+/// The standard name `name` should be drawn with when it is not installed, resolved through
+/// fontconfig. Only the names Excel's font list offers are substituted: fontconfig answers for any
+/// string, so a typo would otherwise silently bind a random face.
+#[cfg(target_os = "linux")]
+pub fn substitute_family(name: &str) -> Option<String> {
+    if !crate::ribbon::FONTS.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    let cat = CATALOG.get()?;
+    if cat.iter().any(|f| f.answers_to(name)) {
+        return None; // the real font is installed: nothing to substitute
+    }
+    let (path, _) = fc_match(name)?;
+    let path = PathBuf::from(path);
+    let family = cat.iter().find(|f| f.path == path)?.family.clone();
+    if family.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    Some(family)
+}
+
+/// macOS and Windows resolve the standard names themselves (the core fonts ship with them, and
+/// Core Text and DirectWrite substitute where one is absent), so nothing extra is bound.
+#[cfg(not(target_os = "linux"))]
+pub fn substitute_family(_name: &str) -> Option<String> {
+    None
 }
 
 /// The font list a combo box shows: the standard [`crate::ribbon::FONTS`] names first (what Excel
@@ -464,6 +656,84 @@ mod tests {
         assert!(file_faces(b"ttcf\x00\x01\x00\x00\xff\xff\xff\xff").is_empty());
         assert!(file_faces(b"not a font at all").is_empty());
         assert!(file_faces(&[]).is_empty());
+    }
+
+    /// fontconfig weights follow the OpenType convention, not CSS numbers; `FC_WEIGHT_EXTRABOLD`
+    /// (205) needs its own point or it ties with Bold (#1231).
+    #[test]
+    fn fc_weight_maps_the_fontconfig_scale() {
+        assert_eq!(fc_weight(80), 400.0);
+        assert_eq!(fc_weight(200), 700.0);
+        assert_eq!(fc_weight(205), 800.0);
+        assert_eq!(fc_weight(180), 600.0);
+        assert_eq!(fc_weight(50), 300.0);
+        assert_eq!(fc_weight(9999), 900.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fontconfig_records_carry_family_style_and_slant() {
+        use crate::script::ScriptClass;
+        let bold = fontconfig_face(
+            b"/usr/share/fonts/x/NotoSans-Bold.ttf\t2\tNoto Sans\tNoto Sans,Noto Sans Bold\tBold\t200\t0\t20-7e 4e00-9fff 1f600-1f64f",
+        )
+        .expect("a concrete face");
+        assert_eq!(bold.family, "Noto Sans");
+        assert_eq!(bold.index, 2);
+        assert_eq!(bold.weight, 700.0);
+        assert!(!bold.italic);
+        assert!(bold.scripts.has(ScriptClass::Latin) && bold.scripts.has(ScriptClass::Han), "the charset names the scripts");
+        assert!(bold.scripts.has(ScriptClass::Symbols), "an emoji block covers the symbol samples");
+        assert!(!bold.scripts.has(ScriptClass::Thai), "a script absent from the charset stays out");
+        assert_eq!(bold.names, vec!["Noto Sans".to_string(), "Noto Sans Bold".to_string()]);
+
+        let italic =
+            fontconfig_face(b"/usr/share/fonts/x/NotoSans-Italic.ttf\t0\tNoto Sans\tNoto Sans\tItalic\t80\t100\t20-7e").expect("an italic face");
+        assert!(italic.italic);
+
+        // The variable font's default-instance range row has no style and is not a usable face.
+        assert!(fontconfig_face(b"/usr/share/fonts/x/NotoSans[wdth,wght].ttf\t0\tNoto Sans\tNoto Sans\t\t[80 200]\t0\t20-7e").is_none());
+        // Truncated records and non-font files are ignored.
+        assert!(fontconfig_face(b"/usr/share/fonts/x/NotoSans.ttf\t0\tNoto Sans").is_none());
+        assert!(fontconfig_face(b"/usr/share/fonts/x/README.txt\t0\tNoto Sans\tNoto Sans\tRegular\t80\t0\t20-7e").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fontconfig_faces_are_existing_supported_fonts() {
+        let faces = fontconfig_faces();
+        // A minimal container may not have fontconfig or any fonts; the folder scan is the
+        // fallback in that case. When fc-list does answer, every face must be usable.
+        if faces.is_empty() {
+            return;
+        }
+        assert!(faces.iter().all(|face| face.path.is_file() && is_font_path(&face.path)));
+        assert!(faces.iter().all(|face| (100.0..=900.0).contains(&face.weight)));
+        // `%{charset}` has to arrive for every record, so a Latin face says so.
+        assert!(faces.iter().any(|face| face.scripts.has(crate::script::ScriptClass::Latin)), "charset parsed");
+        let unique: HashSet<(&PathBuf, u32)> = faces.iter().map(|face| (&face.path, face.index)).collect();
+        assert_eq!(unique.len(), faces.len(), "fc-list duplicates are removed");
+    }
+
+    /// A standard Excel name that is not installed resolves through fontconfig to the family that
+    /// stands in for it; names outside the standard list never do, because fontconfig answers any
+    /// pattern and binding a misspelt name would hide the miss (#1231).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_standard_name_resolves_to_its_substitute_family() {
+        let cat = catalog();
+        assert_eq!(substitute_family("DejaVu Sans"), None, "only standard names are substituted");
+        assert_eq!(substitute_family("Grossly Missing Font"), None);
+        if cat.iter().any(|f| f.answers_to("Times New Roman")) {
+            return; // the real font is installed: nothing to substitute
+        }
+        // A container without fontconfig answers nothing, and the folder scan may find no
+        // substitute either; when fontconfig does answer, the substitute must be usable.
+        let Some(resolved) = substitute_family("Times New Roman") else { return };
+        assert!(!resolved.eq_ignore_ascii_case("Times New Roman"));
+        let faces = faces_of(&resolved);
+        assert!(!faces.is_empty(), "{resolved} is in the catalog");
+        assert!(faces.iter().any(|f| f.weight >= 600.0 && !f.italic), "the substitute has a bold face");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
