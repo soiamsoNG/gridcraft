@@ -566,7 +566,7 @@ fn font_definitions_impl(
     drop_unparseable_fonts(&mut fonts);
     // Only families egui still has data for count as bound (a dropped face can empty a chain).
     bound.retain(|f| fonts.families.get(&FontFamily::Name(f.as_str().into())).is_some_and(|c| !c.is_empty()));
-    crate::fonts::set_bound(bound);
+    crate::fonts::set_bound_for(&fonts, bound);
     fonts
 }
 

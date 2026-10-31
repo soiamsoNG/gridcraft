@@ -602,9 +602,9 @@ pub fn set_bound(keys: impl IntoIterator<Item = String>) {
 /// [`set_bound`] from a finished font set: only the roles the definitions actually carry are
 /// recorded, so a role the old set advertised and the new one dropped cannot be named.
 pub fn set_bound_for(defs: &egui::FontDefinitions, roles: Vec<String>) {
-    set_bound_for_roles(roles.into_iter().map(|role| {
+    set_bound_for_roles(roles.into_iter().filter_map(|role| {
         let present = defs.families.get(&egui::FontFamily::Name(role.as_str().into())).is_some_and(|c| !c.is_empty());
-        (role, present.then_some(None).flatten())
+        present.then_some((role, None))
     }));
 }
 
