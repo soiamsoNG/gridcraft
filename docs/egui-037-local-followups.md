@@ -87,6 +87,33 @@ including available-empty versus unavailable, stale epoch/serial deletion and co
 batches, composition ownership and two-surface isolation. Full CI07 is not a native IME or complete
 E21b/W27 acceptance result. No application-local API stub is introduced.
 
+### Grid-owned input method (2026-11-01, local)
+
+The single-clicked cell now receives a composition from its first key instead of typing that key as
+plain text (#1231). egui enables the platform input method only for a widget that publishes an
+`IMEOutput`, and a focused `TextEdit` was the sole producer, so a grid holding the keyboard never
+had one:
+
+- `SheetApp::ime_owner`/`ime_generation` (`crates/ui-egui/src/lib.rs`) plus
+  `grid::interact::publish_ime()` publish an `IMEOutput` for the active cell whenever the grid is the
+  focused widget, with a fresh context generation each time the grid takes the keyboard back from an
+  editor. The editor's own descriptor takes over as soon as an edit starts.
+- The composition stays with the grid: `grid::keyboard::ime_preedit()` keeps the string in
+  `SheetApp::ime_compose` and `QuadrantPaint::compose` paints it in the active cell; the commit opens
+  the edit with the finished word. Handing focus to an in-cell `TextEdit` mid-composition resets the
+  input context and drops the word typed so far (gtk#2636, nautilus#1168).
+- The native Wayland backend is the default (`apps/gridcraft/src/main.rs`); X11 is opt-in with
+  `GRIDCRAFT_X11=1`. Under XWayland the XIM path delivered neither preedit nor commit.
+
+Checked by hand on native Wayland with IBus and rime: click a cell, type — the first key starts the
+composition, the preedit is drawn in the cell and the commit lands there; double-click editing is
+unchanged. Automated coverage:
+`an_input_method_preedit_is_shown_without_opening_an_edit`,
+`a_later_commit_opens_the_edit_with_the_finished_word`,
+`a_commit_in_the_frame_the_edit_opens_types_the_text`, `an_input_method_commit_types_into_the_cell`
+and the binary's `backend_tests`. This is application evidence for the single-click path, not the
+full E21b matrix (formula bar, text boxes, stale-owner deletion and two-surface isolation remain).
+
 ## Review repair (2026-10-24)
 
 - `RequestPaintWhileHidden` is sent only for a queued/settling request that has a capturable size;
