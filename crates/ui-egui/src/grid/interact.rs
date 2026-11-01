@@ -568,6 +568,38 @@ fn handle_context_menu_and_keyboard(app: &mut SheetApp, input: &InteractionInput
         resp.request_focus();
     }
     keyboard(app, &ctx, resp, geo, sh);
+    publish_ime(app, &ctx, resp, geo, sh);
+}
+
+/// egui only lets the platform input method in for a widget that publishes an IME descriptor, and
+/// a focused `TextEdit` is the only widget that does. The grid holds the keyboard until an edit
+/// starts, so without this the first key of a composition arrives as plain text and the input
+/// method joins at the second one only (nautilus#1168, gtk#2636). Publish the active cell as the
+/// IME context while the grid owns the keyboard; the editor's own descriptor takes over after.
+fn publish_ime(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo: &Geo, sh: &Sheet) {
+    // Only while the grid is the widget with the keyboard: an open editor, a dialog or the name
+    // box publishes its own descriptor, and the platform must keep the input method on that one.
+    let owns_keyboard = ctx.memory(|m| m.focused()) == Some(resp.id) && app.editor.is_none() && app.text_box_editor.is_none() && app.dialog.is_none();
+    if !owns_keyboard || !ctx.input(|i| i.focused) {
+        // A text field owns the input method now. The grid asks for a fresh context when it gets
+        // the keyboard back, so no composition started in the editor is resumed in the grid.
+        app.ime_owner = None;
+        // A composition left over from a grid that no longer has the keys is stale.
+        app.ime_compose.clear();
+        return;
+    }
+    let Some(d) = app.session.active() else { return };
+    let rect = geo.mirror_rect(geo.cell_rect(sh, d.selection.active));
+    let caret = Rect::from_min_size(pos2(rect.left() + 2.0, rect.top() + 3.0), vec2(1.0, (rect.height() - 6.0).max(1.0)));
+    let owner = resp.id;
+    if app.ime_owner != Some(owner) {
+        app.ime_owner = Some(owner);
+        app.ime_generation = app.ime_generation.wrapping_add(1);
+    }
+    let generation = app.ime_generation;
+    ctx.output_mut(|o| {
+        o.ime = Some(egui::output::IMEOutput::new(owner, generation, egui::IMEPurpose::Normal, rect, caret));
+    });
 }
 
 fn handle_dragging(app: &mut SheetApp, input: &InteractionInput<'_>) {

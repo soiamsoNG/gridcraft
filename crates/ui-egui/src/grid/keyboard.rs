@@ -175,34 +175,22 @@ fn ime_events(app: &mut SheetApp, events: Vec<egui::Event>, shortcut_pressed: bo
     rest
 }
 
-/// Start an edit when an input method begins composing. The composition is not text yet, so the
-/// edit opens empty and the cell is replaced once something is committed; egui's `TextEdit` shows
-/// the preedit itself from the frame it takes focus (the frame after this one) (#1231).
+/// Show the input method's composition in the cell without opening an editor. Handing the keys to
+/// a `TextEdit` mid-composition resets the input context and loses the word typed so far, so the
+/// grid keeps the input method until the commit arrives (#1231).
 fn ime_preedit(app: &mut SheetApp, text: &str) {
-    if app.editor.is_none() && !text.is_empty() {
-        app.begin_edit(Some(String::new()), false);
-        if let Some(ed) = app.editor.as_mut() {
-            ed.caret = 0;
-            ed.anchor = 0;
-        }
+    if app.editor.is_none() {
+        app.ime_compose.clear();
+        app.ime_compose.push_str(text);
     }
 }
 
-/// Commit an input method's text. A `TextEdit` that already has focus inserts the commit itself;
-/// before then (the frame the edit opens) there is nobody else to do it, so it lands here.
+/// Commit an input method's text into a new edit at the cell, with the caret after it.
 fn ime_commit(app: &mut SheetApp, text: String) {
-    if let Some(ed) = app.editor.as_mut() {
-        // `request_focus` stays set until the editor widget runs: no `TextEdit` owns the keys yet.
-        if !ed.request_focus {
-            return;
-        }
-        let at = ed.text.char_indices().nth(ed.caret).map(|(i, _)| i).unwrap_or(ed.text.len());
-        ed.text.insert_str(at, &text);
-        ed.caret += text.chars().count();
-        ed.anchor = ed.caret;
-        ed.sync_caret = true;
+    if app.editor.is_some() {
         return;
     }
+    app.ime_compose.clear();
     app.begin_edit(Some(text), false);
     if let Some(ed) = app.editor.as_mut() {
         ed.caret = ed.text.chars().count();

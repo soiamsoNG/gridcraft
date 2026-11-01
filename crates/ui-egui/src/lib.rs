@@ -253,6 +253,16 @@ pub struct SheetApp {
     fonts_bold_scripts: crate::script::ScriptSet,
     /// The window's input method was enabled once; re-sending it every frame resets the composition.
     ime_allowed: bool,
+    /// Which widget the IME descriptor published last frame named (the grid), so a fresh context
+    /// generation is asked for whenever the grid gets the keyboard back (#1231).
+    pub(crate) ime_owner: Option<egui::Id>,
+    /// IME context generation: it changes when the grid takes the input method back from an editor,
+    /// never while it keeps it (egui rejects a stale owner/support pair).
+    pub(crate) ime_generation: u64,
+    /// The input method's unfinished composition, shown in the active cell until it is committed.
+    /// It is drawn in place of the cell's text, so the grid keeps the input method for the whole
+    /// composition instead of handing it to an editor mid-word (gtk#2636, nautilus#1168) (#1231).
+    pub ime_compose: String,
 
     /// Set while a font-set change is pending activation: the new set is live only from the next
     /// pass, so this frame keeps painting with the previous one (no blank frame).

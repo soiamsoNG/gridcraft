@@ -1,6 +1,6 @@
 use super::cell_paint::{
-    Look, MergedArea, cell_text_y, center_across_end, col32, display_text, ink_bottom_inset, look, merged_edges, paint_border, paint_cf_icon, painted_halign,
-    rotated_text_pos, shrink_font, wrapped_cell_text_y,
+    Look, MergedArea, cell_text_y, center_across_end, col32, display_text, ink_bottom_inset, look, merged_edges, paint_border, paint_cf_icon,
+    painted_halign, rotated_text_pos, shrink_font, wrapped_cell_text_y,
 };
 use super::geo::Geo;
 use super::tables::{filter_button_rect, paint_filter_button};
@@ -121,6 +121,8 @@ pub(crate) struct QuadrantPaint<'a> {
     pub(crate) cols: (u32, u32),
     pub(crate) cf: &'a mut CfCache,
     pub(crate) tokens: &'a Tokens,
+    /// An input method's unfinished composition, painted in place of the cell's own text (#1231).
+    pub(crate) compose: Option<(CellRef, &'a str)>,
 }
 
 /// Paint a worksheet quadrant, including backgrounds, borders, and text.
@@ -356,7 +358,10 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
     if paint_cell_decorations(q, c, *rect, lk, cfl.as_ref()) {
         return;
     }
-    let v = sh.value(c);
+    let mut v = sh.value(c);
+    if let Some((_, preedit)) = q.compose.filter(|(cc, _)| *cc == c) {
+        v = Value::Text(preedit.into());
+    }
     let mut text_left = rect.left();
     if let Some(l) = cfl
         && let Some((set, idx)) = &l.icon

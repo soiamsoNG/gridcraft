@@ -140,11 +140,7 @@ pub(crate) fn ink_bottom_inset(galley: &egui::Galley) -> f32 {
             ink_bottom = ink_bottom.max(bottom);
         }
     }
-    if ink_bottom.is_finite() {
-        (galley.size().y - ink_bottom).max(0.0)
-    } else {
-        0.0
-    }
+    if ink_bottom.is_finite() { (galley.size().y - ink_bottom).max(0.0) } else { 0.0 }
 }
 
 /// What share of the space below the ink is kept as a gap: the rest of the font's descent is taken
