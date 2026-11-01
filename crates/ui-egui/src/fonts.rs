@@ -576,10 +576,18 @@ pub fn role_key(family: &str, bold: bool, italic: bool) -> String {
 
 /// The face to use for a role, or `None` when the family has no faces. Missing bold/italic faces
 /// fall back to the family's regular face, so every bound role has data behind it.
+///
+/// Within the faces that match a role, the one nearest the role's weight wins rather than the first
+/// one the host lists: most families carry a Semibold between Regular and Bold, and for italic a
+/// thin or light cut is a different design, not a slanted regular.
 fn pick_face(faces: &[Face], bold: bool, italic: bool) -> Option<&Face> {
     let regular = || faces.iter().find(|f| !f.italic && (f.weight - 400.0).abs() < 1.0);
     let exact = |wanted_bold: bool, wanted_italic: bool| {
-        faces.iter().find(|f| f.italic == wanted_italic && if wanted_bold { f.weight >= 600.0 } else { f.weight < 600.0 })
+        let target = if wanted_bold { 700.0 } else { 400.0 };
+        faces
+            .iter()
+            .filter(|f| f.italic == wanted_italic && (f.weight >= 600.0) == wanted_bold)
+            .min_by(|a, b| (a.weight - target).abs().total_cmp(&(b.weight - target).abs()))
     };
     (match (bold, italic) {
         (true, true) => exact(true, true).or_else(|| exact(true, false)).or_else(|| exact(false, true)),
@@ -987,6 +995,29 @@ mod tests {
         let coverage = italic_coverage(&real).flatten().expect("italic role");
         assert!(coverage.has(crate::script::ScriptClass::Latin), "the real italic face draws Latin");
         assert!(!coverage.has(crate::script::ScriptClass::Han), "Han has no italic face, so it is slanted");
+    }
+
+    #[test]
+    fn a_role_takes_the_face_nearest_its_weight() {
+        // Many families ship a Semibold between Regular and Bold, and a Light Italic next to an
+        // Italic; picking the first match drew bold text in Semibold (#1231).
+        let mut faces = vec![
+            face("Noto Sans", &["Noto Sans"], "/f/regular.ttf", 400.0),
+            face("Noto Sans", &["Noto Sans"], "/f/semibold.ttf", 600.0),
+            face("Noto Sans", &["Noto Sans"], "/f/bold.ttf", 700.0),
+        ];
+        let bold = pick_face(&faces, true, false).map(|f| f.path.to_string_lossy().to_string());
+        assert_eq!(bold.as_deref(), Some("/f/bold.ttf"));
+
+        let mut italic =
+            vec![face("Noto Sans", &["Noto Sans"], "/f/italic.ttf", 400.0), face("Noto Sans", &["Noto Sans"], "/f/light-italic.ttf", 300.0)];
+        italic[0].italic = true;
+        italic[1].italic = true;
+        let slanted = pick_face(&italic, false, true).map(|f| f.path.to_string_lossy().to_string());
+        assert_eq!(slanted.as_deref(), Some("/f/italic.ttf"));
+
+        faces.clear();
+        assert!(pick_face(&faces, true, false).is_none(), "a family with no faces picks nothing");
     }
 
     fn face(family: &str, names: &[&str], path: &str, weight: f32) -> Face {
