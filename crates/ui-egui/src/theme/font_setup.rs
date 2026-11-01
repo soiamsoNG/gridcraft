@@ -546,16 +546,22 @@ fn font_definitions_impl(
     // Bold script faces, for the scripts the workbook actually sets in bold.
     let bold_sans = if system { font_fallback::load_bold_script_faces(&mut fonts, bold_scripts, false) } else { Vec::new() };
     let bold_serif = if system && want_serif { font_fallback::load_bold_script_faces(&mut fonts, bold_scripts, true) } else { Vec::new() };
+    // A bold role wants the bold script faces, but only some scripts have one this host can read
+    // (a variable collection's bold is a named instance `try_load` refuses). Keep the regular
+    // faces behind them: a script without a bold face then draws at regular weight instead of
+    // tofu (#1231).
+    let bold_role_fallback = with_regular_faces(&bold_sans, &fallback);
+    let bold_role_serif = with_regular_faces(&bold_serif, &serif_fallback);
     let hack = fonts.font_data.contains_key(HACK).then_some(HACK);
     for role in [UI, UI_BOLD, CELL, CELL_BOLD, CELL_ITALIC, CELL_BOLD_ITALIC, SERIF, MONO, MATH, MATH_ITALIC, MATH_BOLD] {
         // A bold role takes the bold script faces: a Calibri cell draws its Latin in Carlito Bold,
         // so its Han has to come from a bold CJK face or half the cell stays regular.
         let role_fallback = if role == SERIF && want_serif {
             &serif_fallback
-        } else if matches!(role, UI_BOLD | CELL_BOLD | CELL_BOLD_ITALIC) && !bold_sans.is_empty() {
-            &bold_sans
-        } else if matches!(role, UI_BOLD | CELL_BOLD | CELL_BOLD_ITALIC) && !bold_serif.is_empty() {
-            &bold_serif
+        } else if matches!(role, UI_BOLD | CELL_BOLD | CELL_BOLD_ITALIC) && !bold_role_fallback.is_empty() {
+            &bold_role_fallback
+        } else if matches!(role, UI_BOLD | CELL_BOLD | CELL_BOLD_ITALIC) && !bold_role_serif.is_empty() {
+            &bold_role_serif
         } else {
             &fallback
         };
@@ -625,6 +631,19 @@ pub fn merge_fonts(new: &mut FontDefinitions, old: &FontDefinitions) {
 /// Builds one role family's chain: the loaded system face (or its role fallback), egui's bundled
 /// proportional/monospace base, Hack's symbols, then the script fallbacks. Keys without font data
 /// are dropped, as before.
+/// The bold script faces followed by the regular ones. A host often has a bold face for some
+/// scripts only — a variable collection's bold is a named instance `try_load` refuses — and a
+/// bold role that listed just the bold faces would draw those scripts as tofu (#1231).
+fn with_regular_faces(bold: &[String], regular: &[String]) -> Vec<String> {
+    let mut keys = bold.to_vec();
+    for key in regular {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    keys
+}
+
 fn build_role_chain(
     fonts: &mut FontDefinitions,
     role: &str,
@@ -742,6 +761,16 @@ mod font_binding_tests {
         let FontFamily::Name(fallback) = cell_family("Ubuntu", false, true) else { panic!("should name a family") };
         assert!(crate::fonts::is_bound(&fallback), "the fallback is a bound role");
         crate::fonts::set_bound(always_bound());
+    }
+
+    #[test]
+    fn a_bold_role_keeps_the_regular_faces_behind_its_bold_ones() {
+        // Bold script faces come first, but the regular ones stay in the chain: without them a
+        // script whose bold face is unreadable would have no face at all and draw tofu (#1231).
+        let bold = vec!["sys-script-han-bold".to_string(), "sys-script-arabic-bold".to_string()];
+        let regular = vec!["sys-script-arabic-bold".to_string(), "sys-cjk-han-zh".to_string(), "sys-thai".to_string()];
+        assert_eq!(with_regular_faces(&bold, &regular), ["sys-script-han-bold", "sys-script-arabic-bold", "sys-cjk-han-zh", "sys-thai"]);
+        assert_eq!(with_regular_faces(&[], &regular), regular);
     }
 
     #[test]
