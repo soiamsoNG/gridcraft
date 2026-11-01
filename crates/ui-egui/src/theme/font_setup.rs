@@ -131,9 +131,14 @@ pub(crate) fn font_parses(bytes: &[u8], index: u32) -> bool {
 /// skipped with a warning and the next candidate is tried.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn try_load(paths: &[(&str, u32)]) -> Option<FontData> {
-    for (p, index) in paths {
-        if let Some(blob) = font_file(p, *index) {
-            let mut fd = FontData::from_blob(blob, *index);
+    for (p, raw) in paths {
+        // fontconfig packs a named instance into the high 16 bits; egui's face index is the low one.
+        let (index, instance) = crate::fonts::fc_index_parts(*raw);
+        if let Some(blob) = font_file(p, index) {
+            let mut fd = FontData::from_blob(blob, index);
+            if let Some(instance) = instance {
+                crate::fonts::apply_named_instance(&mut fd, instance);
+            }
             // A script face is a fallback in the workbook families that lack its script; without
             // this it is centred in their row instead of sitting on their baseline (#1231).
             crate::fonts::align_fallback(&mut fd, p);
