@@ -142,6 +142,19 @@ full E21b matrix (formula bar, text boxes, stale-owner deletion and two-surface 
   `a_serif_family_reaches_the_serif_script_faces` and `a_sans_family_keeps_the_sans_script_faces`
   cover the rule.
 
+## Middle alignment centres the ink (2026-11-01, local)
+
+- `cell_text_y()`/`wrapped_cell_text_y()` centred the *line box*. A mixed-script line is taller
+  than its row because the fallback faces are put on the baseline (#1231), so the box carries an
+  ascent no glyph fills; centring it left the glyphs hanging on the bottom border, and rows 3/4 of
+  `font-cases.xlsx` (italic and bold italic) were clipped by the cell below.
+- `ink_insets()` now measures how far the ink starts below the galley top and ends above its bottom
+  (it used to return only the bottom), and Middle centres `ink_top..ink_bottom` in the cell. Top and
+  Bottom keep their rules, including `BOTTOM_TRAIL`.
+- Measured on `font-cases.xlsx` through the offscreen snapshot: rows 3/4 went from 10 px/1 px and
+  7 px/1 px (top/bottom gaps) to 7 px/4 px and 4 px/4 px. `centre_puts_the_ink_in_the_middle_of_the_row`
+  covers it.
+
 ## Right-to-left text right aligns under General (2026-11-01, local)
 
 - epaint 0.37 already lays right-to-left text out correctly (`BidiLevels` plus
