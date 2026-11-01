@@ -368,6 +368,10 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
         s.text_styles.insert(egui::TextStyle::Small, ui_font(11.0));
         s.text_styles.insert(egui::TextStyle::Heading, ui_bold(18.0));
         s.text_styles.insert(egui::TextStyle::Monospace, FontId::new(12.0, FontFamily::Name(MONO.into())));
+        // Sub-pixel binning keeps one bitmap per glyph and quarter-pixel offset, which evens out
+        // kerning but softens every edge (#1231). Hinting stays on: it is what makes small text
+        // crisp, and epaint's own docs call binning the blurrier of the two.
+        s.visuals.text_options.subpixel_binning = false;
     });
 }
 
