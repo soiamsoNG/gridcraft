@@ -157,6 +157,21 @@ full E21b matrix (formula bar, text boxes, stale-owner deletion and two-surface 
   left-to-right paragraph direction. `the_first_strong_character_decides_the_direction` and
   `general_alignment_follows_the_text_direction` cover the rule.
 
+Still open — the per-cell `readingOrder`:
+
+- Excel's `<alignment readingOrder="1|2">` forces a paragraph's base direction (`1` left to right,
+  `2` right to left) regardless of its first character, and an absent value inherits the sheet
+  direction. GridCraft has neither field nor round trip: `Alignment` in `crates/model/src/style.rs`
+  is `{ h, v, wrap, shrink, indent, rotation }`, and `crates/xlsx` ignores the attribute on read and
+  write.
+- Only the sheet level works today: `Sheet::right_to_left` is read from `<sheetView
+  rightToLeft="1">`, written back, and mirrored by `Geo::rtl`.
+- Closing it means three pieces: an `Alignment` field plus its XLSX read/write (and the XLS
+  equivalent), `general_halign()` preferring the forced direction over `script::is_rtl(text)`, and
+  `LayoutJob::direction` set to `Ltr`/`Rtl` instead of `Auto` so mixed runs keep the forced base
+  direction. Until then a cell whose text starts with Latin stays left to right even when the user
+  asks Excel for right to left.
+
 ## Review repair (2026-10-24)
 
 - `RequestPaintWhileHidden` is sent only for a queued/settling request that has a capturable size;
