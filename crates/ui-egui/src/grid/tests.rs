@@ -482,3 +482,25 @@ fn only_the_scripts_beyond_the_italic_face_are_slanted() {
     assert!(job.sections.iter().all(|s| s.format.italics), "no italic file, so every run is slanted");
     crate::fonts::set_bound([]);
 }
+
+#[test]
+fn a_family_the_font_set_lacks_still_lays_out() {
+    // A font set replaced between frames can leave a family name unbound; epaint panics on that,
+    // so the cell text has to be laid out in the default family instead (#1231, never-crash).
+    let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::fonts::set_bound(Vec::new());
+    let ctx = egui::Context::default();
+    ctx.set_fonts(crate::theme::pinned_font_definitions());
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let job = egui::text::LayoutJob::simple(
+            "hi".to_owned(),
+            egui::FontId::new(14.0, egui::FontFamily::Name("not-a-bound-family".into())),
+            egui::Color32::BLACK,
+            f32::INFINITY,
+        );
+        let galley = super::quadrant::layout_job_or_default(&painter, job);
+        assert!(galley.size().x > 0.0, "the fallback laid the text out");
+    });
+    out.textures_delta.clear();
+}

@@ -245,7 +245,16 @@ pub(super) fn merged_edges(wb: &Workbook, si: usize, sh: &Sheet, geo: &Geo, area
 /// The smaller font that makes `text` fit in `room` points of width (Shrink to fit), or `None`
 /// when it already fits at its own size.
 pub(super) fn shrink_font(p: &Painter, text: &str, font: &FontId, room: f32) -> Option<FontId> {
-    let natural = p.layout_no_wrap(text.to_string(), font.clone(), Color32::PLACEHOLDER).size().x;
+    // A family the current font set no longer carries would panic here; measuring the default
+    // family instead keeps the cell drawing and the run alive (#1231, never-crash).
+    let natural =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.layout_no_wrap(text.to_string(), font.clone(), Color32::PLACEHOLDER))) {
+            Ok(galley) => galley.size().x,
+            Err(_) => {
+                log::warn!("a cell font could not be measured; measuring the default family");
+                p.layout_no_wrap(text.to_string(), FontId::new(font.size, egui::FontFamily::Proportional), Color32::PLACEHOLDER).size().x
+            }
+        };
     let room = room.max(1.0);
     if natural.is_nan() || natural <= room {
         return None;
