@@ -311,12 +311,38 @@ fn an_input_method_commit_types_into_the_cell() {
 }
 
 #[test]
-fn an_input_method_preedit_starts_the_edit() {
-    // Before the in-cell editor has focus, a composition has to open the edit with its text;
-    // once it is open, egui's `TextEdit` owns the composition and shows it.
+fn an_input_method_preedit_starts_an_empty_edit() {
+    // A composition is not text yet: it must not be typed into the cell. The edit opens empty and
+    // egui's `TextEdit` shows the preedit itself once it has focus.
     let mut h = harness(book("B2"));
     h.input_mut().events.push(Event::Ime(egui::ImeEvent::Preedit { text: "zhong".into(), active_range_chars: None }));
     h.run_steps(2);
     let ed = h.state().editor.as_ref().expect("a composition starts an edit");
-    assert!(ed.text.starts_with("zhong"), "{:?}", ed.text);
+    assert_eq!(ed.text, "");
+    assert_eq!(ed.caret, 0);
+}
+
+#[test]
+fn a_later_commit_is_typed_by_the_editor() {
+    // Once the in-cell `TextEdit` has focus it owns IME events, so it inserts the commit itself.
+    let mut h = harness(book("B2"));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Preedit { text: "nihao".into(), active_range_chars: None }));
+    h.run_steps(2);
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Commit("你好".into())));
+    h.run_steps(2);
+    let ed = h.state().editor.as_ref().expect("the composition started an edit");
+    assert_eq!(ed.text, "你好");
+}
+
+#[test]
+fn a_commit_in_the_frame_the_edit_opens_types_the_text() {
+    // The input method can commit before the editor widget has run and taken focus: nothing else
+    // would insert the text, so the grid does it (a preedit opened the edit just before).
+    let mut h = harness(book("B2"));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Preedit { text: "nihao".into(), active_range_chars: None }));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Commit("你好".into())));
+    h.run_steps(2);
+    let ed = h.state().editor.as_ref().expect("the composition started an edit");
+    assert_eq!(ed.text, "你好");
+    assert_eq!(ed.caret, 2);
 }

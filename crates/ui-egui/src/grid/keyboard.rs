@@ -38,6 +38,7 @@ pub(super) fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Res
         matches!(e, egui::Event::Key { pressed: true, modifiers: m, key, .. }
             if !m.alt && (m.ctrl || m.command || (m.shift && *key == egui::Key::Space)))
     });
+    let events = ime_events(app, events, shortcut_pressed);
     let page = ((geo.cells.height() / geo.z) / sh.default_row_height).floor().max(1.0) as i64;
     // Alt shortcuts type their character too on Windows and Linux (Alt+= sends Text("=")): once
     // a shortcut ran, that text must not start an edit over what it just did.
@@ -60,17 +61,6 @@ pub(super) fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Res
             // insert text at, so a middle click on a cell is deliberately not a paste.
             egui::Event::MiddleClickPaste { .. } => {}
             egui::Event::Text(_) if shortcut_pressed || shortcut_ran => {}
-            // An input method (ibus, fcitx, a native IME) commits finished text as one string: it
-            // never arrives as `Text`, so without this a Chinese or Japanese keyboard types nothing.
-            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
-                ime_preedit(app, &text);
-                return;
-            }
-            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !shortcut_pressed && !text.is_empty() => {
-                ime_commit(app, text);
-                return;
-            }
-            egui::Event::Ime(_) => {}
             egui::Event::Text(text) if text.chars().all(|c| !c.is_control()) && !text.is_empty() => {
                 app.begin_edit(Some(text), false);
                 if let Some(ed) = app.editor.as_mut() {
@@ -169,21 +159,53 @@ pub(super) fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Res
     }
 }
 
-/// Start an edit with the text an input method is composing. Once the in-cell editor has focus,
-/// egui's `TextEdit` owns IME events (composition, commit) and shows the preedit itself (#1231).
+/// Handles an input method's events, if the frame has any, and returns the events the grid still
+/// owns. A preedit opens the edit and a commit is its text; the rest of that frame belongs to the
+/// editor, not the grid.
+fn ime_events(app: &mut SheetApp, events: Vec<egui::Event>, shortcut_pressed: bool) -> Vec<egui::Event> {
+    let Some(at) = events.iter().position(|e| matches!(e, egui::Event::Ime(_))) else { return events };
+    let mut rest = events;
+    for ev in rest.split_off(at) {
+        match ev {
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => ime_preedit(app, &text),
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !shortcut_pressed && !text.is_empty() => ime_commit(app, text),
+            _ => {}
+        }
+    }
+    rest
+}
+
+/// Start an edit when an input method begins composing. The composition is not text yet, so the
+/// edit opens empty and the cell is replaced once something is committed; egui's `TextEdit` shows
+/// the preedit itself from the frame it takes focus (the frame after this one) (#1231).
 fn ime_preedit(app: &mut SheetApp, text: &str) {
     if app.editor.is_none() && !text.is_empty() {
-        app.begin_edit(Some(text.to_string()), false);
+        app.begin_edit(Some(String::new()), false);
+        if let Some(ed) = app.editor.as_mut() {
+            ed.caret = 0;
+            ed.anchor = 0;
+        }
     }
 }
 
-/// Commit an input method's text when no editor has focus yet: there is no `TextEdit` to insert it.
+/// Commit an input method's text. A `TextEdit` that already has focus inserts the commit itself;
+/// before then (the frame the edit opens) there is nobody else to do it, so it lands here.
 fn ime_commit(app: &mut SheetApp, text: String) {
-    if app.editor.is_none() {
-        app.begin_edit(Some(text), false);
-        if let Some(ed) = app.editor.as_mut() {
-            ed.caret = ed.text.chars().count();
-            ed.anchor = ed.caret;
+    if let Some(ed) = app.editor.as_mut() {
+        // `request_focus` stays set until the editor widget runs: no `TextEdit` owns the keys yet.
+        if !ed.request_focus {
+            return;
         }
+        let at = ed.text.char_indices().nth(ed.caret).map(|(i, _)| i).unwrap_or(ed.text.len());
+        ed.text.insert_str(at, &text);
+        ed.caret += text.chars().count();
+        ed.anchor = ed.caret;
+        ed.sync_caret = true;
+        return;
+    }
+    app.begin_edit(Some(text), false);
+    if let Some(ed) = app.editor.as_mut() {
+        ed.caret = ed.text.chars().count();
+        ed.anchor = ed.caret;
     }
 }
