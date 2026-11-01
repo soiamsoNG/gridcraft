@@ -233,6 +233,23 @@ fn icon() -> Option<egui::IconData> {
     Some(egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() })
 }
 
+/// Which window system to ask winit for on Linux.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    X11,
+}
+
+/// `Some(X11)` when the X11 backend has to be forced: `GRIDCRAFT_X11=1`, or no Wayland socket to
+/// use. Otherwise `None`, which leaves winit's default (Wayland in a Wayland session).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn backend(wayland: Option<&std::ffi::OsStr>, display: Option<&std::ffi::OsStr>, force_x11: Option<&std::ffi::OsStr>) -> Option<Backend> {
+    let forced = force_x11.is_some_and(|v| !v.is_empty() && v != "0");
+    let has_wayland = wayland.is_some_and(|v| !v.is_empty());
+    let has_x11 = display.is_some_and(|v| !v.is_empty());
+    (has_x11 && (forced || !has_wayland)).then_some(Backend::X11)
+}
+
 fn main() -> eframe::Result<()> {
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
@@ -346,11 +363,14 @@ fn main() -> eframe::Result<()> {
     // Intel Macs: Metal's compiler aborts on wgpu's indirect-validation shaders (see graphics.rs).
     #[cfg(target_os = "macos")]
     graphics::configure_indirect_validation(&mut options, graphics::skips_indirect_validation(true, cfg!(target_arch = "x86_64")));
-    // winit has no file drag-and-drop on Wayland (only on X11), so dropping files from the file
-    // manager showed a "no" cursor. Run through XWayland when it's there; GRIDCRAFT_WAYLAND=1
-    // keeps the native Wayland backend.
+    // Wayland is the default in a Wayland session: winit's X11 backend talks to input methods
+    // through XIM, which does not deliver composition or commits here, so typing in a cell stayed
+    // Latin-only under XWayland. X11 is still what we fall back to when no Wayland socket is
+    // available, and GRIDCRAFT_X11=1 forces it — winit only drags and drops files on X11.
     #[cfg(all(unix, not(target_os = "macos")))]
-    if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) && std::env::var_os("GRIDCRAFT_WAYLAND").is_none() {
+    if backend(std::env::var_os("WAYLAND_DISPLAY").as_deref(), std::env::var_os("DISPLAY").as_deref(), std::env::var_os("GRIDCRAFT_X11").as_deref())
+        == Some(Backend::X11)
+    {
         options.event_loop_builder = Some(Box::new(|b| {
             use winit::platform::x11::EventLoopBuilderExtX11;
             b.with_x11();
@@ -419,6 +439,36 @@ fn main() -> eframe::Result<()> {
         return run(options);
     }
     result
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod backend_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn a_wayland_session_keeps_the_native_backend() {
+        // Wayland is what delivers input-method commits, so it wins over X11 when both are there.
+        assert_eq!(backend(Some(OsStr::new("wayland-0")), Some(OsStr::new(":0")), None), None);
+    }
+
+    #[test]
+    fn an_x11_session_uses_x11() {
+        assert_eq!(backend(None, Some(OsStr::new(":0")), None), Some(Backend::X11));
+        assert_eq!(backend(Some(OsStr::new("")), Some(OsStr::new(":0")), None), Some(Backend::X11));
+    }
+
+    #[test]
+    fn gridcraft_x11_forces_the_x11_backend_for_drag_and_drop() {
+        assert_eq!(backend(Some(OsStr::new("wayland-0")), Some(OsStr::new(":0")), Some(OsStr::new("1"))), Some(Backend::X11));
+        // An explicit "off" (or an empty value) is not a force.
+        assert_eq!(backend(Some(OsStr::new("wayland-0")), Some(OsStr::new(":0")), Some(OsStr::new("0"))), None);
+    }
+
+    #[test]
+    fn no_display_at_all_leaves_the_choice_to_winit() {
+        assert_eq!(backend(None, None, Some(OsStr::new("1"))), None);
+    }
 }
 
 #[cfg(test)]
