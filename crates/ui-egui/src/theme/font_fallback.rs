@@ -155,19 +155,29 @@ pub(super) fn load_bold_script_faces(fonts: &mut FontDefinitions, wanted_bold: S
         if script == ScriptClass::Latin || !wanted_bold.intersects(ScriptSet::EMPTY.with(script)) {
             continue;
         }
-        let Some(entry) = catalog.font_for_script(script, serif, true) else { continue };
-        if entry.weight < 600.0 {
+        let Some(preferred) = catalog.font_for_script(script, serif, true) else { continue };
+        if preferred.weight < 600.0 {
             continue; // no bold face for this script on this host
         }
-        let path = entry.path.to_string_lossy().into_owned();
-        if loaded.contains(&path) {
-            continue; // one file, several scripts
-        }
-        let Some(fd) = try_load(&[(path.as_str(), entry.index)]) else { continue };
+        // The best ranked face may be one egui cannot read (a variable collection's bold is a
+        // named instance), while the same family also ships a static bold file (#1231). Try the
+        // other bold faces before giving up on this script.
+        let others = catalog.entries().iter().filter(|entry| {
+            entry.weight >= 600.0 && entry.serif == serif && entry.path != preferred.path && entry.scripts.intersects(ScriptSet::EMPTY.with(script))
+        });
+        let Some((entry, fd)) = std::iter::once(preferred).chain(others).find_map(|entry| {
+            let path = entry.path.to_string_lossy().into_owned();
+            if loaded.contains(&path) {
+                return None; // one file, several scripts
+            }
+            try_load(&[(path.as_str(), entry.index)]).map(|fd| (entry, fd))
+        }) else {
+            continue;
+        };
         let key = format!("sys-script-{}-bold{}", script.name(), if serif { "-serif" } else { "" });
         fonts.font_data.insert(key.clone(), Arc::new(fd));
         keys.push(key);
-        loaded.push(path);
+        loaded.push(entry.path.to_string_lossy().into_owned());
     }
     keys
 }

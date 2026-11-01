@@ -114,6 +114,20 @@ unchanged. Automated coverage:
 and the binary's `backend_tests`. This is application evidence for the single-click path, not the
 full E21b matrix (formula bar, text boxes, stale-owner deletion and two-surface isolation remain).
 
+## Bold cells in non-Latin scripts (2026-11-01, local)
+
+- A bold role's chain is the family's bold face, then the `sys-script-*-bold` faces, then the
+  regular script faces. A host with a bold face for a few scripts only keeps drawing the others at
+  regular weight instead of tofu (`fonts::bind_faces`, `theme::font_setup::with_regular_faces`).
+- fontconfig often ranks a variable collection's bold — a named instance `try_load` refuses —
+  above the same family's static bold file, so `theme::font_fallback::load_bold_script_faces` walks
+  the other bold faces covering that script until one parses: `NotoSansCJK-Bold.ttc` is reached even
+  though `NotoSansCJK-VF.ttc` ranks first.
+- Checked with `~/文档/混合输入.xlsx` (regular / bold / italic / bold italic rows of
+  `Hello 中文 العربية ไทย हिन्दी বাংলা አማርኛ 日本語 한국어`, 18 pt). Rows 2 and 4 drew tofu before the
+  repair and now draw every script in bold.
+  `a_bold_role_keeps_the_regular_faces_behind_its_bold_ones` covers the chain rule.
+
 ## Review repair (2026-10-24)
 
 - `RequestPaintWhileHidden` is sent only for a queued/settling request that has a capturable size;
