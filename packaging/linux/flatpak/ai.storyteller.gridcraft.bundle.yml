@@ -91,6 +91,18 @@ modules:
           - '  esac'
           - 'fi'
           - 'exec "/app/libexec/cups/${0##*/}" "$@"'
+  # Font configuration only; the faces themselves come from the runtime or the host
+  # (/run/host/fonts). See fontconfig/70-noto-cjk.conf.
+  - name: fontconfig
+    buildsystem: simple
+    build-commands:
+      - install -pDm644 fonts.conf /app/etc/fonts/local.conf
+      - install -pDm644 65-lang.conf 70-noto-cjk.conf 75-noto-color-emoji.conf -t /app/etc/fonts/conf.d/
+      - fc-cache -fsv || true
+    sources:
+      - type: dir
+        path: fontconfig
+
   - name: gridcraft
     buildsystem: simple
     build-commands:
