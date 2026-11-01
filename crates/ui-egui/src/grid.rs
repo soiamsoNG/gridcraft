@@ -36,7 +36,7 @@ mod tables;
 
 pub(crate) use cell_paint::paint_border;
 #[cfg(test)]
-pub(crate) use cell_paint::{cell_text_y, rotated_text_pos, wrapped_cell_text_y};
+pub(crate) use cell_paint::{Ink, cell_text_y, rotated_text_pos, wrapped_cell_text_y};
 #[cfg(test)]
 use cell_paint::{center_across_end, display_text, general_halign, look, numfmt_color, painted_halign};
 pub use editor::validation_arrow;

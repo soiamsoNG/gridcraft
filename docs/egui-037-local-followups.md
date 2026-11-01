@@ -155,6 +155,23 @@ full E21b matrix (formula bar, text boxes, stale-owner deletion and two-surface 
   7 px/1 px (top/bottom gaps) to 7 px/4 px and 4 px/4 px. `centre_puts_the_ink_in_the_middle_of_the_row`
   covers it.
 
+## Top alignment starts the ink at the cell edge (2026-11-01, local)
+
+- `cell_text_y()`/`wrapped_cell_text_y()` placed the *line box* one pixel below the cell edge. The
+  box carries the ascent of the tallest fallback face (#1231), so `VAlign::Top` left a gap that grew
+  with the font: 4 px at 11 pt, 9 px at 18 pt, 15 px at 30 pt on a mixed-script line.
+- Top now starts the *ink* `2 px` below the edge (`ink.top` subtracted), like Middle centres it, so
+  every size starts at the same place. Bottom and the `BOTTOM_TRAIL` rule are unchanged.
+- The first attempt subtracted the unfilled ascent (`font_face_ascent - font_ascent`) instead. A
+  probe on real galleys showed `ink.top` already contains that growth (4 px for `Hello` and for
+  `中文 한글 العربية` alike), so subtracting it again pushed the glyphs over the top border. Because
+  the ink is a per-glyph measurement, a line of short letters without ascenders sits up to 3 px
+  higher than one with them at 30 pt; that is glyph shape, not a font metric.
+- Checked on `/tmp/opencode/top.xlsx` (rows of `Hello` and `中文 한글 العربية` at 11/18/30 pt, Top
+  alignment, 60 px rows) through the offscreen snapshot: all three sizes start 2 px below the edge
+  and nothing is cut. `top_starts_the_ink_at_the_cell_edge` and the rewritten
+  `cell_text_y_moves_monotonically_in_standard_and_tall_rows` cover the rule.
+
 ## Right-to-left text right aligns under General (2026-11-01, local)
 
 - epaint 0.37 already lays right-to-left text out correctly (`BidiLevels` plus
