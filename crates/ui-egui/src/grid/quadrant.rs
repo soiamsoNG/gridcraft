@@ -11,6 +11,54 @@ use super::{
 
 /// Lay out cell text with the renderer's slant only where the family's real italic face cannot
 /// draw the script: a Latin-only italic leaves Han upright unless it is slanted here (#1231).
+/// The font to lay out with: egui's proportional family when the current font set no longer names
+/// the cell's family. A font set replaced between frames can leave a role unbound, and epaint
+/// panics on a family it has no data for; the registry we publish with each set answers in O(1)
+/// where asking egui would need a lock and a list (#1231, never-crash).
+fn bound_font(font: FontId) -> FontId {
+    match &font.family {
+        egui::FontFamily::Name(name) if !crate::fonts::is_bound(name) => FontId::new(font.size, egui::FontFamily::Proportional),
+        _ => font,
+    }
+}
+
+/// Lays a cell's text out, and lays it out in the default family if epaint panics because the
+/// family is not in the current font set (a set replaced between frames can leave a name unbound).
+/// A cell must draw something, and a panic here would end the run (#1231, never-crash).
+pub(super) fn layout_job_or_default(p: &egui::Painter, mut job: egui::text::LayoutJob) -> std::sync::Arc<egui::Galley> {
+    for section in &mut job.sections {
+        section.format.font_id = bound_font(section.format.font_id.clone());
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.layout_job(job.clone()))) {
+        Ok(galley) => galley,
+        Err(_) => {
+            log::warn!(
+                "cell text could not be laid out in {:?}; drawing it in the default family",
+                job.sections.first().map(|s| &s.format.font_id.family)
+            );
+            let mut job = job;
+            for section in &mut job.sections {
+                section.format.font_id.family = egui::FontFamily::Proportional;
+            }
+            p.layout_job(job)
+        }
+    }
+}
+
+/// The one-line form of [`layout_job_or_default`].
+pub(super) fn layout_no_wrap_or_default(p: &egui::Painter, text: String, font: FontId, color: Color32) -> std::sync::Arc<egui::Galley> {
+    let fallback = text.clone();
+    let size = font.size;
+    let font = bound_font(font);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.layout_no_wrap(text, font, color))) {
+        Ok(galley) => galley,
+        Err(_) => {
+            log::warn!("cell text could not be laid out; drawing it in the default family");
+            p.layout_no_wrap(fallback, FontId::new(size, egui::FontFamily::Proportional), color)
+        }
+    }
+}
+
 pub(super) fn cell_job(text: String, font: FontId, color: Color32, wrap: f32, italic: bool) -> egui::text::LayoutJob {
     let Some(coverage) = italic.then(|| crate::fonts::italic_coverage(&font.family)).flatten() else {
         return egui::text::LayoutJob::simple(text, font, color, wrap);
@@ -383,7 +431,7 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
     let font = FontId::new(size, fam);
     let italic = st.font.italic;
     // Digits fit by the cell's own font and size, not the default 11pt (9pt marks in narrow columns).
-    let char_w = p.layout_no_wrap("0".to_string(), font.clone(), Color32::PLACEHOLDER).size().x.max(1.0);
+    let char_w = layout_no_wrap_or_default(p, "0".to_string(), font.clone(), Color32::PLACEHOLDER).size().x.max(1.0);
     let avail_w = rect.right() - text_left;
     let (mut text, ncolor, numeric, fill_char) = display_text(wb, sh, c, &v, st, avail_w / z.max(0.1) * z, char_w);
     if sh.show_formulas && sh.cell(c).is_some_and(|cell| cell.formula.is_some()) {
@@ -414,7 +462,7 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
             HAlign::Right => egui::Align::RIGHT,
             _ => egui::Align::LEFT,
         };
-        let galley = p.layout_job(job);
+        let galley = layout_job_or_default(p, job);
         let x = match halign {
             HAlign::Center | HAlign::CenterAcross => rect.center().x,
             HAlign::Right => rect.right() - pad,
@@ -437,15 +485,15 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
         .flatten();
     let shrunk = small.is_some();
     let font = small.unwrap_or(font);
-    let mut galley = p.layout_job(cell_job(first_line.clone(), font.clone(), color, f32::INFINITY, italic));
+    let mut galley = layout_job_or_default(p, cell_job(first_line.clone(), font.clone(), color, f32::INFINITY, italic));
     let mut w = galley.size().x;
     // Numbers and dates never overflow: they show #### when too narrow.
     let hashed = !shrunk && (numeric || matches!(v, Value::Number(_))) && w > avail_w - 2.0 * pad && st.align.h != HAlign::Fill;
     if hashed {
         // Measured on `#` itself: it is wider than `0` in some fonts, and #### must fit its cell.
-        let hash_w = p.layout_no_wrap("#".to_string(), font.clone(), color).size().x.max(1.0);
+        let hash_w = layout_no_wrap_or_default(p, "#".to_string(), font.clone(), color).size().x.max(1.0);
         let n = ((avail_w - 2.0 * pad) / hash_w).floor().max(1.0) as usize;
-        galley = p.layout_no_wrap("#".repeat(n), font.clone(), color);
+        galley = layout_no_wrap_or_default(p, "#".repeat(n), font.clone(), color);
         w = galley.size().x;
     }
     // Repeat fill (`*` in number formats) / Fill alignment. A number already shown as #### keeps
@@ -455,13 +503,13 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
         && pos <= first_line.len()
     {
         let base_w = w;
-        let cw = p.layout_no_wrap(ch.to_string(), font.clone(), color).size().x.max(1.0);
+        let cw = layout_no_wrap_or_default(p, ch.to_string(), font.clone(), color).size().x.max(1.0);
         let n = (((avail_w - 2.0 * pad) - base_w) / cw).floor().max(0.0) as usize;
         let mut s = first_line.clone();
         if first_line.is_char_boundary(pos) {
             s.insert_str(pos, &ch.to_string().repeat(n));
         }
-        galley = p.layout_no_wrap(s, font.clone(), color);
+        galley = layout_no_wrap_or_default(p, s, font.clone(), color);
         w = galley.size().x;
     }
     // Center Across Selection: the text is centred over this cell and the empty cells to its right that also use it.
@@ -525,7 +573,7 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
         // Upright (±90°) wrapped text wraps to the row height: lines then stack across the column.
         let galley = if st.align.wrap && st.align.rotation.abs() == 90 {
             let job = cell_job(text.clone(), font.clone(), color, (rect.height() - 2.0 * pad).max(4.0), italic);
-            p.layout_job(job)
+            layout_job_or_default(p, job)
         } else {
             galley.clone()
         };
