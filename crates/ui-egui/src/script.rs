@@ -145,6 +145,22 @@ pub fn classify(c: char) -> ScriptClass {
     }
 }
 
+/// Whether `text` reads right to left, which decides where General alignment puts it.
+///
+/// The paragraph direction comes from the first strong character (UAX #9 rules P2 and P3): Hebrew
+/// and Arabic are right to left, everything else with a direction is left to right. Neutral
+/// characters (digits, spaces, punctuation, symbols) have no direction of their own, so they are
+/// skipped; a string of only those is left to right, as in Excel and LibreOffice.
+pub fn is_rtl(text: &str) -> bool {
+    text.chars()
+        .find_map(|c| match classify(c) {
+            ScriptClass::Common | ScriptClass::Symbols => None,
+            ScriptClass::Hebrew | ScriptClass::Arabic => Some(true),
+            _ => Some(false),
+        })
+        .unwrap_or(false)
+}
+
 /// The runs of one script in `text`, as byte ranges into `text`.
 ///
 /// Ranges are contiguous, do not overlap, are cut on character boundaries and together cover the
@@ -473,5 +489,19 @@ mod tests {
         assert!(set.has(ScriptClass::Latin));
         assert!(set.has(ScriptClass::Han));
         assert!(!set.has(ScriptClass::Common), "Common is never in a set");
+    }
+
+    #[test]
+    fn the_first_strong_character_decides_the_direction() {
+        assert!(is_rtl("אבג"), "Hebrew reads right to left");
+        assert!(is_rtl("مرحبا"), "Arabic reads right to left");
+        assert!(is_rtl("  123 مرحبا"), "digits are neutral");
+        assert!(is_rtl("שלום hello"), "only the first strong character counts");
+        assert!(!is_rtl("hello שלום"));
+        assert!(!is_rtl("বাংলা"), "Bengali reads left to right");
+        assert!(!is_rtl("አማርኛ"), "Ethiopic reads left to right");
+        assert!(!is_rtl("中文"), "Han reads left to right");
+        assert!(!is_rtl("123 - ★ 😀"), "no strong character at all");
+        assert!(!is_rtl(""));
     }
 }
