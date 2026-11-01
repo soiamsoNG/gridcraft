@@ -352,6 +352,32 @@ thread_local! {
 /// `pattern`. The answer is cached for the session: a match is a subprocess, and the same name is
 /// asked for every frame a re-bind is considered.
 #[cfg(target_os = "linux")]
+/// Splits the index `fc-match`/`fc-list` report into the face index (low 16 bits) and the named
+/// instance (high 16 bits, which fontconfig stores 1-based; `None` means the default instance).
+pub(crate) fn fc_index_parts(raw: u32) -> (u32, Option<u32>) {
+    (raw & 0xFFFF, (raw >> 16).checked_sub(1))
+}
+
+/// Applies a variable font's named instance through `FontTweak::coords`. `FontData::index` only
+/// selects a face, so without this a variable font always renders its default instance: fontconfig
+/// resolves `Noto Sans CJK SC:weight=bold` to a bold named instance, but egui would draw the
+/// collection's default (Thin, 100) and refuse the face at the high index outright (#1231).
+pub(crate) fn apply_named_instance(fd: &mut egui::FontData, instance: u32) {
+    use skrifa::MetadataProvider as _;
+    let bytes: &[u8] = fd.font.as_ref().as_ref();
+    let Ok(font) = skrifa::FontRef::from_index(bytes, fd.index) else { return };
+    let Some(named) = usize::try_from(instance).ok().and_then(|i| font.named_instances().get(i)) else {
+        log::warn!("font face {:?} has no named instance {instance}", fd.index);
+        return;
+    };
+    let mut coords = egui::epaint::text::VariationCoords::default();
+    for (axis, value) in font.axes().iter().zip(named.user_coords()) {
+        // `u32` is infallible for `IntoTag`; a malformed tag must not panic.
+        coords.push(u32::from_be_bytes(axis.tag().into_bytes()), value);
+    }
+    fd.tweak.coords = coords;
+}
+
 pub(crate) fn fc_match(pattern: &str) -> Option<(String, u32)> {
     if let Some(answer) = FC_MATCH_CACHE.with(|cache| cache.borrow().get(pattern).cloned()) {
         return answer;
@@ -584,8 +610,12 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
             }
             if !fonts.font_data.contains_key(&key) {
                 let Ok(bytes) = std::fs::read(&face.path) else { continue };
+                let (index, instance) = fc_index_parts(face.index);
                 let mut fd = egui::FontData::from_owned(bytes);
-                fd.index = face.index;
+                fd.index = index;
+                if let Some(instance) = instance {
+                    apply_named_instance(&mut fd, instance);
+                }
                 align_fallback(&mut fd, &face.family);
                 fonts.font_data.insert(key.clone(), std::sync::Arc::new(fd));
             }
@@ -675,6 +705,14 @@ pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fontconfig_index_splits_into_face_and_instance() {
+        assert_eq!(fc_index_parts(0), (0, None));
+        assert_eq!(fc_index_parts(3), (3, None));
+        // `fc-list` reports Noto Sans CJK's bold as face 1, named instance 6 stored 1-based.
+        assert_eq!(fc_index_parts(0x6_0001), (1, Some(5)));
+    }
 
     #[test]
     fn style_names_map_to_weight_and_slant() {
