@@ -132,21 +132,25 @@ pub(super) fn display_text(
     (f.text, f.color.map(numfmt_color), f.numeric, f.fill)
 }
 
-/// How much of a galley's last line sits below its lowest ink: the font's descent that no glyph
-/// fills. Placing a line by its ink instead of its whole line box brings the text nearer the cell's
-/// bottom edge, the way Excel does, without cutting the glyphs.
-pub(crate) fn ink_bottom_inset(galley: &egui::Galley) -> f32 {
+/// How far a galley's ink starts below its top and ends above its bottom: the font's ascent and
+/// descent that no glyph fills. Placing a line by its ink instead of its whole line box brings the
+/// text nearer the cell's edges, the way Excel does, without cutting the glyphs.
+pub(crate) fn ink_insets(galley: &egui::Galley) -> (f32, f32) {
+    let mut ink_top = f32::INFINITY;
     let mut ink_bottom = f32::NEG_INFINITY;
     for placed in &galley.rows {
         for glyph in &placed.row.glyphs {
-            let bottom = placed.pos.y + glyph.pos.y + glyph.uv_rect.offset.y + glyph.uv_rect.size.y;
+            let top = placed.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+            let bottom = top + glyph.uv_rect.size.y;
+            ink_top = ink_top.min(top);
             ink_bottom = ink_bottom.max(bottom);
         }
     }
-    if ink_bottom.is_finite() {
-        (galley.size().y - ink_bottom).max(0.0)
+    if ink_top.is_finite() && ink_bottom.is_finite() {
+        let h = galley.size().y;
+        (ink_top.max(0.0), (h - ink_bottom).max(0.0))
     } else {
-        0.0
+        (0.0, 0.0)
     }
 }
 
@@ -154,7 +158,8 @@ pub(crate) fn ink_bottom_inset(galley: &egui::Galley) -> f32 {
 /// up by putting the glyphs nearer the cell's bottom edge, the way Excel does.
 const BOTTOM_TRAIL: f32 = 0.25;
 
-pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, inset: f32) -> f32 {
+pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, ink: (f32, f32)) -> f32 {
+    let inset = ink.1;
     let pad_v = 1.5 * z;
     let y_top = rect.top() + pad_v;
     // Not clamped to `y_top`: text taller than the row overflows upward (Bottom) or both ways
@@ -162,12 +167,15 @@ pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, i
     let y_bottom = rect.bottom() - gh + (1.0 - BOTTOM_TRAIL) * inset - BOTTOM_TRAIL * pad_v;
     match valign {
         VAlign::Top => y_top,
-        VAlign::Center | VAlign::Justify | VAlign::Distributed => (y_top + y_bottom) / 2.0,
+        // Centre the ink, not the line box: a fallback face put on the baseline (#1231) inflates the
+        // box's ascent, so centring the box leaves the glyphs hanging near the bottom edge.
+        VAlign::Center | VAlign::Justify | VAlign::Distributed => rect.center().y - (ink.0 + (gh - ink.1)) / 2.0,
         VAlign::Bottom => y_bottom,
     }
 }
 
-pub(crate) fn cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, inset: f32) -> f32 {
+pub(crate) fn cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, ink: (f32, f32)) -> f32 {
+    let inset = ink.1;
     let top_inset = 1.0 * z;
     let y_top = rect.top() - top_inset;
     // Not clamped to `y_top`: a line mixing scripts sits taller than the row (its fallback faces are
@@ -176,7 +184,9 @@ pub(crate) fn cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, inset: f3
     let y_bottom = rect.bottom() - gh + (1.0 - BOTTOM_TRAIL) * inset - BOTTOM_TRAIL * 0.5 * z;
     match valign {
         VAlign::Top => y_top,
-        VAlign::Center | VAlign::Justify | VAlign::Distributed => (y_top + y_bottom) / 2.0,
+        // Centre the ink, not the line box: a fallback face put on the baseline (#1231) inflates the
+        // box's ascent, so centring the box leaves the glyphs hanging near the bottom edge.
+        VAlign::Center | VAlign::Justify | VAlign::Distributed => rect.center().y - (ink.0 + (gh - ink.1)) / 2.0,
         VAlign::Bottom => y_bottom,
     }
 }
