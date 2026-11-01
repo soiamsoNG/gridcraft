@@ -1,7 +1,7 @@
 use super::active_row::paint_active_row;
 use super::cell_paint::{
-    Look, MergedArea, cell_text_y, center_across_end, col32, display_text, ink_bottom_inset, look, merged_edges, paint_border, paint_cf_icon, painted_halign,
-    rotated_text_pos, shrink_font, wrapped_cell_text_y,
+    Look, MergedArea, cell_text_y, center_across_end, col32, display_text, general_halign, ink_bottom_inset, look, merged_edges, paint_border,
+    paint_cf_icon, painted_halign, rotated_text_pos, shrink_font, wrapped_cell_text_y,
 };
 use super::geo::Geo;
 use super::tables::{filter_button_rect, paint_filter_button};
@@ -433,13 +433,7 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
     let color = ncolor.unwrap_or(lk.text_color);
     let direction = crate::text_direction::cell_direction(st.align.reading_order, &text);
     let halign = match st.align.h {
-        HAlign::General => match v {
-            Value::Number(_) => HAlign::Right,
-            Value::Bool(_) | Value::Error(_) => HAlign::Center,
-            _ if numeric => HAlign::Right,
-            _ if direction == egui::epaint::text::TextDirection::RightToLeft && !sh.right_to_left => HAlign::Right,
-            _ => HAlign::Left,
-        },
+        HAlign::General => general_halign(&v, numeric, direction == egui::epaint::text::TextDirection::RightToLeft && !sh.right_to_left),
         h => painted_halign(h, geo.rtl),
     };
     let indent = st.align.indent as f32 * 9.0 * z;

@@ -142,6 +142,21 @@ full E21b matrix (formula bar, text boxes, stale-owner deletion and two-surface 
   `a_serif_family_reaches_the_serif_script_faces` and `a_sans_family_keeps_the_sans_script_faces`
   cover the rule.
 
+## Right-to-left text right aligns under General (2026-11-01, local)
+
+- epaint 0.37 already lays right-to-left text out correctly (`BidiLevels` plus
+  `reorder_row_visually` in its `text_layout.rs`), so Hebrew and Arabic draw in reading order. What
+  was missing was the alignment Excel and LibreOffice give them: a cell whose alignment is General
+  put every text value on the left.
+- `script::is_rtl()` takes the paragraph direction from the first strong character (UAX #9 P2/P3,
+  digits/punctuation/symbols are neutral), and `cell_paint::general_halign()` returns `HAlign::Right`
+  for right-to-left text. Numbers, numeric text, booleans and errors keep their previous sides.
+  Explicit Left/Right still go through `painted_halign()` for right-to-left sheets.
+- Checked with `font-cases.xlsx` and a four-row scratch sheet: `אבג`, `שלום עולם`, `ابدأ هنا` now sit
+  on the right edge like the LibreOffice render of the same workbook, while `Hello עולם` keeps its
+  left-to-right paragraph direction. `the_first_strong_character_decides_the_direction` and
+  `general_alignment_follows_the_text_direction` cover the rule.
+
 ## Review repair (2026-10-24)
 
 - `RequestPaintWhileHidden` is sent only for a queued/settling request that has a capturable size;

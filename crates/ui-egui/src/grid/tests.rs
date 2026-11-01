@@ -30,6 +30,19 @@ fn explicit_left_and_right_keep_their_side_on_a_right_to_left_sheet() {
 }
 
 #[test]
+fn general_alignment_follows_the_text_direction() {
+    use super::{HAlign, Value, general_halign};
+    let text = Value::Text(std::sync::Arc::from("hello"));
+    let number = Value::Number(12.0);
+    // Text sits on the side its direction starts from; everything else is unchanged.
+    assert_eq!(general_halign(&text, false, false), HAlign::Left);
+    assert_eq!(general_halign(&text, false, true), HAlign::Right);
+    assert_eq!(general_halign(&number, true, false), HAlign::Right);
+    assert_eq!(general_halign(&text, true, false), HAlign::Right, "numeric text right aligns");
+    assert_eq!(general_halign(&Value::Bool(true), false, false), HAlign::Center);
+}
+
+#[test]
 fn heading_labels_scale_with_the_zoom_without_a_cap() {
     use super::{DISPLAY_SCALE, heading_font_size};
     let at = |percent: f32| heading_font_size(percent / 100.0 * DISPLAY_SCALE);

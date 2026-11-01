@@ -583,13 +583,8 @@ fn font_definitions_impl(
     // still draws instead of turning into tofu.
     let serif_then_sans = with_regular_faces(&serif_fallback, &fallback);
     let bold_serif_then_sans = with_regular_faces(&with_regular_faces(&bold_serif, &bold_sans), &fallback);
-    let script_chains = |serif: bool| -> (&[String], &[String]) {
-        if serif {
-            (&serif_then_sans, &bold_serif_then_sans)
-        } else {
-            (&fallback, &bold_sans)
-        }
-    };
+    let script_chains =
+        |serif: bool| -> (&[String], &[String]) { if serif { (&serif_then_sans, &bold_serif_then_sans) } else { (&fallback, &bold_sans) } };
     // Installed workbook fonts, so a cell's chosen font actually renders in it.
     if system {
         for family in installed {

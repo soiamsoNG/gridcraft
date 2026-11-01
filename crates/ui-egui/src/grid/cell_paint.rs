@@ -336,6 +336,21 @@ pub(super) fn ink_on(fill: Color32) -> Color32 {
     if l < 150.0 { Color32::WHITE } else { Color32::BLACK }
 }
 
+/// The alignment Excel gives a cell whose alignment is General: numbers and numeric text to the
+/// right, booleans and errors in the middle, and text on the side its own script starts from —
+/// right to left text is right aligned even in a left to right sheet. `rtl_text` is the cell's
+/// resolved text direction (an explicit reading order first, its first strong character otherwise),
+/// already cleared on a right-to-left sheet, where mirroring puts it on the right.
+pub(super) fn general_halign(v: &Value, numeric: bool, rtl_text: bool) -> HAlign {
+    match v {
+        Value::Number(_) => HAlign::Right,
+        Value::Bool(_) | Value::Error(_) => HAlign::Center,
+        _ if numeric => HAlign::Right,
+        _ if rtl_text => HAlign::Right,
+        _ => HAlign::Left,
+    }
+}
+
 /// The horizontal alignment to paint with. Cells are painted left to right and a right-to-left
 /// sheet is mirrored afterwards, so an explicit Left or Right is swapped first to end up on the
 /// side the user chose: Align Right stays on the right in either sheet direction, as in Excel.
