@@ -128,6 +128,20 @@ full E21b matrix (formula bar, text boxes, stale-owner deletion and two-surface 
   repair and now draw every script in bold.
   `a_bold_role_keeps_the_regular_faces_behind_its_bold_ones` covers the chain rule.
 
+## Serif workbook fonts chain the serif script faces (2026-11-01, local)
+
+- `theme::font_setup::font_definitions_impl` used to hand every workbook family the sans script
+  faces. A Times New Roman cell drew `Hello` in Liberation Serif and `中文` in Noto Sans CJK, so one
+  row looked like two documents.
+- The family's own design now decides: both binding loops (installed families and the substitute for
+  a standard name this host lacks) pass `serif_fallback`/`bold_serif` when any of the family's faces
+  is serif, and `fallback`/`bold_sans` otherwise. `want_serif` also counts an installed family that
+  really carries a serif face, not only a name that reads as serif.
+- Checked with `~/文档/混合输入.xlsx` after `home.fontName` → Times New Roman: all four rows draw
+  Chinese, Japanese, Korean, Arabic, Devanagari, Bengali, Ethiopic and Thai in serif faces.
+  `a_serif_family_reaches_the_serif_script_faces` and `a_sans_family_keeps_the_sans_script_faces`
+  cover the rule.
+
 ## Review repair (2026-10-24)
 
 - `RequestPaintWhileHidden` is sent only for a queued/settling request that has a capturable size;

@@ -545,8 +545,11 @@ fn font_definitions_impl(
     let fallback = if system { font_fallback::load_fallback(&mut fonts, han, false, wanted, known) } else { Vec::new() };
 
     // Serif companions (Noto Serif CJK alone is ~55 MB) are loaded only when something asks for a
-    // serif face: a workbook font whose name reads as serif, or the serif role.
-    let want_serif = used.iter().any(|name| crate::fonts::family_name_is_serif(name));
+    // serif face: a workbook font whose name reads as serif, or the serif role. An installed
+    // family that really carries a serif face asks for them too: its name need not say so.
+    let installed = crate::fonts::installed_among(used);
+    let want_serif = used.iter().any(|name| crate::fonts::family_name_is_serif(name))
+        || installed.iter().any(|family| crate::fonts::faces_of(family).iter().any(|face| face.serif));
     let serif_fallback = if system && want_serif { font_fallback::load_fallback(&mut fonts, han, true, wanted, known) } else { Vec::new() };
     // Bold script faces, for the scripts the workbook actually sets in bold.
     let bold_sans = if system { font_fallback::load_bold_script_faces(&mut fonts, bold_scripts, false) } else { Vec::new() };
@@ -574,10 +577,25 @@ fn font_definitions_impl(
         fonts.families.insert(FontFamily::Name(role.into()), chain);
         bound.push(role.to_string());
     }
+    // A serif family has to reach the serif script faces (Noto Serif CJK, Naskh, …): a Times New
+    // Roman cell drawing its Latin in Liberation Serif and its Han in Noto Sans CJK looks like two
+    // documents (#1231). The sans faces stay behind them, so a script this host ships only in sans
+    // still draws instead of turning into tofu.
+    let serif_then_sans = with_regular_faces(&serif_fallback, &fallback);
+    let bold_serif_then_sans = with_regular_faces(&with_regular_faces(&bold_serif, &bold_sans), &fallback);
+    let script_chains = |serif: bool| -> (&[String], &[String]) {
+        if serif {
+            (&serif_then_sans, &bold_serif_then_sans)
+        } else {
+            (&fallback, &bold_sans)
+        }
+    };
     // Installed workbook fonts, so a cell's chosen font actually renders in it.
     if system {
-        for family in crate::fonts::installed_among(used) {
-            bound.extend(crate::fonts::bind_family(&mut fonts, &family, &fallback, &bold_sans));
+        for family in installed {
+            let faces = crate::fonts::faces_of(&family);
+            let (fallback, bold) = script_chains(faces.iter().any(|face| face.serif));
+            bound.extend(crate::fonts::bind_faces(&mut fonts, &family, &faces, fallback, bold));
         }
         // A standard name this machine does not have is bound to the face the desktop substitutes
         // for it, under the name the workbook uses: Times New Roman cells keep bold and italic
@@ -594,7 +612,10 @@ fn font_definitions_impl(
             if faces.is_empty() {
                 continue;
             }
-            bound.extend(crate::fonts::bind_faces(&mut fonts, name, &faces, &fallback, &bold_sans));
+            // The substitute's own design decides: Times New Roman lands on Liberation Serif and
+            // has to take the serif script faces with it (#1231).
+            let (fallback, bold) = script_chains(faces.iter().any(|face| face.serif));
+            bound.extend(crate::fonts::bind_faces(&mut fonts, name, &faces, fallback, bold));
         }
     }
     // Interface text (formula bar, name box, dialogs) falls back to the cell font before the
@@ -737,6 +758,7 @@ fn append_craft_faces(fonts: &mut FontDefinitions) {
 #[cfg(test)]
 mod font_binding_tests {
     use super::*;
+    use crate::script::ScriptSet;
 
     /// The families [`font_definitions`] always binds, whatever is installed.
     fn always_bound() -> Vec<String> {
@@ -766,6 +788,44 @@ mod font_binding_tests {
         let FontFamily::Name(fallback) = cell_family("Ubuntu", false, true) else { panic!("should name a family") };
         assert!(crate::fonts::is_bound(&fallback), "the fallback is a bound role");
         crate::fonts::set_bound(always_bound());
+    }
+
+    #[test]
+    fn a_serif_family_reaches_the_serif_script_faces() {
+        // A Times New Roman cell draws its Latin in Liberation Serif; its Han, Arabic and Thai have
+        // to come from serif faces too. The family's own design decides, not its name (#1231).
+        let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let scripts = ScriptSet::EMPTY.with(crate::script::ScriptClass::Han);
+        let (fonts, _) = font_definitions_impl(crate::i18n::Language::En, &["Times New Roman".to_string()], scripts, ScriptSet::EMPTY, true);
+        let Some(chain) = fonts.families.get(&FontFamily::Name(crate::fonts::role_key("Times New Roman", false, false).into())).cloned() else {
+            return; // no substitute for Times New Roman on this host
+        };
+        assert!(!chain.is_empty(), "the family was not bound: {chain:?}");
+        let serif_han = ["sys-cjk-han-zh-serif", "sys-cjk-han-ja-serif"];
+        let loaded: Vec<&str> = serif_han.iter().copied().filter(|key| fonts.font_data.contains_key(*key)).collect();
+        if loaded.is_empty() {
+            return; // this host has no serif CJK face to offer
+        }
+        let sans = chain.iter().position(|key| key == "sys-cjk-han-zh" || key == "sys-cjk-han-ja");
+        for key in loaded {
+            let at = chain.iter().position(|bound| bound == key).unwrap_or_else(|| panic!("{key} missing from {chain:?}"));
+            if let Some(sans) = sans {
+                // The sans face stays behind the serif one as a backstop for a script this host
+                // ships in sans only.
+                assert!(at < sans, "{key} is not ahead of the sans Han face in {chain:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sans_family_keeps_the_sans_script_faces() {
+        let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let scripts = ScriptSet::EMPTY.with(crate::script::ScriptClass::Han);
+        let (fonts, _) = font_definitions_impl(crate::i18n::Language::En, &["Calibri".to_string()], scripts, ScriptSet::EMPTY, true);
+        let Some(chain) = fonts.families.get(&FontFamily::Name(crate::fonts::role_key("Calibri", false, false).into())).cloned() else {
+            return; // no substitute for Calibri on this host
+        };
+        assert!(!chain.iter().any(|key| key.starts_with("sys-") && key.ends_with("-serif")), "{chain:?}");
     }
 
     #[test]
