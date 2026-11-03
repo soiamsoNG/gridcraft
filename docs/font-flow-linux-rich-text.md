@@ -387,6 +387,11 @@ Bold scripts take a parallel path: `load_bold_script_faces()` asks
 other bold faces of the catalog that cover the script, and only then gives up.
 The result keys are `sys-script-<script>-bold` / `sys-script-<script>-bold-serif`.
 
+That walk matters because fontconfig ranks a variable collection's named instance
+above the same family's static bold file: `Noto Sans:weight=bold` resolves to
+`NotoSansCJK-VF.ttc` first, which egui cannot parse, so the walk continues to
+`NotoSansCJK-Bold.ttc` instead of leaving the script at regular weight.
+
 Each script function asks fontconfig first on Linux (`sans-serif:lang=…`,
 `serif:lang=…`, Arabic's serif companion is Noto Naskh Arabic), then appends the
 hard-coded paths in `LINUX_CJK_FALLBACK_DIRS` and the platform-specific paths.
@@ -1491,12 +1496,37 @@ CI without CJK:
 Current test result:
 
 ```text
-cargo +1.95.0 test -p gridcraft-ui-egui --lib
-232 passed, 0 failed
+cargo +1.95.0 test -p gridcraft-ui-egui --lib      331 passed, 0 failed
+cargo +1.95.0 test -p gridcraft-ui-egui --test it 1063 passed, 0 failed
+cargo +1.95.0 test -p gridcraft --bin gridcraft     38 passed, 0 failed
 ```
 
 The full `cargo xtask ci` was not run for this branch; the affected crates are
-checked directly (`clippy -p gridcraft-ui-egui --all-targets -D warnings`).
+checked directly (`clippy -p gridcraft-ui-egui --all-targets -D warnings`,
+`cargo xtask layers`).
+
+### Manual verification material
+
+The unit tests pin the rules; these workbooks pin what the rules look like. They
+are generated from a command script, so they are reproducible rather than
+committed fixtures.
+
+| Workbook | What it proves |
+|---|---|
+| `font-cases.xlsx` | 24 cases in five sheets (`Cases`, `Explanations`, `Countries`, `Matrix`, `Notes`): eight scripts in four styles, the standard names Times New Roman / Arial / Courier New in four roles, symbols and emoji, 22 pt text in an 18 px row. |
+| `混合输入.xlsx` | Four rows (regular / bold / italic / bold italic) of `Hello 中文 العربية ไทย हिन्दी বাংলা አማርኛ 日本語 한국어` at 18 pt: the bold rows drew tofu before the bold script chain and the named-instance walk were fixed. |
+| `lang20-countries.xlsx` | Twenty countries in twenty scripts, one of them right-to-left per row; the Bengali and Ethiopic rows were tofu until `classify()` learned those blocks. |
+| `top.xlsx` | `Hello` and `中文 한글 العربية` at 11 / 18 / 30 pt, top aligned, 60 px rows: every size starts 2 px below the edge. |
+
+Measurements behind two decisions:
+
+- Middle alignment on `font-cases.xlsx` rows 3 and 4 moved the top/bottom ink gaps
+  from 10 px / 1 px and 7 px / 1 px to 7 px / 4 px and 4 px / 4 px.
+- The first top-alignment attempt subtracted the unfilled ascent
+  (`font_face_ascent - font_ascent`). A probe on real galleys showed `ink.top`
+  already contains that growth — 4 px for `Hello` and for `中文 한글 العربية` at
+  11 pt, 9 px at 18 pt, 15 px at 30 pt — so subtracting it again pushed the glyphs
+  over the top border. Do not retry it.
 
 ---
 
@@ -1810,6 +1840,20 @@ Current app behavior:
     has no class? Decided: only when needed. The widening is contained and
     `every_class_but_common_has_its_own_bit` fails as soon as the last bit would
     collide, so it cannot be forgotten.
+16. Should a cell's `readingOrder` be honoured before rich text lands? Excel's
+    `<alignment readingOrder="1|2">` forces a paragraph's base direction (`1`
+    left to right, `2` right to left) regardless of its first character, and an
+    absent value inherits the sheet direction. GridCraft has neither field nor
+    round trip: `Alignment` in `crates/model/src/style.rs` is
+    `{ h, v, wrap, shrink, indent, rotation }`, and `crates/xlsx` ignores the
+    attribute on read and write; only `Sheet::right_to_left` (from
+    `<sheetView rightToLeft="1">`, mirrored by `Geo::rtl`) works today. Closing it
+    needs three pieces: the field plus its XLSX read/write (and the XLS
+    equivalent), `general_halign()` preferring the forced direction over
+    `script::is_rtl(text)`, and `LayoutJob::direction` set to `Ltr`/`Rtl` instead
+    of `Auto` so mixed runs keep the forced base direction. Until then a cell
+    whose text starts with Latin stays left to right even when the user asks for
+    right to left.
 
 ---
 
