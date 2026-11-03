@@ -28,6 +28,9 @@ mod view;
 impl SheetApp {
     /// Constructs a `SheetApp` with default UI, grid, printing, control and screenshot state and the caller's session and services.
     pub fn new(session: Session, services: Services) -> SheetApp {
+        // The bound-family registry describes the font set in use; a fresh app has not built one,
+        // and a family recorded by a previous app in this process is not in this context (#1231).
+        crate::fonts::clear_bound();
         SheetApp {
             session,
             ui: UiState::default(),

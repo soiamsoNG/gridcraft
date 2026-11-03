@@ -689,6 +689,12 @@ pub fn set_bound(keys: impl IntoIterator<Item = String>) {
     set_bound_for_roles(keys.into_iter().map(|key| (key, None)));
 }
 
+/// Forget the families of the previous font set: an app that has not built its own yet must not
+/// name a family egui was never given (#1231).
+pub fn clear_bound() {
+    set_bound_for_roles(std::iter::empty());
+}
+
 /// [`set_bound`] from a finished font set: only the roles the definitions actually carry are
 /// recorded, so a role the old set advertised and the new one dropped cannot be named.
 pub fn set_bound_for(defs: &egui::FontDefinitions, roles: Vec<String>) {
