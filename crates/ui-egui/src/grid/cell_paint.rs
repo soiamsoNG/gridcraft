@@ -172,7 +172,12 @@ pub(crate) fn wrapped_cell_text_y(valign: VAlign, rect: Rect, gh: f32, z: f32, i
     match valign {
         // Start the ink at the cell's edge, not the line box: a fallback face put on the baseline
         // (#1231) makes the box start above the first glyph, and the gap would grow with the size.
-        VAlign::Top => y_top - ink.top,
+        // Text taller than the row starts at the cell's top instead: `wrapped_text_clip` keeps
+        // whole lines, so a line box hanging above the edge would show as a partial one (#2752).
+        VAlign::Top => {
+            let y = y_top - ink.top;
+            if gh > rect.height() { y.max(rect.top()) } else { y }
+        }
         // Centre the ink, not the line box: a fallback face put on the baseline (#1231) inflates the
         // box's ascent, so centring the box leaves the glyphs hanging near the bottom edge.
         VAlign::Center | VAlign::Justify | VAlign::Distributed => rect.center().y - (ink.top + (gh - ink.bottom)) / 2.0,
