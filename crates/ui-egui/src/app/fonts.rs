@@ -143,6 +143,7 @@ impl SheetApp {
         // The rebuilt set has no workbook fonts yet: bind them again once it is active.
         self.fonts_bound.clear();
         self.fonts_scripts = crate::script::ScriptSet::EMPTY;
+        self.fonts_bold_scripts = crate::script::ScriptSet::EMPTY;
         self.fonts_seen = (0, 0);
         self.fonts_han = Some(theme::HanOrder::of(self.ui.language));
         ctx.request_repaint();
@@ -178,6 +179,7 @@ impl SheetApp {
         theme::apply(ctx, self.ui.dark);
         self.fonts_bound = used;
         self.fonts_scripts = scripts;
+        self.fonts_bold_scripts = bold;
         self.fonts_seen = self.fonts_key();
     }
 
@@ -194,10 +196,10 @@ impl SheetApp {
         self.fonts_seen = seen;
         // Text that gains a script (a Thai cell typed into a Latin sheet) needs its fallback face
         // even though every font name stayed the same.
-        if used == self.fonts_bound && scripts == self.fonts_scripts {
+        let bold = self.used_bold_scripts();
+        if used == self.fonts_bound && scripts == self.fonts_scripts && bold == self.fonts_bold_scripts {
             return;
         }
-        let bold = self.used_bold_scripts();
         let (mut defs, roles) = theme::font_definitions_roles(self.ui.language, &used, scripts, bold);
         if let Some(old) = &self.fonts_defs {
             theme::merge_fonts(&mut defs, old);
@@ -207,6 +209,7 @@ impl SheetApp {
         self.pending_roles = roles;
         self.fonts_bound = used;
         self.fonts_scripts = scripts;
+        self.fonts_bold_scripts = bold;
         self.fonts_rebind = true;
         ctx.request_repaint();
     }

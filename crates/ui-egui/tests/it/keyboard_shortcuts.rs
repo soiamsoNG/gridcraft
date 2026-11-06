@@ -303,3 +303,53 @@ fn ctrl_alt_letter_that_typed_text_is_not_select_all() {
     assert_eq!(h.state().session.active().unwrap().selection.current().a1(), "B2");
     assert_eq!(h.state().editor.as_ref().unwrap().text, "\u{e4}");
 }
+
+#[test]
+fn an_input_method_commit_types_into_the_cell() {
+    // A Chinese/Japanese IME commits finished text as one `Ime` event; it never arrives as `Text`.
+    let mut h = harness(book("B2"));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Commit("中文".into())));
+    h.run_steps(2);
+    let ed = h.state().editor.as_ref().expect("typing starts an edit");
+    assert_eq!(ed.text, "中文");
+    assert_eq!(ed.caret, 2);
+}
+
+#[test]
+fn an_input_method_preedit_is_shown_without_opening_an_edit() {
+    // A composition is not text yet, and handing it to an editor mid-word resets the input method
+    // (gtk#2636): the cell shows the preedit while the grid keeps the keys, and the commit opens
+    // the edit with the finished word.
+    let mut h = harness(book("B2"));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Preedit { text: "zhong".into(), active_range_chars: None }));
+    h.run_steps(2);
+    assert!(h.state().editor.is_none(), "a composition does not open an edit");
+    assert_eq!(h.state().ime_compose, "zhong");
+}
+
+#[test]
+fn a_later_commit_opens_the_edit_with_the_finished_word() {
+    // The grid keeps the input method for the whole composition, so the commit is the first text
+    // the cell sees and it opens the edit with it.
+    let mut h = harness(book("B2"));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Preedit { text: "nihao".into(), active_range_chars: None }));
+    h.run_steps(2);
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Commit("你好".into())));
+    h.run_steps(2);
+    let ed = h.state().editor.as_ref().expect("the commit opens an edit");
+    assert_eq!(ed.text, "你好");
+    assert_eq!(h.state().ime_compose, "");
+}
+
+#[test]
+fn a_commit_in_the_frame_the_edit_opens_types_the_text() {
+    // The input method can commit before the editor widget has run and taken focus: nothing else
+    // would insert the text, so the grid does it (a preedit opened the edit just before).
+    let mut h = harness(book("B2"));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Preedit { text: "nihao".into(), active_range_chars: None }));
+    h.input_mut().events.push(Event::Ime(egui::ImeEvent::Commit("你好".into())));
+    h.run_steps(2);
+    let ed = h.state().editor.as_ref().expect("the composition started an edit");
+    assert_eq!(ed.text, "你好");
+    assert_eq!(ed.caret, 2);
+}

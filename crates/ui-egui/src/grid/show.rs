@@ -443,6 +443,8 @@ fn paint_panes(input: PanesInput<'_>, cf: &mut CfCache) -> Vec<PaneQuad> {
         }
         let p = painter.with_clip_rect(*clip);
         let active_row = app.ui.highlight_active_row.then_some(sel.active.row);
+        let compose =
+            (!app.ime_compose.is_empty()).then(|| (app.session.active().map(|d| d.selection.active).unwrap_or_default(), app.ime_compose.as_str()));
         paint_quadrant(QuadrantPaint {
             painter: &p,
             geo,
@@ -454,6 +456,7 @@ fn paint_panes(input: PanesInput<'_>, cf: &mut CfCache) -> Vec<PaneQuad> {
             cf,
             tokens: t,
             active_row,
+            compose,
         });
         paint_selection(SelectionPaintInput { painter: &p, geo, sheet: sh, selection: sel, outline, tokens: t, app, rows: *rows, cols: *cols });
     }

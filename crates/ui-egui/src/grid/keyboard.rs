@@ -38,6 +38,7 @@ pub(super) fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Res
         matches!(e, egui::Event::Key { pressed: true, modifiers: m, key, .. }
             if !m.alt && (m.ctrl || m.command || (m.shift && *key == egui::Key::Space)))
     });
+    let events = ime_events(app, events, shortcut_pressed);
     let page = ((geo.cells.height() / geo.z) / sh.default_row_height).floor().max(1.0) as i64;
     // Alt shortcuts type their character too on Windows and Linux (Alt+= sends Text("=")): once
     // a shortcut ran, that text must not start an edit over what it just did.
@@ -185,5 +186,44 @@ fn form_control_event(app: &mut SheetApp, sh: &Sheet, ev: &egui::Event) -> bool 
             false
         }
         _ => false,
+    }
+}
+
+/// Handles an input method's events, if the frame has any, and returns the events the grid still
+/// owns. A preedit opens the edit and a commit is its text; the rest of that frame belongs to the
+/// editor, not the grid.
+fn ime_events(app: &mut SheetApp, events: Vec<egui::Event>, shortcut_pressed: bool) -> Vec<egui::Event> {
+    let Some(at) = events.iter().position(|e| matches!(e, egui::Event::Ime(_))) else { return events };
+    let mut rest = events;
+    for ev in rest.split_off(at) {
+        match ev {
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => ime_preedit(app, &text),
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) if !shortcut_pressed && !text.is_empty() => ime_commit(app, text),
+            _ => {}
+        }
+    }
+    rest
+}
+
+/// Show the input method's composition in the cell without opening an editor. Handing the keys to
+/// a `TextEdit` mid-composition resets the input context and loses the word typed so far, so the
+/// grid keeps the input method until the commit arrives (#1231).
+fn ime_preedit(app: &mut SheetApp, text: &str) {
+    if app.editor.is_none() {
+        app.ime_compose.clear();
+        app.ime_compose.push_str(text);
+    }
+}
+
+/// Commit an input method's text into a new edit at the cell, with the caret after it.
+fn ime_commit(app: &mut SheetApp, text: String) {
+    if app.editor.is_some() {
+        return;
+    }
+    app.ime_compose.clear();
+    app.begin_edit(Some(text), false);
+    if let Some(ed) = app.editor.as_mut() {
+        ed.caret = ed.text.chars().count();
+        ed.anchor = ed.caret;
     }
 }

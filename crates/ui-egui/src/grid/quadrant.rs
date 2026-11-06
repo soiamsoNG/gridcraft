@@ -172,6 +172,8 @@ pub(crate) struct QuadrantPaint<'a> {
     pub(crate) tokens: &'a Tokens,
     /// The row to tint, when "Highlight the active cell's row" is on.
     pub(crate) active_row: Option<u32>,
+    /// An input method's unfinished composition, painted in place of the cell's own text (#1231).
+    pub(crate) compose: Option<(CellRef, &'a str)>,
 }
 
 /// Paint a worksheet quadrant, including backgrounds, borders, and text.
@@ -399,7 +401,10 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
     if paint_cell_decorations(q, c, *rect, lk, cfl.as_ref()) {
         return;
     }
-    let v = sh.value(c);
+    let mut v = sh.value(c);
+    if let Some((_, preedit)) = q.compose.filter(|(cc, _)| *cc == c) {
+        v = Value::Text(preedit.into());
+    }
     let mut text_left = rect.left();
     if let Some(l) = cfl
         && let Some((set, idx)) = &l.icon
