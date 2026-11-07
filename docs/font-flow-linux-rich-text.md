@@ -544,7 +544,7 @@ Consequences:
 | `families()` rebuilds the list on every call | The ribbon calls it per frame; potentially wasteful. |
 | Missing bold face | A missing bold face still renders as regular. Only bound role families are judged: the built-in `cell-*`/`SERIF`/`MONO` chains are left upright. |
 | Colour emoji need `epaint/color_fonts` | The feature is on in `crates/ui-egui/Cargo.toml` and adds a PNG decoder. A target that drops the feature (a wasm build that opt out) draws a COLRv1 face as nothing, since those glyphs have no outline. |
-| `sys-emoji` loads with the first font set | The colour face is 5 MB and is loaded whenever any text is present, because it only knows the `Symbols` script. Gating it on a scan for emoji code points is open (see §13). |
+| `sys-emoji` loads with the first font set | The colour face is 5 MB and is loaded whenever any text is present, because it only knows the `Symbols` script. Measured on this host (three runs each, `--sample sales`): +5.2–5.5 MB resident and 0–7 ms to the first frame, so gating it on a scan for emoji code points is deliberately not done (§13 question 17). |
 | Missing italic face | Slanted per script run by the painter (§3.10); the in-cell editor and the formula bar do not slant yet. |
 | No cache invalidation | Fonts installed while running are not picked up until restart. |
 | `ScriptSet` is full | All 16 bits are used (Latin … Ethiopic); a new script class needs the set widened to `u32` first (§13 question 15). |
@@ -1987,6 +1987,18 @@ Current app behavior:
     of `Auto` so mixed runs keep the forced base direction. Until then a cell
     whose text starts with Latin stays left to right even when the user asks for
     right to left.
+
+17. Should `sys-emoji` load only when the text asks for a colour emoji? Measured
+    before deciding (`--sample sales`, three runs of each, first-frame probe +
+    `VmRSS`): 227.3/227.3/226.8 MB with the face and 221.8/222.2/221.7 MB
+    without it — **+5.2–5.5 MB resident, 0–7 ms to the first frame** (0.77 s vs
+    0.75 s, one 1.13 s outlier without the face). That is below the threshold we
+    set for adding the machinery (< 10 MB, < 30 ms), so the face stays
+    unconditional and the cost is recorded in §3.9 instead. Closing it later
+    means a `Emoji_Presentation` table (UCD `emoji-data.txt`, 18.0.0: 302
+    ranges, 1228 code points, plus `U+FE0F` and `U+20E3`), an `emoji: bool`
+    request through `font_definitions_*`, and one more term in the rebind
+    condition (`fonts_emoji`), otherwise typed emoji stay blank until a restart.
 
 ---
 
