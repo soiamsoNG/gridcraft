@@ -625,3 +625,90 @@ fn the_caret_covers_the_text_line_and_not_the_fallback_box() {
     });
     out.textures_delta.clear();
 }
+
+/// A one-line job cut into two sections at `split` bytes, laid out in two sizes: a section whose
+/// fallback face reaches deeper than the font's own descent grows its line, which is what
+/// `shared_baseline()` has to undo.
+fn two_section_job(text: &str, split: usize, first: f32, second: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob { text: text.to_owned(), ..Default::default() };
+    job.sections.push(egui::text::LayoutSection {
+        leading_space: 0.0,
+        byte_range: egui::text::ByteIndex(0)..egui::text::ByteIndex(split),
+        format: egui::TextFormat::simple(egui::FontId::new(first, egui::FontFamily::Proportional), egui::Color32::BLACK),
+    });
+    job.sections.push(egui::text::LayoutSection {
+        leading_space: 0.0,
+        byte_range: egui::text::ByteIndex(split)..egui::text::ByteIndex(text.len()),
+        format: egui::TextFormat::simple(egui::FontId::new(second, egui::FontFamily::Proportional), egui::Color32::BLACK),
+    });
+    job
+}
+
+/// The y of every quad of glyph `i`, so a test can compare how far it moved with how far the glyph
+/// moved.
+fn quad_delta(before: &egui::epaint::text::Row, after: &egui::epaint::text::Row, i: usize) -> Option<f32> {
+    let starts: Vec<usize> = before.glyphs.iter().map(|g| g.first_vertex as usize).collect();
+    let count = before.visuals.mesh.vertices.len();
+    let start = starts.get(i).copied().unwrap_or(count).min(count);
+    let end = starts.get(i + 1).copied().unwrap_or(count).min(count).max(start);
+    (start < end).then(|| after.visuals.mesh.vertices[start].pos.y - before.visuals.mesh.vertices[start].pos.y)
+}
+
+#[test]
+fn the_shared_baseline_carries_the_tessellated_quads_along() {
+    // epaint tessellates a row during layout and painting uses that mesh, so moving `glyph.pos.y`
+    // alone would leave the pixels where they were (#1231).
+    let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::fonts::set_bound(Vec::new());
+    let ctx = egui::Context::default();
+    ctx.set_fonts(crate::theme::pinned_font_definitions());
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let before = painter.layout_job(two_section_job("Hello world", 5, 19.2, 11.0));
+        let after = super::quadrant::shared_baseline(before.clone(), 2);
+        let (b, a) = (&before.rows[0], &after.rows[0]);
+        let mut moved = 0;
+        for (i, (gb, ga)) in b.glyphs.iter().zip(&a.glyphs).enumerate() {
+            let glyph_delta = ga.pos.y - gb.pos.y;
+            if glyph_delta != 0.0 {
+                moved += 1;
+            }
+            // A space has no quads of its own; the glyphs that do must move exactly as far.
+            if let Some(quad) = quad_delta(b, a, i) {
+                assert!((quad - glyph_delta).abs() < 1e-3, "glyph {i} moved {glyph_delta} but its quads moved {quad}");
+            }
+        }
+        assert!(moved > 0, "the second section should have needed a correction");
+        let ys: Vec<f32> = a.glyphs.iter().map(|g| g.pos.y).collect();
+        assert!(ys.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-3), "one baseline: {ys:?}");
+    });
+    out.textures_delta.clear();
+}
+
+#[test]
+fn the_row_box_trim_moves_the_quads_and_shrinks_the_galley() {
+    // The caret and the editor field are sized from these; a box left at the untrimmed height puts
+    // both above the cell (#1231).
+    let ctx = egui::Context::default();
+    ctx.set_fonts(crate::theme::pinned_font_definitions());
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let before = painter.layout_job(two_section_job("Hello 中文", 6, 11.0, 30.0));
+        let line_box = ctx.fonts_mut(|f| f.row_height(&egui::FontId::new(11.0, egui::FontFamily::Proportional)));
+        let tall = before.rows[0].row.size.y;
+        assert!(tall > line_box + 1.0, "the fallback grew the row: {tall} vs {line_box}");
+        let after = super::quadrant::normalize_row_boxes(before.clone(), line_box);
+        let (b, a) = (&before.rows[0], &after.rows[0]);
+        assert!(a.row.size.y >= line_box - 1e-3, "row box {} under the line box {line_box}", a.row.size.y);
+        assert!(a.row.size.y < tall, "row box {} still as tall as {tall}", a.row.size.y);
+        for (i, (gb, ga)) in b.glyphs.iter().zip(&a.glyphs).enumerate() {
+            let glyph_delta = ga.pos.y - gb.pos.y;
+            if let Some(quad) = quad_delta(b, a, i) {
+                assert!((quad - glyph_delta).abs() < 1e-3, "glyph {i} moved {glyph_delta} but its quads moved {quad}");
+            }
+        }
+        let height = after.rows.iter().map(|placed| placed.pos.y + placed.row.size.y).fold(0.0f32, f32::max);
+        assert!((after.rect.max.y - after.rect.min.y - height).abs() < 1e-3, "galley rect {:?} vs rows {height}", after.rect);
+    });
+    out.textures_delta.clear();
+}

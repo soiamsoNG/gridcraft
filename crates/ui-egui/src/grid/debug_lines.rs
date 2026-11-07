@@ -39,6 +39,11 @@ pub(crate) enum Line {
 }
 
 impl Line {
+    /// Every line the palette knows, so a test can state an invariant over the whole table.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 7] =
+        [Self::InkBounds, Self::RawBaseline, Self::SharedBaseline, Self::Misplaced, Self::CellRect, Self::FieldRect, Self::RowBox];
+
     fn color(self) -> Color32 {
         match self {
             Self::SharedBaseline => Color32::from_rgb(255, 0, 0),
@@ -56,14 +61,16 @@ impl Line {
     /// probe that only showed where the correction worked would hide exactly the case it exists to
     /// catch — a script that should have moved and did not.
     fn dashes(self) -> (f32, f32) {
+        // Periods are distinct primes (5, 7, 11, 13, 17, 19, 23), so no two lines share a phase:
+        // any two of them interleave instead of running in lock step.
         match self {
             Self::SharedBaseline => (2.0, 3.0),
-            Self::RawBaseline => (3.0, 5.0),
-            Self::CellRect => (5.0, 7.0),
-            Self::FieldRect => (7.0, 11.0),
-            Self::RowBox => (11.0, 13.0),
-            Self::InkBounds => (13.0, 17.0),
-            Self::Misplaced => (17.0, 19.0),
+            Self::RawBaseline => (3.0, 4.0),
+            Self::Misplaced => (5.0, 6.0),
+            Self::CellRect => (6.0, 7.0),
+            Self::FieldRect => (8.0, 9.0),
+            Self::RowBox => (9.0, 10.0),
+            Self::InkBounds => (11.0, 12.0),
         }
     }
 
@@ -146,6 +153,16 @@ pub(crate) fn any() -> bool {
 /// Whether the probe for `group` is switched on.
 pub(crate) fn enabled(group: Group) -> bool {
     groups().contains(&group)
+}
+
+/// How far a glyph may sit from the row's baseline and still count as on it. Half a pixel is below
+/// what the rasteriser can show, so anything larger is a correction that did not land.
+const ON_BASELINE: f32 = 0.5;
+
+/// Whether a glyph still sits off `reference` after the correction. This is the measurement
+/// [`Line::Misplaced`] draws, so the line means "the correction failed", not "the run moved".
+fn still_off_baseline(now: f32, reference: f32) -> bool {
+    (now - reference).abs() > ON_BASELINE
 }
 
 /// One probe line waiting to be drawn: which line, its y, and the span of x it covers.
@@ -260,7 +277,7 @@ fn collect_galley(probes: &mut Vec<Probe>, galley: &Arc<egui::Galley>, origin: P
                 let offset = row_raw.get(start).copied().unwrap_or(0.0);
                 probes.push((Line::RawBaseline, y + shared + offset, (origin.x + span.0, origin.x + span.1)));
                 let now = glyphs[start].pos.y;
-                if (now - shared).abs() > 0.5 {
+                if still_off_baseline(now, shared) {
                     probes.push((Line::Misplaced, y + now, (origin.x + span.0, origin.x + span.1)));
                 }
             }
@@ -313,4 +330,47 @@ pub(crate) fn paint_editor(painter: &Painter, cell: egui::Rect, field: egui::Rec
     }
     collect_galley(&mut probes, galley, Pos2::new(field.left(), text_top));
     paint_probes(painter, probes, Scope::Edit);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn period(line: Line) -> f32 {
+        let (dash, gap) = line.dashes();
+        dash + gap
+    }
+
+    fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+
+    #[test]
+    fn every_line_has_its_own_place_in_the_paint_order() {
+        let mut lines = Line::ALL.to_vec();
+        lines.sort_by_key(|line| line.order());
+        let orders: Vec<u8> = lines.iter().map(|line| line.order()).collect();
+        assert_eq!(orders, vec![1, 2, 3, 4, 5, 6, 7], "orders: {orders:?}");
+        assert_eq!(Line::ALL.len(), 7);
+    }
+
+    #[test]
+    fn every_dash_period_coprime_so_two_lines_never_hide_each_other() {
+        for (i, a) in Line::ALL.iter().enumerate() {
+            for b in &Line::ALL[i + 1..] {
+                let (pa, pb) = (period(*a) as u32, period(*b) as u32);
+                assert_eq!(gcd(pa, pb), 1, "{a:?} period {pa} and {b:?} period {pb} share a factor");
+            }
+        }
+    }
+
+    #[test]
+    fn a_glyph_half_a_pixel_off_still_counts_as_on_the_baseline() {
+        assert!(!still_off_baseline(10.0, 10.0));
+        assert!(!still_off_baseline(10.5, 10.0));
+        assert!(!still_off_baseline(9.5, 10.0));
+        assert!(still_off_baseline(10.51, 10.0));
+        assert!(still_off_baseline(9.49, 10.0));
+        assert!(still_off_baseline(17.0, 10.0));
+    }
 }

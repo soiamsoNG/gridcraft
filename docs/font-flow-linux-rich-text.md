@@ -1575,20 +1575,21 @@ Measurements behind two decisions:
 call `paint_probes()`, so a screenshot reads the same way whichever path drew it. All lines are 1 px,
 their vertical position is the value under test, and only the horizontal extent differs.
 
-Every line is dashed with a pair of primes, and the periods are pairwise coprime, so two lines that
-land on the same `y` interleave instead of one hiding the other. That matters for the one case the
+Every line is dashed, and the dash-plus-gap periods are seven distinct primes (5, 7, 11, 13, 17, 19,
+23), so the periods are pairwise coprime: two lines that land on the same `y` interleave instead of
+one hiding the other. That matters for the one case the
 probes exist to catch: a script run that should have moved onto the shared baseline and did not.
 With a solid line on top, that run's green line would sit exactly under the red one and disappear.
 
 | Order | Line | Colour | Dash/gap | Period | Extent | Scope |
 |---|---|---|---|---|---|---|
-| 1 | `InkBounds` | purple `(128,0,255)` | 13/17 | 30 | the row's ink width, drawn at the ink top and bottom | both |
-| 2 | `RawBaseline` | green `(0,255,0)` | 3/5 | 8 | one span per script run: that run's ink width | both |
+| 1 | `InkBounds` | purple `(128,0,255)` | 11/12 | 23 | the row's ink width, drawn at the ink top and bottom | both |
+| 2 | `RawBaseline` | green `(0,255,0)` | 3/4 | 7 | one span per script run: that run's ink width | both |
 | 3 | `SharedBaseline` | red `(255,0,0)` | 2/3 | 5 | the row's ink: first glyph's `pos.x + uv_rect.offset.x` to last glyph's `+ uv_rect.size.x` | both |
-| 4 | `Misplaced` | orange `(255,120,0)` | 17/19 | 36 | one span per script run whose glyphs are still off the shared baseline, measured *after* the correction | both |
-| 5 | `CellRect` | yellow `(255,235,0)` | 5/7 | 12 | the cell's full width, on its top and bottom edge; display mode outlines only the active cell | both |
-| 6 | `FieldRect` | cyan `(0,200,255)` | 7/11 | 18 | the rect handed to `TextEdit`, i.e. the cell inset by 2 px | edit only |
-| 7 | `RowBox` | magenta `(255,0,200)` | 11/13 | 24 | the field's width, drawn at `field.top + gh` | edit only |
+| 4 | `Misplaced` | orange `(255,120,0)` | 5/6 | 11 | one span per script run whose glyphs are still off the shared baseline, measured *after* the correction | both |
+| 5 | `CellRect` | yellow `(255,235,0)` | 6/7 | 13 | the cell's full width, on its top and bottom edge; display mode outlines only the active cell | both |
+| 6 | `FieldRect` | cyan `(0,200,255)` | 8/9 | 17 | the rect handed to `TextEdit`, i.e. the cell inset by 2 px | edit only |
+| 7 | `RowBox` | magenta `(255,0,200)` | 9/10 | 19 | the field's width, drawn at `field.top + gh` | edit only |
 
 Order is a property of the palette (`Line::order()`), not of the call sites: `paint_cell()` and
 `paint_editor()` push `(line, y, span)` into one vector, `paint_probes()` sorts it by that value and
@@ -1616,6 +1617,13 @@ than 0.5 px. Reading a row:
 - green **parallel** to red, `d` away: the run was moved by `d`; this is expected, not an error;
 - **orange anywhere**: the correction left that run off the baseline — a real bug. Orange is not a
   reference line and must never appear in a healthy build.
+
+Tests hold the parts that a screenshot cannot: `grid/tests.rs` checks that the correction moves
+each glyph's tessellated quads by the same amount as the glyph (`the_shared_baseline_carries_the_tessellated_quads_along`)
+and that `normalize_row_boxes()` moves the quads, shrinks the row box and updates `galley.rect`
+(`the_row_box_trim_moves_the_quads_and_shrinks_the_galley`); `debug_lines.rs` checks that the orders
+are 1–7 and distinct, that every pair of dash periods is coprime, and that `still_off_baseline()`
+draws its line only beyond 0.5 px.
 
 `shared_baseline()` records, per row, how far each glyph sat from that row's first glyph before it
 moved anything, keyed by the address of the galley it returns. Offsets rather than positions keep
