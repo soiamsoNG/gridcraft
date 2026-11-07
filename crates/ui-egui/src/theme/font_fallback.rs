@@ -23,6 +23,42 @@ fn fc_match_candidates(patterns: &[&str]) -> Vec<(String, u32)> {
     candidates
 }
 
+/// The system's colour emoji face.
+///
+/// `emoji` is the generic family fontconfig itself ranks emoji fonts by: `45-generic.conf` aliases
+/// every colour emoji face to it and `60-generic.conf` prefers the colour ones over the monochrome
+/// Noto Emoji. Asking for the family therefore follows the distribution's policy instead of
+/// hard-coding a vendor path, and it keeps working inside a Flatpak, where the host's fontconfig
+/// answers for `/run/host/fonts`.
+///
+/// `★`, `✓` and `→` are not in a colour emoji face, so they keep falling through to [`symbols`].
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn emoji() -> Vec<(String, u32)> {
+    #[cfg(target_os = "linux")]
+    let faces = fc_match_candidates(&["emoji", "Noto Color Emoji"]);
+    #[cfg(target_os = "macos")]
+    let faces = vec![("/System/Library/Fonts/Apple Color Emoji.ttc".into(), 0)];
+    #[cfg(target_os = "windows")]
+    let faces = {
+        let win = std::env::var("WINDIR").map_or_else(|_| "C:\\Windows\\Fonts".to_string(), |w| format!("{w}\\Fonts"));
+        vec![(format!("{win}\\seguiemj.ttf"), 0)]
+    };
+    faces
+}
+
+/// Whether the system has a colour emoji face (tests skip their glyph checks without one).
+#[cfg(test)]
+pub fn colour_emoji_installed() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        emoji().iter().any(|(path, _)| std::path::Path::new(path).exists())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
 pub(super) struct ScriptFace {
     pub(super) key: &'static str,
     sans: Vec<(String, u32)>,
@@ -252,7 +288,10 @@ pub(super) fn fallback_faces(han: HanOrder) -> Vec<ScriptFace> {
         HanOrder::Japanese => (ja, zh),
         HanOrder::Chinese => (zh, ja),
     };
-    vec![
+    // First, so an emoji code point reaches the colour face before the CJK face claims it: Noto Sans
+    // CJK covers seventy `1Fxxx` code points of its own, in monochrome (#1231).
+    let mut faces = vec![ScriptFace { key: "sys-emoji", sans: emoji(), serif: None, covers: ScriptSet::EMPTY.with(ScriptClass::Symbols) }];
+    faces.extend([
         first,
         second,
         ScriptFace {
@@ -292,7 +331,8 @@ pub(super) fn fallback_faces(han: HanOrder) -> Vec<ScriptFace> {
         ScriptFace { key: "sys-yi", sans: yi(), serif: None, covers: ScriptSet::EMPTY.with(ScriptClass::Yi) },
         ScriptFace { key: "sys-symbols", sans: symbols(), serif: None, covers: ScriptSet::EMPTY.with(ScriptClass::Symbols) },
         ScriptFace { key: "sys-symbols-2", sans: symbols_more(), serif: None, covers: ScriptSet::EMPTY.with(ScriptClass::Symbols) },
-    ]
+    ]);
+    faces
 }
 
 /// Linux directories that hold CJK fonts across distributions: Debian/Ubuntu (`opentype/noto`,

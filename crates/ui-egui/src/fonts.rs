@@ -336,13 +336,24 @@ pub fn is_symbol_family(name: &str) -> bool {
     ["emoji", "symbol", "dingbat", "icon", "webding", "wingding", "awesome"].iter().any(|word| lower.contains(word))
 }
 
+/// Whether a face draws pictograms that belong inside their box rather than on the baseline.
+///
+/// Symbol and icon faces qualify: their glyphs are designed to fill the em square and look wrong
+/// sitting on a text baseline. Emoji do not: a colour emoji is a text-sized glyph that hangs from
+/// the baseline like any other character, and centring it is what pushed 😀 off the line (#1231).
+fn is_icon_family(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["symbol", "dingbat", "icon", "webding", "wingding", "awesome"].iter().any(|word| lower.contains(word))
+}
+
 /// Where a face sits vertically when it draws for a family whose first font is another design.
 ///
 /// Text faces go on the first font's baseline: epaint's default centres a fallback in the row, which
-/// sinks CJK, Thai or Devanagari against the Latin beside it (#1231). Emoji and icon faces keep the
-/// centred default, because their glyphs fill the whole row and would drop below the baseline.
+/// sinks CJK, Thai or Devanagari against the Latin beside it (#1231). Icon faces keep the centred
+/// default, because their glyphs fill the whole row and would drop below the baseline; colour emoji
+/// are text-sized, so they sit on the baseline too.
 pub fn fallback_align(family: &str) -> egui::epaint::text::FallbackAlign {
-    if is_symbol_family(family) { egui::epaint::text::FallbackAlign::Center } else { egui::epaint::text::FallbackAlign::Baseline }
+    if is_icon_family(family) { egui::epaint::text::FallbackAlign::Center } else { egui::epaint::text::FallbackAlign::Baseline }
 }
 
 /// Sets [`fallback_align`] on a face built from `family`.
@@ -772,12 +783,12 @@ mod tests {
         assert_eq!(fallback_align("Carlito"), FallbackAlign::Baseline);
         assert_eq!(fallback_align("Noto Sans Thai"), FallbackAlign::Baseline);
         assert_eq!(fallback_align("Noto Sans Symbols 2"), FallbackAlign::Center);
-        assert_eq!(fallback_align("Noto Color Emoji"), FallbackAlign::Center);
+        assert_eq!(fallback_align("Noto Color Emoji"), FallbackAlign::Baseline);
         assert_eq!(fallback_align("Font Awesome 6 Free"), FallbackAlign::Center);
         // A face keeps its own family's rule wherever it is used.
         let mut fd = egui::FontData::from_owned(vec![0, 1, 0, 0, 0, 0xFF, 0, 0]);
         align_fallback(&mut fd, "Noto Color Emoji");
-        assert_eq!(fd.tweak.fallback_align, FallbackAlign::Center);
+        assert_eq!(fd.tweak.fallback_align, FallbackAlign::Baseline);
         align_fallback(&mut fd, "Noto Sans Devanagari");
         assert_eq!(fd.tweak.fallback_align, FallbackAlign::Baseline);
     }
@@ -1158,5 +1169,32 @@ mod tests {
         let Ok(data) = std::fs::read(root.join("Fonts").join("malgun.ttf")) else { return };
         let faces = file_faces(&data);
         assert!(faces.iter().any(|(_, family, names, _, _, _)| family == "Malgun Gothic" && names.iter().any(|n| n == "맑은 고딕")), "{faces:?}");
+    }
+}
+
+#[cfg(test)]
+mod fallback_align_tests {
+    use super::*;
+    use egui::epaint::text::FallbackAlign;
+
+    #[test]
+    fn a_colour_emoji_face_sits_on_the_baseline() {
+        assert_eq!(fallback_align("Noto Color Emoji"), FallbackAlign::Baseline);
+        assert_eq!(fallback_align("Apple Color Emoji"), FallbackAlign::Baseline);
+        assert_eq!(fallback_align("Segoe UI Emoji"), FallbackAlign::Baseline);
+        assert_eq!(fallback_align("Noto Emoji"), FallbackAlign::Baseline);
+    }
+
+    #[test]
+    fn an_icon_face_stays_centred() {
+        assert_eq!(fallback_align("Font Awesome 6 Free"), FallbackAlign::Center);
+        assert_eq!(fallback_align("Noto Sans Symbols 2"), FallbackAlign::Center);
+        assert_eq!(fallback_align("Wingdings"), FallbackAlign::Center);
+    }
+
+    #[test]
+    fn a_text_face_sits_on_the_baseline() {
+        assert_eq!(fallback_align("Noto Sans CJK SC"), FallbackAlign::Baseline);
+        assert_eq!(fallback_align("Carlito"), FallbackAlign::Baseline);
     }
 }

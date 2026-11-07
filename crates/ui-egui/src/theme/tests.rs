@@ -33,7 +33,15 @@ fn script_faces_align_on_the_family_baseline() {
         // Craft faces and system script faces are the ones that draw beside a Latin text face; the
         // egui defaults are inserted by epaint itself and keep their own alignment.
         if key.starts_with("craft-") || key.starts_with("sys-") {
-            let expected = if crate::fonts::is_symbol_family(key) { FallbackAlign::Center } else { FallbackAlign::Baseline };
+            // `sys-emoji` carries a colour emoji face, which is text-sized and belongs on the
+            // baseline; the other symbol faces keep the centred default (#1231).
+            let expected = if key == "sys-emoji" {
+                FallbackAlign::Baseline
+            } else if crate::fonts::is_symbol_family(key) {
+                FallbackAlign::Center
+            } else {
+                FallbackAlign::Baseline
+            };
             assert_eq!(fd.tweak.fallback_align, expected, "{key}");
             checked += 1;
         }
@@ -141,6 +149,7 @@ fn language_reorders_only_the_han_faces() {
     assert_eq!(
         keys(HanOrder::Japanese),
         [
+            "sys-emoji",
             "sys-cjk-han-ja",
             "sys-cjk-han-zh",
             "sys-cjk-hangul",
@@ -160,6 +169,7 @@ fn language_reorders_only_the_han_faces() {
     assert_eq!(
         keys(HanOrder::Chinese),
         [
+            "sys-emoji",
             "sys-cjk-han-zh",
             "sys-cjk-han-ja",
             "sys-cjk-hangul",
@@ -466,4 +476,17 @@ fn fedora_package_folders_are_searched_after_the_other_linux_layouts() {
     assert!(first_liberation.is_some() && first_liberation > last_dejavu, "Liberation Mono must follow DejaVu Sans Mono: {mono:?}");
     let noto = mono.iter().position(|p| p == "/usr/share/fonts/google-noto-vf/NotoSansMono[wght].ttf");
     assert!(noto.is_some() && noto.unwrap_or(0) + 1 == mono.len(), "Fedora's default Noto Sans Mono must be the last resort: {mono:?}");
+}
+
+#[test]
+/// The colour emoji face comes before the CJK faces, which carry mono emoji of their own (#1231).
+fn the_emoji_face_comes_before_the_cjk_faces() {
+    if !crate::theme::font_fallback::colour_emoji_installed() {
+        return; // no colour emoji on this host
+    }
+    let fonts = font_definitions_for_language(Language::En);
+    let chain = fonts.families.get(&FontFamily::Name(UI.into())).map(Vec::as_slice).unwrap_or_default();
+    let emoji = chain.iter().position(|k| k == "sys-emoji").expect("the colour emoji face is in the chain");
+    let cjk = chain.iter().position(|k| k.starts_with("sys-cjk-han")).expect("a CJK face is in the chain");
+    assert!(emoji < cjk, "emoji face at {emoji} must precede the CJK face at {cjk}");
 }
