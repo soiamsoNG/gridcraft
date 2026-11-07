@@ -1571,18 +1571,28 @@ Measurements behind two decisions:
 ### Debug line colours
 
 `crates/ui-egui/src/grid/debug_lines.rs` owns the palette; both paths that draw probes
-(`quadrant.rs` for a cell at rest, `editor.rs` for the cell being edited) call `draw()`, so a
-screenshot reads the same way whichever path drew it. All lines are 1 px, their vertical position
-is the value under test, and only the horizontal extent differs.
+(`quadrant.rs` for a cell at rest, `editor.rs` for the cell being edited) collect their lines and
+call `paint_probes()`, so a screenshot reads the same way whichever path drew it. All lines are 1 px,
+their vertical position is the value under test, and only the horizontal extent differs.
 
-| Line | Colour | Dash | Extent | Scope |
-|---|---|---|---|---|
-| `SharedBaseline` | red `(255,0,0)` | solid | the row's ink: first glyph's `pos.x + uv_rect.offset.x` to last glyph's `+ uv_rect.size.x` | both |
-| `RawBaseline` | green `(0,255,0)` | 4/3 | one span per script run that the correction moved: that run's ink width | both |
-| `CellRect` | yellow `(255,235,0)` | solid | the cell's full width, on its top and bottom edge; display mode outlines only the active cell | both |
-| `FieldRect` | cyan `(0,200,255)` | solid | the rect handed to `TextEdit`, i.e. the cell inset by 2 px | edit only |
-| `RowBox` | magenta `(255,0,200)` | 4/3 | the field's width, drawn at `field.top + gh` | edit only |
-| `InkBounds` | purple `(128,0,255)` | dotted 1/3 | the row's ink width, drawn at the ink top and bottom | both |
+Every line is dashed with a pair of primes, and the periods are pairwise coprime, so two lines that
+land on the same `y` interleave instead of one hiding the other. That matters for the one case the
+probes exist to catch: a script run that should have moved onto the shared baseline and did not.
+With a solid line on top, that run's green line would sit exactly under the red one and disappear.
+
+| Order | Line | Colour | Dash/gap | Period | Extent | Scope |
+|---|---|---|---|---|---|---|
+| 1 | `InkBounds` | purple `(128,0,255)` | 13/17 | 30 | the row's ink width, drawn at the ink top and bottom | both |
+| 2 | `RawBaseline` | green `(0,255,0)` | 3/5 | 8 | one span per script run: that run's ink width | both |
+| 3 | `SharedBaseline` | red `(255,0,0)` | 2/3 | 5 | the row's ink: first glyph's `pos.x + uv_rect.offset.x` to last glyph's `+ uv_rect.size.x` | both |
+| 4 | `CellRect` | yellow `(255,235,0)` | 5/7 | 12 | the cell's full width, on its top and bottom edge; display mode outlines only the active cell | both |
+| 5 | `FieldRect` | cyan `(0,200,255)` | 7/11 | 18 | the rect handed to `TextEdit`, i.e. the cell inset by 2 px | edit only |
+| 6 | `RowBox` | magenta `(255,0,200)` | 11/13 | 24 | the field's width, drawn at `field.top + gh` | edit only |
+
+Order is a property of the palette (`Line::order()`), not of the call sites: `paint_cell()` and
+`paint_editor()` push `(line, y, span)` into one vector, `paint_probes()` sorts it by that value and
+only then draws. Baselines sit under the boxes and the shared baseline sits over the raw one, so a
+new line only needs an entry in the table.
 
 Scope is enforced in code, not only here: `Line::shows_in(scope)` and every `draw()` call name the
 path they run on (`Scope::Display` from `paint_cell()`, `Scope::Edit` from `paint_editor()`), so an
@@ -1590,10 +1600,15 @@ edit-only line cannot leak into the sheet at rest. Display mode outlines only th
 the other outlines would sit on grid lines and say nothing.
 
 Rules: baselines only use red/green, boxes only yellow/cyan/magenta, ink only purple; both edges of
-a box use the same colour and dash. Green is drawn only for a script run that the correction
-actually moved, and always below the red line: a run that was already on the shared baseline keeps
-just the red line, so a row cannot show two baselines where there is one. A green span still apart
-from the red one by more than ±1 px is a bug.
+a box use the same colour and dash. Green is drawn for **every** script run, moved or not, so the
+probe cannot hide a correction that silently did nothing. Reading a row:
+
+- only red, no green: the line was laid out in one section, so no correction ran and there is
+  nothing to compare;
+- red and green **interleaved** on one `y`: that run is on the shared baseline and was not moved
+  (correct, and now visible as such);
+- a green line **apart** from the red one: `shared_baseline()` moved that run, and the gap is the
+  distance it was off. More than ±1 px left over is a bug.
 
 `shared_baseline()` records, per row, how far each glyph sat from that row's first glyph before it
 moved anything, keyed by the address of the galley it returns. Offsets rather than positions keep

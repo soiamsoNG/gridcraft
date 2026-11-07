@@ -47,12 +47,31 @@ impl Line {
         }
     }
 
-    /// Dash and gap: solid for a current value, dashed for a reference, dotted for ink.
-    fn dashes(self) -> Option<(f32, f32)> {
+    /// Dash and gap, in pixels. Every line is dashed with a pair of primes, so two lines that land
+    /// on the same y keep different periods: they interleave instead of one hiding the other. A
+    /// probe that only showed where the correction worked would hide exactly the case it exists to
+    /// catch — a script that should have moved and did not.
+    fn dashes(self) -> (f32, f32) {
         match self {
-            Self::SharedBaseline | Self::CellRect | Self::FieldRect => None,
-            Self::RawBaseline | Self::RowBox => Some((4.0, 3.0)),
-            Self::InkBounds => Some((1.0, 3.0)),
+            Self::SharedBaseline => (2.0, 3.0),
+            Self::RawBaseline => (3.0, 5.0),
+            Self::CellRect => (5.0, 7.0),
+            Self::FieldRect => (7.0, 11.0),
+            Self::RowBox => (11.0, 13.0),
+            Self::InkBounds => (13.0, 17.0),
+        }
+    }
+
+    /// Paint order, low first. Baselines sit under the boxes, and the shared baseline sits over the
+    /// raw one. `paint_*` sorts by this, so the order does not depend on which helper runs first.
+    fn order(self) -> u8 {
+        match self {
+            Self::InkBounds => 1,
+            Self::RawBaseline => 2,
+            Self::SharedBaseline => 3,
+            Self::CellRect => 4,
+            Self::FieldRect => 5,
+            Self::RowBox => 6,
         }
     }
 
@@ -123,18 +142,27 @@ pub(crate) fn enabled(group: Group) -> bool {
     groups().contains(&group)
 }
 
-/// Draws one horizontal probe line across `x`, if that line belongs to `scope`.
-pub(crate) fn draw(painter: &Painter, line: Line, scope: Scope, y: f32, x: (f32, f32)) {
-    if !line.shows_in(scope) || !enabled(line.group()) || x.0 >= x.1 || !y.is_finite() {
+/// One probe line waiting to be drawn: which line, its y, and the span of x it covers.
+type Probe = (Line, f32, (f32, f32));
+
+/// Draws one horizontal probe line across `x`.
+fn draw(painter: &Painter, line: Line, y: f32, x: (f32, f32)) {
+    if x.0 >= x.1 || !y.is_finite() {
         return;
     }
     let stroke = Stroke::new(1.0, line.color());
     let ends = [Pos2::new(x.0, y), Pos2::new(x.1, y)];
-    match line.dashes() {
-        None => {
-            painter.line_segment(ends, stroke);
+    let (dash, gap) = line.dashes();
+    painter.extend(Shape::dashed_line(&ends, stroke, dash, gap));
+}
+
+/// Draws every collected probe in [`Line::order`] order, skipping the groups that are switched off.
+fn paint_probes(painter: &Painter, mut probes: Vec<Probe>, scope: Scope) {
+    probes.sort_by_key(|(line, _, _)| line.order());
+    for (line, y, x) in probes {
+        if line.shows_in(scope) && enabled(line.group()) {
+            draw(painter, line, y, x);
         }
-        Some((dash, gap)) => painter.extend(Shape::dashed_line(&ends, stroke, dash, gap)),
     }
 }
 
@@ -205,8 +233,8 @@ fn script_runs(glyphs: &[egui::epaint::text::Glyph]) -> Vec<(usize, usize)> {
     runs.into_iter().map(|(start, end, _)| (start, end)).collect()
 }
 
-/// The probe lines of a laid-out galley whose top-left corner sits at `origin`.
-fn paint_galley(painter: &Painter, galley: &Arc<egui::Galley>, origin: Pos2, scope: Scope) {
+/// Collects the probe lines of a laid-out galley whose top-left corner sits at `origin`.
+fn collect_galley(probes: &mut Vec<Probe>, galley: &Arc<egui::Galley>, origin: Pos2) {
     let raw = raw_rows(galley);
     for (r, placed) in galley.rows.iter().enumerate() {
         let glyphs = &placed.row.glyphs;
@@ -215,24 +243,19 @@ fn paint_galley(painter: &Painter, galley: &Arc<egui::Galley>, origin: Pos2, sco
         let y = origin.y + placed.pos.y;
         let Some(first) = glyphs.first() else { continue };
         let shared = first.pos.y;
-        // Green first, red last: a run that did not move sits on the shared baseline, and the red
-        // line has to stay visible there (#1231).
         if enabled(Group::Baseline)
             && let Some(row_raw) = raw.as_ref().and_then(|rows| rows.get(r))
         {
+            // Every script run gets its line, including the ones already on the shared baseline:
+            // there the two lines interleave (their dash periods are coprime), which says "this run
+            // was not moved" instead of saying nothing at all.
             for (start, end) in script_runs(glyphs) {
                 let Some(span) = ink_span(&glyphs[start..end]) else { continue };
                 let offset = row_raw.get(start).copied().unwrap_or(0.0);
-                let before = shared + offset;
-                // Only a script that the correction moved has a raw baseline worth drawing;
-                // drawing the ones already on the shared baseline made one line look like two.
-                if (before - shared).abs() <= 0.5 {
-                    continue;
-                }
-                draw(painter, Line::RawBaseline, scope, y + before, (origin.x + span.0, origin.x + span.1));
+                probes.push((Line::RawBaseline, y + shared + offset, (origin.x + span.0, origin.x + span.1)));
             }
         }
-        draw(painter, Line::SharedBaseline, scope, y + shared, x);
+        probes.push((Line::SharedBaseline, y + shared, x));
         if enabled(Group::Ink) {
             let mut top = f32::INFINITY;
             let mut bottom = f32::NEG_INFINITY;
@@ -242,8 +265,8 @@ fn paint_galley(painter: &Painter, galley: &Arc<egui::Galley>, origin: Pos2, sco
                 bottom = bottom.max(glyph_top + glyph.uv_rect.size.y);
             }
             if top.is_finite() && bottom.is_finite() {
-                draw(painter, Line::InkBounds, scope, y + top, x);
-                draw(painter, Line::InkBounds, scope, y + bottom, x);
+                probes.push((Line::InkBounds, y + top, x));
+                probes.push((Line::InkBounds, y + bottom, x));
             }
         }
     }
@@ -256,11 +279,13 @@ pub(crate) fn paint_cell(painter: &Painter, rect: egui::Rect, galley: &Arc<egui:
     if groups().is_empty() {
         return;
     }
+    let mut probes = Vec::new();
     if active && enabled(Group::Boxes) {
-        draw(painter, Line::CellRect, Scope::Display, rect.top(), (rect.left(), rect.right()));
-        draw(painter, Line::CellRect, Scope::Display, rect.bottom(), (rect.left(), rect.right()));
+        probes.push((Line::CellRect, rect.top(), (rect.left(), rect.right())));
+        probes.push((Line::CellRect, rect.bottom(), (rect.left(), rect.right())));
     }
-    paint_galley(painter, galley, origin, Scope::Display);
+    collect_galley(&mut probes, galley, origin);
+    paint_probes(painter, probes, Scope::Display);
 }
 
 /// Probes for the cell editor: its cell, its input field, its line box, and the same text lines.
@@ -268,12 +293,14 @@ pub(crate) fn paint_editor(painter: &Painter, cell: egui::Rect, field: egui::Rec
     if groups().is_empty() {
         return;
     }
+    let mut probes = Vec::new();
     if enabled(Group::Boxes) {
-        draw(painter, Line::CellRect, Scope::Edit, cell.top(), (cell.left(), cell.right()));
-        draw(painter, Line::CellRect, Scope::Edit, cell.bottom(), (cell.left(), cell.right()));
-        draw(painter, Line::FieldRect, Scope::Edit, field.top(), (field.left(), field.right()));
-        draw(painter, Line::FieldRect, Scope::Edit, field.bottom(), (field.left(), field.right()));
-        draw(painter, Line::RowBox, Scope::Edit, field.top() + gh, (field.left(), field.right()));
+        probes.push((Line::CellRect, cell.top(), (cell.left(), cell.right())));
+        probes.push((Line::CellRect, cell.bottom(), (cell.left(), cell.right())));
+        probes.push((Line::FieldRect, field.top(), (field.left(), field.right())));
+        probes.push((Line::FieldRect, field.bottom(), (field.left(), field.right())));
+        probes.push((Line::RowBox, field.top() + gh, (field.left(), field.right())));
     }
-    paint_galley(painter, galley, Pos2::new(field.left(), text_top), Scope::Edit);
+    collect_galley(&mut probes, galley, Pos2::new(field.left(), text_top));
+    paint_probes(painter, probes, Scope::Edit);
 }
