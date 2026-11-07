@@ -103,6 +103,55 @@ pub(crate) fn shared_baseline(galley: std::sync::Arc<egui::Galley>, sections: us
     galley
 }
 
+/// The caret and the selection are drawn from each row's box, and a fallback face put on the
+/// baseline (#1231) inflates that box far beyond the text: the caret then starts well above the ink
+/// (and, in the cell editor, above the cell itself). Move the glyphs (and their tessellated quads)
+/// up so the ink is centred in a box of the cell font's own line height, and give the row that box.
+pub(crate) fn normalize_row_boxes(galley: std::sync::Arc<egui::Galley>, line_box: f32) -> std::sync::Arc<egui::Galley> {
+    let mut galley = galley;
+    for placed in std::sync::Arc::make_mut(&mut galley).rows.iter_mut() {
+        let row = std::sync::Arc::make_mut(&mut placed.row);
+        let (mut ink_top, mut ink_bottom) = (f32::INFINITY, f32::NEG_INFINITY);
+        for glyph in &row.glyphs {
+            let top = glyph.pos.y + glyph.uv_rect.offset.y;
+            ink_top = ink_top.min(top);
+            ink_bottom = ink_bottom.max(top + glyph.uv_rect.size.y);
+        }
+        if !ink_top.is_finite() || !ink_bottom.is_finite() {
+            continue;
+        }
+        let ink_h = ink_bottom - ink_top;
+        let box_h = ink_h.max(line_box.max(1.0));
+        let delta = (box_h - ink_h) / 2.0 - ink_top;
+        if delta != 0.0 {
+            // epaint tessellates a row during layout, and painting uses that mesh, so moving the
+            // glyph alone would not move the pixels: shift the quads too (#1231).
+            let starts: Vec<usize> = row.glyphs.iter().map(|g| g.first_vertex as usize).collect();
+            let vertices = row.visuals.glyph_vertex_range.clone();
+            let vertex_count = row.visuals.mesh.vertices.len();
+            for glyph in &mut row.glyphs {
+                glyph.pos.y += delta;
+            }
+            for (i, start) in starts.iter().enumerate() {
+                let start = (*start).max(vertices.start).min(vertex_count);
+                let end = starts.get(i + 1).copied().unwrap_or(vertex_count).min(vertices.end).min(vertex_count).max(start);
+                for vertex in &mut row.visuals.mesh.vertices[start..end] {
+                    vertex.pos.y += delta;
+                }
+            }
+            row.visuals.mesh_bounds.min.y += delta;
+            row.visuals.mesh_bounds.max.y += delta;
+        }
+        row.size.y = box_h;
+    }
+    // `gh` comes from `galley.rect`, not from the rows: without this, callers would still lay the
+    // galley out as tall as the untrimmed box.
+    let height = galley.rows.iter().map(|placed| placed.pos.y + placed.row.size.y).fold(0.0f32, f32::max);
+    let rect = &mut std::sync::Arc::make_mut(&mut galley).rect;
+    rect.max.y = rect.min.y + height;
+    galley
+}
+
 pub(super) fn cell_job(text: String, font: FontId, color: Color32, wrap: f32, italic: bool) -> egui::text::LayoutJob {
     let Some(coverage) = italic.then(|| crate::fonts::italic_coverage(&font.family)).flatten() else {
         return egui::text::LayoutJob::simple(text, font, color, wrap);

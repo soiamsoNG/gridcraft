@@ -511,6 +511,20 @@ pub struct EditorStyle {
     pub italic: bool,
 }
 
+/// Lays the editor's text out exactly as its `TextEdit` layouter does — script-split italics and
+/// one shared baseline — so the caller can measure it before placing the field. Colours differ
+/// from the real job (formula references), metrics do not.
+pub(crate) fn editor_probe(ui: &egui::Ui, text: &str, style: &EditorStyle, wrap_width: f32) -> std::sync::Arc<egui::Galley> {
+    let coverage = style.italic.then(|| crate::fonts::italic_coverage(&style.font.family)).flatten().flatten();
+    let mut job = egui::text::LayoutJob::default();
+    append_scripted(&mut job, text, &egui::TextFormat::simple(style.font.clone(), egui::Color32::BLACK), style.italic, coverage);
+    job.wrap.max_width = wrap_width;
+    let sections = job.sections.len();
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let galley = crate::grid::shared_baseline(galley, sections);
+    crate::grid::normalize_row_boxes(galley, ui.fonts_mut(|f| f.row_height(&style.font)))
+}
+
 pub fn editor_widget(
     app: &mut SheetApp,
     ui: &mut egui::Ui,
@@ -542,6 +556,7 @@ pub fn editor_widget(
     let reading_order = cell_reading_order(app, ed.sheet, ed.cell);
     let italic = style.italic;
     let coverage = italic.then(|| crate::fonts::italic_coverage(&font2.family)).flatten().flatten();
+    let line_box = ui.fonts_mut(|f| f.row_height(&font2));
     let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let s = buf.as_str();
         let mut job = egui::text::LayoutJob {
@@ -570,7 +585,8 @@ pub fn editor_widget(
         job.wrap.max_width = if multiline { wrap_width } else { f32::INFINITY };
         let sections = job.sections.len();
         let galley = ui.fonts_mut(|f| f.layout_job(job));
-        crate::grid::shared_baseline(galley, sections)
+        let galley = crate::grid::shared_baseline(galley, sections);
+        crate::grid::normalize_row_boxes(galley, line_box)
     };
     let chars_before = ed.text.chars().count();
     // A dialog opened over the edit (Paste Name) takes the keyboard until it closes, and the

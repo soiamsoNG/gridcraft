@@ -1,6 +1,6 @@
 //! The in-cell editor covers the edited cell exactly, as in Excel, at every zoom (#1755).
 
-use egui::{Color32, Event, Modifiers, PointerButton, Rect, Shape};
+use egui::{Color32, Event, Id, Modifiers, PointerButton, Rect, Shape};
 use gridcraft_engine::Session;
 use gridcraft_engine::core::CellRef;
 use gridcraft_ui_egui::{SheetApp, grid::Geo};
@@ -84,4 +84,38 @@ fn one_long_line_widens_the_editor_but_keeps_the_row_height() {
     let ed = editor_rect(&h, cell);
     assert!(ed.width() > cell.width() + 1.0, "long text widens the editor: {ed:?} vs {cell:?}");
     assert!((ed.height() - cell.height()).abs() < 0.01, "one line keeps the row height: {ed:?} vs {cell:?}");
+}
+
+/// The editing text sits where the cell's own text sits: it follows the cell's vertical alignment,
+/// so entering or leaving the edit does not move it.
+#[test]
+fn the_editor_text_follows_the_cells_vertical_alignment() {
+    let mut tall = Vec::new();
+    let mut top_inks = Vec::new();
+    for (align, command) in [("top", Some("home.alignTop")), ("center", Some("home.alignMiddle")), ("bottom", None)] {
+        for height in [20.0, 200.0] {
+            let mut h = harness();
+            h.state_mut().session.execute("home.rowHeight", json!({"rows": "1:1", "height": height})).unwrap();
+            if let Some(c) = command {
+                h.state_mut().session.execute(c, json!({"range": "A1"})).unwrap();
+            }
+            h.run_steps(2);
+            h.state_mut().begin_edit(Some("Hello 中文".into()), false);
+            h.run_steps(2);
+            let field = h.ctx.read_response(Id::unique("gridcraft.cell_editor")).expect("the in-cell editor is shown").rect;
+            let cell = cell_rect(&h, "A1");
+            let ink_top: f32 = h.ctx.data(|d| d.get_temp(Id::unique("gridcraft.cell_editor.ink"))).expect("the editor recorded its ink gap");
+            let gap = field.top() + ink_top - cell.top();
+            if height > 100.0 {
+                tall.push(gap);
+            }
+            // Top alignment is the one that ignores the row height: the ink starts 2 z below the edge.
+            if align == "top" {
+                top_inks.push(gap);
+            }
+        }
+    }
+    assert!((top_inks[0] - top_inks[1]).abs() < 0.51, "top: the ink moved with the row height: {top_inks:?}");
+    assert!(tall[0] < tall[1] && tall[1] < tall[2], "top < center < bottom in a tall row: {tall:?}");
+    assert!(tall[2] - tall[0] > 100.0, "a tall row separates the three alignments: {tall:?}");
 }

@@ -1,6 +1,9 @@
-use super::cell_paint::ink_on;
+use super::cell_paint::{Ink, ink_insets, ink_on};
+use super::cell_paint::{cell_text_y, wrapped_cell_text_y};
 use super::geo::Geo;
-use super::{Align2, CellRef, Color32, FontId, PatternType, Rect, Sheet, SheetApp, Stroke, StrokeKind, Tokens, Workbook, json, pos2, theme, vec2};
+use super::{
+    Align2, CellRef, Color32, FontId, PatternType, Rect, Sheet, SheetApp, Stroke, StrokeKind, Tokens, VAlign, Workbook, json, pos2, theme, vec2,
+};
 
 /// Room the in-cell editor keeps right of its text. It is sized from the text of the last frame, so
 /// the next typed character must still fit: a fixed 14 px was less than one glyph at high zoom,
@@ -13,6 +16,12 @@ pub(super) fn editor_slack(size: f32) -> f32 {
 /// editor is exactly the cell wide, as in Excel; once it overflows, the extra `editor_slack` applies.
 pub(super) fn editor_width(text_w: f32, cell_w: f32, size: f32) -> f32 {
     if text_w + 14.0 <= cell_w { cell_w } else { text_w + editor_slack(size) }
+}
+
+/// Top of the in-cell editor's line box: the cell's own text, put where the cell's vertical
+/// alignment puts it, so entering and leaving the edit never moves the text.
+pub(super) fn editor_text_top(rect: Rect, z: f32, ink: Ink, galley_h: f32, valign: VAlign, wrap: bool) -> f32 {
+    if wrap { wrapped_cell_text_y(valign, rect, galley_h, z, ink) } else { cell_text_y(valign, rect, galley_h, z, ink) }
 }
 
 /// Draws the in-cell editor, growing and wrapping with its text, mirroring for right-to-left sheets, choosing contrasting caret ink and clipping cells hidden under frozen panes.
@@ -73,21 +82,53 @@ pub(super) fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, s
     let painter = ui.painter().with_clip_rect(clip);
     painter.rect_filled(erect, 0.0, fill);
     painter.rect_stroke(erect.expand(1.0), 0.0, Stroke::new(2.0, Tokens::get(ui.ctx()).sel_border), StrokeKind::Middle);
+    // The editor's text sits exactly where the cell's text sits: `TextEdit` puts its galley at the
+    // top of the rect it is given, so the field starts at the line box top that `cell_text_y()`
+    // returns for the cell's own vertical alignment.
+    let style = crate::formula_bar::EditorStyle { font: font.clone(), italic: st.font.italic };
+    let wrap_width = if wrap { (erect.width() - 4.0).max(1.0) } else { f32::INFINITY };
+    let probe = crate::formula_bar::editor_probe(ui, &ed.text, &style, wrap_width);
+    let ink = ink_insets(&probe);
+    let text_top = editor_text_top(rect, geo.z, ink, probe.size().y, st.align.v, wrap);
+    // The tests read the ink gap back to check the text starts `2 z` below the cell's top edge.
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.ink"), ink.top));
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.height"), probe.size().y));
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.z"), geo.z));
+    let field = Rect::from_min_max(pos2(erect.left() + 2.0, text_top), pos2(erect.right() - 2.0, (erect.bottom() - 1.0).max(text_top + size)));
+    if std::env::var_os("GRIDCRAFT_EDITOR_DEBUG").is_some() {
+        // Debug lines follow the palette in docs/font-flow-linux-rich-text.md: baselines are red
+        // (shared) and green (per script), boxes are yellow (cell), cyan (input field) and magenta
+        // (line box).
+        let line = |y: f32, color: Color32| {
+            ui.painter().line_segment([pos2(erect.left(), y), pos2(erect.right(), y)], Stroke::new(1.0, color));
+        };
+        const CELL: Color32 = Color32::from_rgb(255, 235, 0);
+        const FIELD: Color32 = Color32::from_rgb(0, 200, 255);
+        const ROW: Color32 = Color32::from_rgb(255, 0, 200);
+        line(erect.top(), CELL);
+        line(erect.bottom(), CELL);
+        line(field.top(), FIELD);
+        line(field.bottom(), FIELD);
+        line(field.top() + probe.size().y, ROW);
+        let baseline = probe.rows.first().and_then(|placed| placed.row.glyphs.first().map(|glyph| field.top() + placed.pos.y + glyph.pos.y));
+        if let Some(baseline) = baseline {
+            line(baseline, Color32::RED);
+        }
+        log::warn!(
+            "editor cell={cell:?} rect={erect:?} field={field:?} text_top={text_top} ink_top={} gh={} v={:?} z={}",
+            ink.top,
+            probe.size().y,
+            st.align.v,
+            geo.z
+        );
+    }
     let id = egui::Id::unique("gridcraft.cell_editor");
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(erect.shrink2(vec2(2.0, 1.0))));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field));
     child.set_clip_rect(clip);
     // The theme's caret is meant for the UI chrome and vanishes on some fills (and, in the dark
     // theme, on the white paper): pick black or white against the fill, like Excel.
     child.visuals_mut().text_cursor.stroke.color = ink_on(fill);
-    crate::formula_bar::editor_widget(
-        app,
-        &mut child,
-        id,
-        &crate::formula_bar::EditorStyle { font, italic: st.font.italic },
-        wrap,
-        erect.width() - 4.0,
-        erect.height() - 2.0,
-    );
+    crate::formula_bar::editor_widget(app, &mut child, id, &style, wrap, erect.width() - 4.0, erect.height() - 2.0);
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.rect"), erect));
 }
 

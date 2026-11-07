@@ -576,6 +576,16 @@ Cell text:
   the galley through `shared_baseline()`. Without that, an editing italic cell
   lost its synthetic slant and its mixed-script baselines — the `TextEdit` knows
   nothing about per-script italics or epaint's per-section growth.
+  Its field is also anchored by ink, not by the row: `editor_text_top()` puts the line box
+  so the highest ink starts `2 z` below the cell's top edge — the same rule
+  `cell_text_y(VAlign::Top, …)` applies to the cell's own text, so a tall row neither pushes the
+  The editor takes its line box top from the same `cell_text_y()`/`wrapped_cell_text_y()` the cell
+  paints with, for the cell's own vertical alignment, so entering or leaving the edit does not move
+  the text (`the_editor_text_follows_the_cells_vertical_alignment`).
+  The caret and selection come from `TextEdit`'s row boxes, which the baseline fallback inflates:
+  `trim_row_boxes()` trims each row's box to the cell font's own line height while the glyphs keep
+  their positions (`the_caret_covers_the_text_line_and_not_the_fallback_box`).
+
 - `every_section_of_a_line_shares_one_baseline()` (`crates/ui-egui/src/grid/tests.rs`)
   lays out a two-section line and asserts that every glyph sits on one
   baseline.
@@ -1557,6 +1567,24 @@ Measurements behind two decisions:
   over the top border. Do not retry it.
 
 ---
+
+### Debug line colours
+
+Temporary probes draw 1 px lines in one fixed palette, so a screenshot reads the
+same way whichever path drew it. Baselines are red and green; only boxes get
+other colours, and a box draws both of its edges in its own colour.
+
+| Line | Colour | What it marks |
+|---|---|---|
+| Shared baseline (after `shared_baseline()`) | red `(255,0,0)` | Where the row's text sits: `field.top + placed.pos.y + glyph.pos.y` for the first glyph. |
+| Raw baseline (before correction) | green `(0,255,0)` | Each script's own baseline where it sat before `shared_baseline()`, drawn across that script's glyphs only. Only visible when a row has several sections. |
+| Cell rectangle | yellow `(255,235,0)` | `erect.top()` and `erect.bottom()`: the cell the editor is painting into. |
+| Input field | cyan `(0,200,255)` | `field.top()` and `field.bottom()`: the rectangle handed to `TextEdit`. |
+| Line box | magenta `(255,0,200)` | `field.top + gh`: the galley height `TextEdit` uses for the caret and the selection. |
+
+The editor draws them when `GRIDCRAFT_EDITOR_DEBUG` is set; the cell path uses
+`GRIDCRAFT_BASELINE` for the red/green pair. A green line hidden under the red
+one means the scripts share a baseline; ±1 px is the accepted tolerance.
 
 ## 10. fontconfig 0.11 API coverage and gaps
 

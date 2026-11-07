@@ -580,3 +580,48 @@ fn every_section_of_a_line_shares_one_baseline() {
     });
     out.textures_delta.clear();
 }
+
+#[test]
+fn the_editor_puts_its_text_where_the_cell_puts_it() {
+    let rect = egui::Rect::from_min_size(egui::pos2(100.0, 40.0), egui::vec2(80.0, 96.0));
+    let ink = Ink { top: 4.0, bottom: 3.0 };
+    let gh = 33.0;
+    for z in [0.8f32, 1.0, 1.25, 2.0] {
+        for v in [super::VAlign::Top, super::VAlign::Center, super::VAlign::Bottom] {
+            let ed = super::editor::editor_text_top(rect, z, ink, gh, v, false);
+            assert!((ed - super::cell_text_y(v, rect, gh, z, ink)).abs() < 1e-3, "z {z} {v:?}");
+            let ed_w = super::editor::editor_text_top(rect, z, ink, gh, v, true);
+            assert!((ed_w - super::wrapped_cell_text_y(v, rect, gh, z, ink)).abs() < 1e-3, "wrapped z {z} {v:?}");
+        }
+        // Top alignment still starts the ink 2 z below the cell edge, as the Top button does.
+        let top = super::editor::editor_text_top(rect, z, ink, gh, super::VAlign::Top, false);
+        assert!((top + ink.top - (rect.top() + 2.0 * z)).abs() < 1e-3, "z {z}");
+    }
+}
+
+#[test]
+fn the_caret_covers_the_text_line_and_not_the_fallback_box() {
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let mut job = egui::text::LayoutJob { text: "Hello 中文".to_owned(), ..Default::default() };
+        job.sections.push(egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range: egui::text::ByteIndex(0)..egui::text::ByteIndex(6),
+            format: egui::TextFormat::simple(egui::FontId::new(19.2, egui::FontFamily::Proportional), egui::Color32::BLACK),
+        });
+        job.sections.push(egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range: egui::text::ByteIndex(6)..egui::text::ByteIndex(12),
+            format: egui::TextFormat::simple(egui::FontId::new(19.2, egui::FontFamily::Proportional), egui::Color32::BLACK),
+        });
+        let line_box = ctx.fonts_mut(|f| f.row_height(&egui::FontId::new(19.2, egui::FontFamily::Proportional)));
+        let galley = super::quadrant::layout_job_or_default(&painter, job);
+        let tall = galley.rows[0].rect().height();
+        let galley = super::quadrant::normalize_row_boxes(galley, line_box);
+        let caret = galley.pos_from_cursor(egui::text::CCursor::new(0));
+        assert!(caret.height() <= line_box + 0.51, "caret {caret:?} vs line box {line_box} (row was {tall})");
+        assert!(caret.top() >= galley.rect.top() - 0.51, "caret starts above the line box: {caret:?} vs {:?}", galley.rect);
+    });
+    out.textures_delta.clear();
+}

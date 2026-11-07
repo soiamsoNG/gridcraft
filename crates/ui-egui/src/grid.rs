@@ -46,7 +46,7 @@ pub use editor::validation_arrow;
 use editor::{editor_slack, editor_width, list_picker_height};
 pub use geo::Geo;
 pub use interact::{follow_link, freeze_handles, point_move};
-pub(crate) use quadrant::{QuadrantPaint, paint_quadrant, shared_baseline};
+pub(crate) use quadrant::{QuadrantPaint, normalize_row_boxes, paint_quadrant, shared_baseline};
 pub use selection::selection_fill;
 pub(crate) use selection::{SelectionPaintInput, paint_selection};
 pub(crate) use show::horizontal_scrollbar;
