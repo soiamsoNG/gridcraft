@@ -3,9 +3,9 @@
 Status: design note and implementation map.
 
 - Repository: `storytold/gridcraft`
-- Branch: `port/ontario-037` (ported onto `origin/main` at `178f3eb7`; local only)
-- HEAD when this revision was written: `b09e796c fix(ui): keep whole wrapped lines at the top of an overflowing cell (#2752)`
-- Last updated: 2026-11-03 (sections 3, 10.5, 12 and 14 describe the port line)
+- Branch: `port/ontario-037` (ported onto `origin/main` at `6a8eb4ff`; local only)
+- HEAD when this revision was written: `a4b2da99 chore(ui): draw the layout probes from one scoped palette (#1231)`
+- Last updated: 2026-11-07 (sections 3, 9, 10.5, 12 and 14 describe the port line)
 - Related issue: `#1231`
 - Current PR: `#1972` points at `fix/linux-fontconfig`; this branch has no PR
 
@@ -113,7 +113,7 @@ Fonts remain external assets. GridCraft must not bundle fonts outside the
 
 ## 3. Current implementation
 
-This section describes the code on this branch at HEAD `b09e796c`. It states what
+This section describes the code on this branch at HEAD `a4b2da99`. It states what
 the code does now, not how it differs from another line: the comparison with
 `fix/linux-fontconfig-0121` is in §10.5 and §12. Functions and files are the
 anchors; line numbers are omitted on purpose because every phase moves them.
@@ -1768,9 +1768,13 @@ Consequences for this document's plans:
 ## 12. Current project status
 
 - Branch: `port/ontario-037`, a port of the fontconfig line onto `origin/main`
-  at `178f3eb7` (2026-11-02), last rebased 2026-11-03. 34 commits on top of that
-  base; local only.
-- Last code commit: `b09e796c` (`fix(ui): keep whole wrapped lines at the top of
+  at `6a8eb4ff` (2026-11-07). 39 commits on top of that base; local only.
+- The 2026-11-07 work was regrouped so each commit is the final implementation
+  of one idea rather than its last iteration: `a4b2da99` (the scoped probe
+  palette), `12a37fe8` (the editor's text and line box follow the cell),
+  `f26fd5ec` (per-script synthetic italics while editing), `01e9ded1` (one
+  shared baseline per line) and `c219f751` (input-method commits on the grid,
+  bold scripts off tofu). Earlier commits on the same line: `b09e796c` (`fix(ui): keep whole wrapped lines at the top of
   an overflowing cell (#2752)`); before it `7f645682` (`fix(ui): start an app
   with no families bound by the previous font set (#1231)`), `0d831dab`
   (`pick_face` nearest weight), `91aa91c9` (subpixel binning off), `53455682`
