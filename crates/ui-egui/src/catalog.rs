@@ -203,7 +203,9 @@ fn preferred_families(script: ScriptClass, serif: bool) -> &'static [&'static st
         (ScriptClass::Bengali, true) => &["Noto Serif Bengali", "Noto Sans Bengali", "Lohit Bengali"],
         (ScriptClass::Ethiopic, false) => &["Noto Sans Ethiopic", "Abyssinica SIL"],
         (ScriptClass::Ethiopic, true) => &["Noto Serif Ethiopic", "Noto Sans Ethiopic", "Abyssinica SIL"],
-        (ScriptClass::Symbols, false) => &["Noto Sans Symbols 2", "Noto Sans Symbols", "DejaVu Sans"],
+        // Colour first: a symbols face draws emoji as monochrome outlines, and a cell that shows
+        // an emoji shows it in colour (#1231).
+        (ScriptClass::Symbols, false) => &["Noto Color Emoji", "Noto Sans Symbols 2", "Noto Sans Symbols", "DejaVu Sans"],
         (ScriptClass::Symbols, true) => &["Noto Sans Symbols 2", "DejaVu Sans"],
         (ScriptClass::Latin, false) => &["DejaVu Sans", "Liberation Sans", "Noto Sans"],
         (ScriptClass::Latin, true) => &["DejaVu Serif", "Liberation Serif", "Noto Serif"],

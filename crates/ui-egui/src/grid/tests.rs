@@ -628,7 +628,7 @@ fn the_caret_covers_the_text_line_and_not_the_fallback_box() {
 
 /// A one-line job cut into two sections at `split` bytes, laid out in two sizes: a section whose
 /// fallback face reaches deeper than the font's own descent grows its line, which is what
-/// `shared_baseline()` has to undo.
+/// `align_baseline()` has to undo.
 fn two_section_job(text: &str, split: usize, first: f32, second: f32) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob { text: text.to_owned(), ..Default::default() };
     job.sections.push(egui::text::LayoutSection {
@@ -655,7 +655,7 @@ fn quad_delta(before: &egui::epaint::text::Row, after: &egui::epaint::text::Row,
 }
 
 #[test]
-fn the_shared_baseline_carries_the_tessellated_quads_along() {
+fn the_baseline_alignment_carries_the_tessellated_quads_along() {
     // epaint tessellates a row during layout and painting uses that mesh, so moving `glyph.pos.y`
     // alone would leave the pixels where they were (#1231).
     let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -665,7 +665,7 @@ fn the_shared_baseline_carries_the_tessellated_quads_along() {
     let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
         let painter = ctx.layer_painter(egui::LayerId::background());
         let before = painter.layout_job(two_section_job("Hello world", 5, 19.2, 11.0));
-        let after = super::quadrant::shared_baseline(before.clone(), 2);
+        let after = super::quadrant::align_baseline(before.clone());
         let (b, a) = (&before.rows[0], &after.rows[0]);
         let mut moved = 0;
         for (i, (gb, ga)) in b.glyphs.iter().zip(&a.glyphs).enumerate() {
@@ -709,6 +709,45 @@ fn the_row_box_trim_moves_the_quads_and_shrinks_the_galley() {
         }
         let height = after.rows.iter().map(|placed| placed.pos.y + placed.row.size.y).fold(0.0f32, f32::max);
         assert!((after.rect.max.y - after.rect.min.y - height).abs() < 1e-3, "galley rect {:?} vs rows {height}", after.rect);
+    });
+    out.textures_delta.clear();
+}
+
+#[test]
+fn an_emoji_in_one_section_lands_on_the_text_baseline() {
+    // A `Center` face (emoji, icons) sits in the middle of the row box even when the whole cell is
+    // one section, so the correction cannot depend on the section count (#1231).
+    let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ctx = egui::Context::default();
+    ctx.set_fonts(crate::theme::font_definitions_for_language(crate::i18n::Language::En));
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let job = egui::text::LayoutJob::simple(
+            "Hello 😀".to_owned(),
+            egui::FontId::new(19.2, egui::FontFamily::Proportional),
+            egui::Color32::BLACK,
+            f32::INFINITY,
+        );
+        let before = painter.layout_job(job);
+        assert_eq!(before.rows[0].glyphs.len(), 7, "the emoji is one glyph");
+        let distinct = |g: &std::sync::Arc<egui::Galley>| {
+            let mut ys: Vec<f32> = g.rows[0].glyphs.iter().map(|glyph| glyph.pos.y).collect();
+            ys.sort_by(|a, b| a.total_cmp(b));
+            ys.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+            ys.len()
+        };
+        let spread = distinct(&before);
+        let after = super::quadrant::align_baseline(before.clone());
+        assert_eq!(distinct(&after), 1, "one baseline after the correction (was {spread})");
+        for (i, (b, a)) in before.rows[0].glyphs.iter().zip(&after.rows[0].glyphs).enumerate() {
+            if let Some(quad) = quad_delta(&before.rows[0], &after.rows[0], i) {
+                assert!((quad - (a.pos.y - b.pos.y)).abs() < 1e-3, "glyph {i}: quads follow");
+            }
+        }
+        if spread == 1 {
+            // No host emoji face loaded: nothing to correct here, but the call must not disturb it.
+            eprintln!("no emoji face on this host: the line already had one baseline");
+        }
     });
     out.textures_delta.clear();
 }

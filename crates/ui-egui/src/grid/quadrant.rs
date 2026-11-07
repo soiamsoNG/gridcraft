@@ -32,7 +32,7 @@ pub(super) fn layout_job_or_default(p: &egui::Painter, mut job: egui::text::Layo
         section.format.font_id = bound_font(section.format.font_id.clone());
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.layout_job(job.clone()))) {
-        Ok(galley) => shared_baseline(galley, job.sections.len()),
+        Ok(galley) => align_baseline(galley),
         Err(_) => {
             log::warn!(
                 "cell text could not be laid out in {:?}; drawing it in the default family",
@@ -61,12 +61,12 @@ pub(super) fn layout_no_wrap_or_default(p: &egui::Painter, text: String, font: F
     }
 }
 
-/// epaint grows a line per *section* when a fallback face reaches above or below the font's own
-/// ascent and descent, and a section grown below the baseline then sits higher than its neighbour
-/// once the row is aligned. A cell splits its text into sections for per-script italics, so the
-/// scripts of one line end up on different baselines. Put every script run back on the baseline
-/// of the row's first glyph (#1231).
-pub(crate) fn shared_baseline(galley: std::sync::Arc<egui::Galley>, sections: usize) -> std::sync::Arc<egui::Galley> {
+/// epaint places each glyph against the face that draws it: a fallback face that reaches above or
+/// below the font's own ascent and descent moves its glyphs off the row's baseline, and a face kept
+/// `Center` (emoji and icons, see `fonts::fallback_align()`) sits in the middle of the row box. Both
+/// happen inside a single section, so this cannot key off the section count. Put every glyph back on
+/// the baseline of the row's first glyph (#1231).
+pub(crate) fn align_baseline(galley: std::sync::Arc<egui::Galley>) -> std::sync::Arc<egui::Galley> {
     let mut galley = galley;
     // The probes draw a green line where each script sat before this correction, so the original
     // baselines are kept before anything moves (#1231).
@@ -81,7 +81,7 @@ pub(crate) fn shared_baseline(galley: std::sync::Arc<egui::Galley>, sections: us
             })
             .collect::<Vec<Vec<f32>>>()
     });
-    if sections >= 2 {
+    {
         for placed in std::sync::Arc::make_mut(&mut galley).rows.iter_mut() {
             let row = std::sync::Arc::make_mut(&mut placed.row);
             let Some(reference) = row.glyphs.first().map(|g| g.pos.y) else { continue };

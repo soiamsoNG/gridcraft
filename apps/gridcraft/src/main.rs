@@ -1,6 +1,7 @@
 //! GridCraft desktop app.
 //!
-//! Usage: `gridcraft [--control <port> [--control-token <token>]] [--sample <name>] [files…]`
+//! Usage: `gridcraft [--control <port> [--control-token <token>]] [--sample <name>]
+//! [--debug-lines[=baseline,boxes,ink]] [files…]`
 //!
 //! `--control <port>` (or `GRIDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control
 //! server: `{"id":1,"method":"ui.inspect","params":{}}` → `{"id":1,"ok":true,"result":…}`.
@@ -309,6 +310,12 @@ fn main() -> eframe::Result<()> {
             "--sample" => {
                 i += 1;
                 sample = Some(args.get(i).cloned().unwrap_or_else(|| "sales".into()));
+            }
+            "--debug-lines" => {
+                gridcraft_ui_egui::enable_debug_lines("all");
+            }
+            a if a.starts_with("--debug-lines=") => {
+                gridcraft_ui_egui::enable_debug_lines(&a["--debug-lines=".len()..]);
             }
             a if a.starts_with("-psn_") => {}
             a => files.push(a.to_string()),

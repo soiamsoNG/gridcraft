@@ -1596,6 +1596,13 @@ Order is a property of the palette (`Line::order()`), not of the call sites: `pa
 only then draws. Baselines sit under the boxes and the shared baseline sits over the raw one, so a
 new line only needs an entry in the table.
 
+Switching them on: `gridcraft --debug-lines book.xlsx` (or `--debug-lines=baseline,boxes,ink`)
+calls `gridcraft_ui_egui::enable_debug_lines()` before the first frame, and
+`GRIDCRAFT_DEBUG_LINES=all` reaches the same switch from the environment (`GRIDCRAFT_BASELINE` and
+`GRIDCRAFT_EDITOR_DEBUG` are older aliases that still turn everything on). Use the flag for a
+hand check of the font behaviour: the window then carries the lines, so a screenshot taken by eye
+and one taken by the control channel read the same way.
+
 Scope is enforced in code, not only here: `Line::shows_in(scope)` is checked in `paint_probes()`
 against the path that called it (`Scope::Display` from `paint_cell()`, `Scope::Edit` from
 `paint_editor()`), so an edit-only line cannot leak into the sheet at rest. Display mode outlines only the active cell because

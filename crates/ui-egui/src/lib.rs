@@ -38,6 +38,15 @@ pub mod formula_bar;
 mod formula_locale;
 pub mod function_library;
 pub mod grid;
+
+/// Switches on the text probe lines documented in `docs/font-flow-linux-rich-text.md` §9.
+///
+/// `spec` is `all`, or a comma- or space-separated list of `baseline`, `boxes` and `ink`. The app
+/// passes `--debug-lines` here; `GRIDCRAFT_DEBUG_LINES` reaches the same switch from the
+/// environment. Call it before the first frame — a later call is ignored.
+pub fn enable_debug_lines(spec: &str) -> bool {
+    crate::grid::debug_lines::set_spec(spec)
+}
 pub mod i18n;
 pub mod icons;
 pub mod keymap;

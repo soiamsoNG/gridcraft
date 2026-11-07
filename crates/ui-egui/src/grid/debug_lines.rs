@@ -21,9 +21,9 @@ use crate::script::{ScriptClass, classify};
 /// One line in the probe palette.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Line {
-    /// Where the text of a row sits after `shared_baseline()`.
+    /// Where the text of a row sits after `align_baseline()`.
     SharedBaseline,
-    /// Where each script's glyphs sat before `shared_baseline()`, one span per script.
+    /// Where each script's glyphs sat before `align_baseline()`, one span per script.
     RawBaseline,
     /// The cell rectangle handed to the paint code.
     CellRect,
@@ -122,27 +122,43 @@ pub(crate) enum Group {
     Ink,
 }
 
+/// The switch handed to [`set_spec`] by the app's `--debug-lines` flag, before the first frame.
+static SPEC: OnceLock<Vec<Group>> = OnceLock::new();
+
+/// Reads `all`, or a comma- or space-separated list of `baseline`, `boxes` and `ink`.
+fn parse_groups(raw: &str) -> Vec<Group> {
+    let mut groups = Vec::new();
+    for part in raw.split([',', ' ']).map(str::trim).filter(|p| !p.is_empty()) {
+        match part {
+            "all" => return vec![Group::Baseline, Group::Boxes, Group::Ink],
+            "baseline" | "baselines" => groups.push(Group::Baseline),
+            "boxes" | "box" => groups.push(Group::Boxes),
+            "ink" => groups.push(Group::Ink),
+            other => log::warn!("debug lines: unknown group {other:?}"),
+        }
+    }
+    groups
+}
+
+/// The groups switched on for this process: the `--debug-lines` flag first, then the environment.
 fn groups() -> &'static [Group] {
-    static GROUPS: OnceLock<Vec<Group>> = OnceLock::new();
-    GROUPS
-        .get_or_init(|| {
-            if ["GRIDCRAFT_BASELINE", "GRIDCRAFT_EDITOR_DEBUG"].iter().any(|name| std::env::var_os(name).is_some()) {
-                return vec![Group::Baseline, Group::Boxes, Group::Ink];
-            }
-            let Ok(raw) = std::env::var("GRIDCRAFT_DEBUG_LINES") else { return Vec::new() };
-            let mut groups = Vec::new();
-            for part in raw.split([',', ' ']).map(str::trim).filter(|p| !p.is_empty()) {
-                match part {
-                    "all" => return vec![Group::Baseline, Group::Boxes, Group::Ink],
-                    "baseline" | "baselines" => groups.push(Group::Baseline),
-                    "boxes" | "box" => groups.push(Group::Boxes),
-                    "ink" => groups.push(Group::Ink),
-                    other => log::warn!("GRIDCRAFT_DEBUG_LINES: unknown group {other:?}"),
-                }
-            }
-            groups
-        })
-        .as_slice()
+    SPEC.get_or_init(|| {
+        if ["GRIDCRAFT_BASELINE", "GRIDCRAFT_EDITOR_DEBUG"].iter().any(|name| std::env::var_os(name).is_some()) {
+            return vec![Group::Baseline, Group::Boxes, Group::Ink];
+        }
+        match std::env::var("GRIDCRAFT_DEBUG_LINES") {
+            Ok(raw) => parse_groups(&raw),
+            Err(_) => Vec::new(),
+        }
+    })
+    .as_slice()
+}
+
+/// Switches every probe named in `spec` on (`all`, or any of `baseline`, `boxes`, `ink`). The app
+/// calls this from `--debug-lines` before the first frame; a later call cannot change the answer,
+/// because the first frame already decided the layout it applies to.
+pub(crate) fn set_spec(spec: &str) -> bool {
+    SPEC.set(parse_groups(spec)).is_ok()
 }
 
 /// Whether any probe is switched on.
@@ -189,7 +205,7 @@ fn paint_probes(painter: &Painter, mut probes: Vec<Probe>, scope: Scope) {
     }
 }
 
-// How far each glyph of a row sat from the row's first glyph before `shared_baseline()` moved it,
+// How far each glyph of a row sat from the row's first glyph before `align_baseline()` moved it,
 // keyed by the address of the galley that came out of it. Offsets rather than positions keep the
 // green line on the text when a later step shifts the whole row uniformly (`normalize_row_boxes`).
 // Only filled while a probe is on.
@@ -372,5 +388,30 @@ mod tests {
         assert!(still_off_baseline(10.51, 10.0));
         assert!(still_off_baseline(9.49, 10.0));
         assert!(still_off_baseline(17.0, 10.0));
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    #[test]
+    fn a_spec_names_the_groups_it_switches_on() {
+        assert_eq!(parse_groups("all"), vec![Group::Baseline, Group::Boxes, Group::Ink]);
+        assert_eq!(parse_groups("baseline"), vec![Group::Baseline]);
+        assert_eq!(parse_groups("boxes, ink"), vec![Group::Boxes, Group::Ink]);
+        assert_eq!(parse_groups(" box ,baseline "), vec![Group::Boxes, Group::Baseline]);
+    }
+
+    #[test]
+    fn an_empty_spec_switches_nothing_on() {
+        assert!(parse_groups("").is_empty());
+        assert!(parse_groups(" , ").is_empty());
+    }
+
+    #[test]
+    fn an_unknown_group_is_skipped_not_fatal() {
+        assert_eq!(parse_groups("baseline,nonsense"), vec![Group::Baseline]);
+        assert_eq!(parse_groups("nonsense"), Vec::new());
     }
 }

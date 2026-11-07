@@ -519,9 +519,8 @@ pub(crate) fn editor_probe(ui: &egui::Ui, text: &str, style: &EditorStyle, wrap_
     let mut job = egui::text::LayoutJob::default();
     append_scripted(&mut job, text, &egui::TextFormat::simple(style.font.clone(), egui::Color32::BLACK), style.italic, coverage);
     job.wrap.max_width = wrap_width;
-    let sections = job.sections.len();
     let galley = ui.fonts_mut(|f| f.layout_job(job));
-    let galley = crate::grid::shared_baseline(galley, sections);
+    let galley = crate::grid::align_baseline(galley);
     crate::grid::normalize_row_boxes(galley, ui.fonts_mut(|f| f.row_height(&style.font)))
 }
 
@@ -583,9 +582,8 @@ pub fn editor_widget(
         }
         append_scripted(&mut job, s.get(pos..).unwrap_or(""), &egui::TextFormat::simple(font2.clone(), cell_text_color), italic, coverage);
         job.wrap.max_width = if multiline { wrap_width } else { f32::INFINITY };
-        let sections = job.sections.len();
         let galley = ui.fonts_mut(|f| f.layout_job(job));
-        let galley = crate::grid::shared_baseline(galley, sections);
+        let galley = crate::grid::align_baseline(galley);
         crate::grid::normalize_row_boxes(galley, line_box)
     };
     let chars_before = ed.text.chars().count();
