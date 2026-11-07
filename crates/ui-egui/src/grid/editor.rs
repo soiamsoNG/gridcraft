@@ -95,32 +95,9 @@ pub(super) fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, s
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.height"), probe.size().y));
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.z"), geo.z));
     let field = Rect::from_min_max(pos2(erect.left() + 2.0, text_top), pos2(erect.right() - 2.0, (erect.bottom() - 1.0).max(text_top + size)));
-    if std::env::var_os("GRIDCRAFT_EDITOR_DEBUG").is_some() {
-        // Debug lines follow the palette in docs/font-flow-linux-rich-text.md: baselines are red
-        // (shared) and green (per script), boxes are yellow (cell), cyan (input field) and magenta
-        // (line box).
-        let line = |y: f32, color: Color32| {
-            ui.painter().line_segment([pos2(erect.left(), y), pos2(erect.right(), y)], Stroke::new(1.0, color));
-        };
-        const CELL: Color32 = Color32::from_rgb(255, 235, 0);
-        const FIELD: Color32 = Color32::from_rgb(0, 200, 255);
-        const ROW: Color32 = Color32::from_rgb(255, 0, 200);
-        line(erect.top(), CELL);
-        line(erect.bottom(), CELL);
-        line(field.top(), FIELD);
-        line(field.bottom(), FIELD);
-        line(field.top() + probe.size().y, ROW);
-        let baseline = probe.rows.first().and_then(|placed| placed.row.glyphs.first().map(|glyph| field.top() + placed.pos.y + glyph.pos.y));
-        if let Some(baseline) = baseline {
-            line(baseline, Color32::RED);
-        }
-        log::warn!(
-            "editor cell={cell:?} rect={erect:?} field={field:?} text_top={text_top} ink_top={} gh={} v={:?} z={}",
-            ink.top,
-            probe.size().y,
-            st.align.v,
-            geo.z
-        );
+    if super::debug_lines::any() {
+        // Debug lines follow the palette in docs/font-flow-linux-rich-text.md (§9).
+        super::debug_lines::paint_editor(ui.painter(), erect, field, &probe, text_top, probe.size().y);
     }
     let id = egui::Id::unique("gridcraft.cell_editor");
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field));

@@ -1570,21 +1570,37 @@ Measurements behind two decisions:
 
 ### Debug line colours
 
-Temporary probes draw 1 px lines in one fixed palette, so a screenshot reads the
-same way whichever path drew it. Baselines are red and green; only boxes get
-other colours, and a box draws both of its edges in its own colour.
+`crates/ui-egui/src/grid/debug_lines.rs` owns the palette; both paths that draw probes
+(`quadrant.rs` for a cell at rest, `editor.rs` for the cell being edited) call `draw()`, so a
+screenshot reads the same way whichever path drew it. All lines are 1 px, their vertical position
+is the value under test, and only the horizontal extent differs.
 
-| Line | Colour | What it marks |
-|---|---|---|
-| Shared baseline (after `shared_baseline()`) | red `(255,0,0)` | Where the row's text sits: `field.top + placed.pos.y + glyph.pos.y` for the first glyph. |
-| Raw baseline (before correction) | green `(0,255,0)` | Each script's own baseline where it sat before `shared_baseline()`, drawn across that script's glyphs only. Only visible when a row has several sections. |
-| Cell rectangle | yellow `(255,235,0)` | `erect.top()` and `erect.bottom()`: the cell the editor is painting into. |
-| Input field | cyan `(0,200,255)` | `field.top()` and `field.bottom()`: the rectangle handed to `TextEdit`. |
-| Line box | magenta `(255,0,200)` | `field.top + gh`: the galley height `TextEdit` uses for the caret and the selection. |
+| Line | Colour | Dash | Extent | Scope |
+|---|---|---|---|---|
+| `SharedBaseline` | red `(255,0,0)` | solid | the row's ink: first glyph's `pos.x + uv_rect.offset.x` to last glyph's `+ uv_rect.size.x` | both |
+| `RawBaseline` | green `(0,255,0)` | 4/3 | one span per script run that the correction moved: that run's ink width | both |
+| `CellRect` | yellow `(255,235,0)` | solid | the cell's full width, on its top and bottom edge; display mode outlines only the active cell | both |
+| `FieldRect` | cyan `(0,200,255)` | solid | the rect handed to `TextEdit`, i.e. the cell inset by 2 px | edit only |
+| `RowBox` | magenta `(255,0,200)` | 4/3 | the field's width, drawn at `field.top + gh` | edit only |
+| `InkBounds` | purple `(128,0,255)` | dotted 1/3 | the row's ink width, drawn at the ink top and bottom | both |
 
-The editor draws them when `GRIDCRAFT_EDITOR_DEBUG` is set; the cell path uses
-`GRIDCRAFT_BASELINE` for the red/green pair. A green line hidden under the red
-one means the scripts share a baseline; ±1 px is the accepted tolerance.
+Scope is enforced in code, not only here: `Line::shows_in(scope)` and every `draw()` call name the
+path they run on (`Scope::Display` from `paint_cell()`, `Scope::Edit` from `paint_editor()`), so an
+edit-only line cannot leak into the sheet at rest. Display mode outlines only the active cell because
+the other outlines would sit on grid lines and say nothing.
+
+Rules: baselines only use red/green, boxes only yellow/cyan/magenta, ink only purple; both edges of
+a box use the same colour and dash. Green is drawn only for a script run that the correction
+actually moved, and always below the red line: a run that was already on the shared baseline keeps
+just the red line, so a row cannot show two baselines where there is one. A green span still apart
+from the red one by more than ±1 px is a bug.
+
+`shared_baseline()` records, per row, how far each glyph sat from that row's first glyph before it
+moved anything, keyed by the address of the galley it returns. Offsets rather than positions keep
+the green line on the text when `normalize_row_boxes()` later shifts the whole row uniformly.
+
+Switched on with `GRIDCRAFT_DEBUG_LINES=baseline,boxes,ink` (or `all`); `GRIDCRAFT_BASELINE` and
+`GRIDCRAFT_EDITOR_DEBUG` are accepted as aliases that switch everything on.
 
 ## 10. fontconfig 0.11 API coverage and gaps
 

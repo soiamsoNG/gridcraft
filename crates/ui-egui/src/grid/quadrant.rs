@@ -3,6 +3,7 @@ use super::cell_paint::{
     Look, MergedArea, cell_text_y, center_across_end, col32, display_text, general_halign, ink_insets, look, merged_edges, paint_border,
     paint_cf_icon, painted_halign, rotated_text_pos, shrink_font, wrapped_cell_text_y,
 };
+use super::debug_lines;
 use super::geo::Geo;
 use super::tables::{filter_button_rect, paint_filter_button};
 use super::{
@@ -67,6 +68,19 @@ pub(super) fn layout_no_wrap_or_default(p: &egui::Painter, text: String, font: F
 /// of the row's first glyph (#1231).
 pub(crate) fn shared_baseline(galley: std::sync::Arc<egui::Galley>, sections: usize) -> std::sync::Arc<egui::Galley> {
     let mut galley = galley;
+    // The probes draw a green line where each script sat before this correction, so the original
+    // baselines are kept before anything moves (#1231).
+    let raw = debug_lines::enabled(debug_lines::Group::Baseline).then(|| {
+        galley
+            .rows
+            .iter()
+            .map(|placed| {
+                let glyphs = &placed.row.glyphs;
+                let Some(first) = glyphs.first().map(|glyph| glyph.pos.y) else { return Vec::new() };
+                glyphs.iter().map(|glyph| glyph.pos.y - first).collect()
+            })
+            .collect::<Vec<Vec<f32>>>()
+    });
     if sections >= 2 {
         for placed in std::sync::Arc::make_mut(&mut galley).rows.iter_mut() {
             let row = std::sync::Arc::make_mut(&mut placed.row);
@@ -99,6 +113,9 @@ pub(crate) fn shared_baseline(galley: std::sync::Arc<egui::Galley>, sections: us
             row.visuals.mesh_bounds.min.y += low;
             row.visuals.mesh_bounds.max.y += high;
         }
+    }
+    if let Some(raw) = raw {
+        debug_lines::remember_raw(&galley, raw);
     }
     galley
 }
@@ -264,6 +281,8 @@ pub(crate) struct QuadrantPaint<'a> {
     pub(crate) tokens: &'a Tokens,
     /// The row to tint, when "Highlight the active cell's row" is on.
     pub(crate) active_row: Option<u32>,
+    /// The cell the selection sits on; the probes outline only this one in display mode.
+    pub(crate) active: CellRef,
     /// An input method's unfinished composition, painted in place of the cell's own text (#1231).
     pub(crate) compose: Option<(CellRef, &'a str)>,
 }
@@ -556,7 +575,10 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
         let ink = ink_insets(&galley);
         let y = wrapped_cell_text_y(st.align.v, *rect, galley.size().y, z, ink);
         let text_clip = wrapped_text_clip(p, *rect, &galley, y, st.align.v);
-        p.with_clip_rect(text_clip).galley(pos2(x, y), galley, color);
+        p.with_clip_rect(text_clip).galley(pos2(x, y), galley.clone(), color);
+        if debug_lines::any() {
+            debug_lines::paint_cell(&p.with_clip_rect(*rect), *rect, &galley, pos2(x, y), c == q.active);
+        }
         return;
     }
     // Wrap Text off: Excel ignores the line breaks and draws the whole string on one line.
@@ -678,6 +700,9 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
         cp.add(shape);
     } else {
         cp.galley(pos2(x, y), galley.clone(), color);
+        if debug_lines::any() {
+            debug_lines::paint_cell(&cp, *rect, &galley, pos2(x, y), c == q.active);
+        }
     }
     paint_text_decorations(&cp, TextDecoration { x, y, width: w, height: gh, color, underline: st.font.underline, strike: st.font.strike });
 }

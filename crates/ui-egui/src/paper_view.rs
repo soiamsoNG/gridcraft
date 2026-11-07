@@ -174,6 +174,7 @@ pub(crate) fn paint_pages(input: PagePaintInput<'_>, cf: &mut CfCache) -> Vec<gr
             cf,
             tokens: t,
             active_row,
+            active: sel.active,
             compose: None,
         });
         if !pg.is_data_page(i, j) {
