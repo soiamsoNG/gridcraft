@@ -138,7 +138,7 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
                 // A spill child shows its anchor's formula muted and read-only.
                 let read_only = active_spill_anchor(app).is_some();
                 let info = if app.editor.is_some() {
-                    editor_widget(app, &mut child, id, font.clone(), true, inner.width(), inner.height())
+                    editor_widget(app, &mut child, id, &EditorStyle { font: font.clone(), italic: false }, true, inner.width(), inner.height())
                 } else {
                     // Show the active cell's content (a Python cell's code in the code editor's
                     // colours); clicking starts editing in the bar.
@@ -478,7 +478,48 @@ fn show_edit<'t>(
 
 /// The text editor used in the cell and in the formula bar (they share `app.editor`). It shows
 /// `max_height` of text and scrolls beyond that, keeping the caret in view.
-pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: FontId, multiline: bool, width: f32, max_height: f32) -> EditorInfo {
+/// Appends `text` to `job`, split by script, so a script the italic face does not cover is
+/// sheared exactly as `grid::quadrant::cell_job()` does for the cell itself. The editor draws
+/// through a plain `TextEdit`, which knows nothing about per-script italics (#1231).
+fn append_scripted(job: &mut egui::text::LayoutJob, text: &str, format: &egui::TextFormat, italic: bool, coverage: Option<crate::script::ScriptSet>) {
+    if text.is_empty() {
+        return;
+    }
+    if !italic {
+        job.append(text, 0.0, format.clone());
+        return;
+    }
+    let coverage = coverage.unwrap_or(crate::script::ScriptSet::EMPTY);
+    let base = job.text.len();
+    job.text.push_str(text);
+    for (range, script) in crate::script::split_runs(text) {
+        let mut format = format.clone();
+        format.italics = !coverage.has(script);
+        job.sections.push(egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range: egui::text::ByteIndex(base + range.start)..egui::text::ByteIndex(base + range.end),
+            format,
+        });
+    }
+}
+
+/// How the editor draws the cell's text: the face and whether the cell is italic (the editor
+/// shears the scripts the italic face does not cover itself).
+#[derive(Clone)]
+pub struct EditorStyle {
+    pub font: FontId,
+    pub italic: bool,
+}
+
+pub fn editor_widget(
+    app: &mut SheetApp,
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    style: &EditorStyle,
+    multiline: bool,
+    width: f32,
+    max_height: f32,
+) -> EditorInfo {
     if app.editor.as_ref().is_some_and(|e| e.python) {
         // Python mode edits in the formula bar only.
         if id != egui::Id::unique("gridcraft.formula_bar") {
@@ -497,8 +538,10 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     let t = Tokens::get(ui.ctx());
     let on_sheet = id == egui::Id::unique("gridcraft.cell_editor");
     let cell_text_color = if on_sheet { t.cell_text } else { t.text };
-    let font2 = font.clone();
+    let font2 = style.font.clone();
     let reading_order = cell_reading_order(app, ed.sheet, ed.cell);
+    let italic = style.italic;
+    let coverage = italic.then(|| crate::fonts::italic_coverage(&font2.family)).flatten().flatten();
     let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let s = buf.as_str();
         let mut job = egui::text::LayoutJob {
@@ -513,13 +556,21 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
             if a < pos || !s.is_char_boundary(a) || !s.is_char_boundary(b) {
                 continue;
             }
-            job.append(s.get(pos..a).unwrap_or(""), 0.0, egui::TextFormat::simple(font2.clone(), cell_text_color));
-            job.append(s.get(a..b).unwrap_or(""), 0.0, egui::TextFormat::simple(font2.clone(), t.ref_color(idx, on_sheet)));
+            append_scripted(&mut job, s.get(pos..a).unwrap_or(""), &egui::TextFormat::simple(font2.clone(), cell_text_color), italic, coverage);
+            append_scripted(
+                &mut job,
+                s.get(a..b).unwrap_or(""),
+                &egui::TextFormat::simple(font2.clone(), t.ref_color(idx, on_sheet)),
+                italic,
+                coverage,
+            );
             pos = b;
         }
-        job.append(s.get(pos..).unwrap_or(""), 0.0, egui::TextFormat::simple(font2.clone(), cell_text_color));
+        append_scripted(&mut job, s.get(pos..).unwrap_or(""), &egui::TextFormat::simple(font2.clone(), cell_text_color), italic, coverage);
         job.wrap.max_width = if multiline { wrap_width } else { f32::INFINITY };
-        ui.fonts_mut(|f| f.layout_job(job))
+        let sections = job.sections.len();
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        crate::grid::shared_baseline(galley, sections)
     };
     let chars_before = ed.text.chars().count();
     // A dialog opened over the edit (Paste Name) takes the keyboard until it closes, and the
@@ -537,14 +588,14 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     // for the text (a scroll area would take the bar's width off it and wrap the text narrower
     // than the cell does). The formula bar shows its lines and scrolls past them.
     let mut output = if on_sheet {
-        show_edit(edit, ui, id, font, width, &mut layouter)
+        show_edit(edit, ui, id, style.font.clone(), width, &mut layouter)
     } else {
         egui::ScrollArea::vertical()
             .id_salt(id.with("scroll"))
             .max_height(max_height.max(1.0))
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                let output = show_edit(edit, ui, id, font, width, &mut layouter);
+                let output = show_edit(edit, ui, id, style.font.clone(), width, &mut layouter);
                 // A caret moved by our own keys (Alt+Enter, F4, point mode) isn't the TextEdit's
                 // doing, so it doesn't scroll to it itself.
                 if synced {
@@ -1129,6 +1180,34 @@ mod tests {
                 assert!((inner / row_h).floor() as usize >= lines, "{lines} lines of {row_h} px in a {bar} px bar");
             }
         }
+    }
+
+    #[test]
+    /// The in-cell editor draws through a plain `TextEdit`, so it has to split the text by script
+    /// itself to shear the scripts the italic face does not cover (#1231).
+    fn the_editor_shears_the_scripts_the_italic_face_does_not_cover() {
+        use crate::script::{ScriptClass, ScriptSet};
+        let format = egui::TextFormat::simple(egui::FontId::new(14.0, egui::FontFamily::Proportional), egui::Color32::BLACK);
+        // The family has a real italic for Latin only: Han must be sheared.
+        let latin_only = Some(ScriptSet::EMPTY.with(ScriptClass::Latin));
+        let mut job = egui::text::LayoutJob::default();
+        append_scripted(&mut job, "中文 Hello", &format, true, latin_only);
+        assert_eq!(job.sections.len(), 2, "{:?}", job.sections);
+        assert!(job.sections[0].format.italics, "Han has no italic face");
+        assert!(!job.sections[1].format.italics, "Latin uses the real italic face");
+        assert_eq!(job.sections[0].byte_range, egui::text::ByteIndex(0)..egui::text::ByteIndex(7));
+        assert_eq!(job.sections[1].byte_range, egui::text::ByteIndex(7)..egui::text::ByteIndex(12));
+
+        // A family with no italic face at all shears everything.
+        let mut job = egui::text::LayoutJob::default();
+        append_scripted(&mut job, "Hello", &format, true, None);
+        assert!(job.sections.iter().all(|s| s.format.italics));
+
+        // An upright cell stays one section.
+        let mut job = egui::text::LayoutJob::default();
+        append_scripted(&mut job, "中文 Hello", &format, false, latin_only);
+        assert_eq!(job.sections.len(), 1);
+        assert!(!job.sections[0].format.italics);
     }
 }
 

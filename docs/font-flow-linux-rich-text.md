@@ -569,6 +569,13 @@ Cell text:
   script's glyphs; a green line on top of the red one means aligned, and ±1 px
   is the accepted tolerance. Non-italic cells have a single section, so their
   raw baseline equals the corrected one and only the red line is visible.
+- The in-cell editor and the formula bar draw through one `TextEdit`
+  (`editor_widget()` in `crates/ui-egui/src/formula_bar.rs`): its layouter
+  splits each colour span by script with `append_scripted()` and sets
+  `format.italics` from `italic_coverage()` like `cell_job()` does, then runs
+  the galley through `shared_baseline()`. Without that, an editing italic cell
+  lost its synthetic slant and its mixed-script baselines — the `TextEdit` knows
+  nothing about per-script italics or epaint's per-section growth.
 - `every_section_of_a_line_shares_one_baseline()` (`crates/ui-egui/src/grid/tests.rs`)
   lays out a two-section line and asserts that every glyph sits on one
   baseline.

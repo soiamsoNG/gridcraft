@@ -31,7 +31,7 @@ pub(super) fn layout_job_or_default(p: &egui::Painter, mut job: egui::text::Layo
         section.format.font_id = bound_font(section.format.font_id.clone());
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.layout_job(job.clone()))) {
-        Ok(galley) => shared_baseline(galley, &job),
+        Ok(galley) => shared_baseline(galley, job.sections.len()),
         Err(_) => {
             log::warn!(
                 "cell text could not be laid out in {:?}; drawing it in the default family",
@@ -65,9 +65,9 @@ pub(super) fn layout_no_wrap_or_default(p: &egui::Painter, text: String, font: F
 /// once the row is aligned. A cell splits its text into sections for per-script italics, so the
 /// scripts of one line end up on different baselines. Put every script run back on the baseline
 /// of the row's first glyph (#1231).
-fn shared_baseline(galley: std::sync::Arc<egui::Galley>, job: &egui::text::LayoutJob) -> std::sync::Arc<egui::Galley> {
+pub(crate) fn shared_baseline(galley: std::sync::Arc<egui::Galley>, sections: usize) -> std::sync::Arc<egui::Galley> {
     let mut galley = galley;
-    if job.sections.len() >= 2 {
+    if sections >= 2 {
         for placed in std::sync::Arc::make_mut(&mut galley).rows.iter_mut() {
             let row = std::sync::Arc::make_mut(&mut placed.row);
             let Some(reference) = row.glyphs.first().map(|g| g.pos.y) else { continue };

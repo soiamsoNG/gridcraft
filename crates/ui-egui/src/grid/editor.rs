@@ -79,7 +79,15 @@ pub(super) fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, s
     // The theme's caret is meant for the UI chrome and vanishes on some fills (and, in the dark
     // theme, on the white paper): pick black or white against the fill, like Excel.
     child.visuals_mut().text_cursor.stroke.color = ink_on(fill);
-    crate::formula_bar::editor_widget(app, &mut child, id, font, wrap, erect.width() - 4.0, erect.height() - 2.0);
+    crate::formula_bar::editor_widget(
+        app,
+        &mut child,
+        id,
+        &crate::formula_bar::EditorStyle { font, italic: st.font.italic },
+        wrap,
+        erect.width() - 4.0,
+        erect.height() - 2.0,
+    );
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.rect"), erect));
 }
 
