@@ -550,3 +550,33 @@ fn a_family_the_font_set_lacks_still_lays_out() {
     });
     out.textures_delta.clear();
 }
+
+#[test]
+fn every_section_of_a_line_shares_one_baseline() {
+    // epaint grows a line per section: a fallback face with a deeper descent shifts its own
+    // section off the row's baseline, and painting uses the tessellated mesh, so both the glyph
+    // positions and their quads have to be put back on it (#1231).
+    let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::fonts::set_bound(Vec::new());
+    let ctx = egui::Context::default();
+    ctx.set_fonts(crate::theme::pinned_font_definitions());
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let mut job = egui::text::LayoutJob { text: "Hello world".to_owned(), ..Default::default() };
+        job.sections.push(egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range: egui::text::ByteIndex(0)..egui::text::ByteIndex(5),
+            format: egui::TextFormat::simple(egui::FontId::new(19.2, egui::FontFamily::Proportional), egui::Color32::BLACK),
+        });
+        job.sections.push(egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range: egui::text::ByteIndex(5)..egui::text::ByteIndex(11),
+            format: egui::TextFormat::simple(egui::FontId::new(11.0, egui::FontFamily::Proportional), egui::Color32::BLACK),
+        });
+        let galley = super::quadrant::layout_job_or_default(&painter, job);
+        let ys: Vec<f32> = galley.rows[0].glyphs.iter().map(|g| g.pos.y).collect();
+        assert!(ys.len() > 6, "the line has glyphs from both sections");
+        assert!(ys.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-3), "one baseline: {ys:?}");
+    });
+    out.textures_delta.clear();
+}

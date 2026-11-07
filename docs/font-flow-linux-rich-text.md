@@ -551,6 +551,27 @@ Cell text:
   to any fonts` and retries with the proportional family, logging the role;
   `bound_font()` swaps an unbound `fnt:` family for `Proportional` before the
   first attempt.
+- `shared_baseline()` (same file) undoes epaint's per-section line growth: a
+  fallback face that reaches deeper than the font's descent grows only its own
+  section, and bottom alignment then lifts that script off the row's baseline
+  (Devanagari in an italic Times New Roman cell sat 7 px high at 19.2 px). It
+  records the row's first glyph baseline and moves every other glyph onto it.
+  **Moving `glyph.pos.y` alone is not enough**: epaint tessellates each row into
+  `row.visuals.mesh` during layout and painting reuses that mesh
+  (`crates/epaint/src/tessellator.rs`), so the quads of the moved glyphs are
+  shifted as well (`first_vertex .. next.first_vertex`, clipped to
+  `glyph_vertex_range`), and `mesh_bounds` grows by the shift. Doing only the
+  first half moved the whole line through `ink_insets()` and looked "half
+  fixed".
+  Probe (used to verify it, not shipped): with `GRIDCRAFT_BASELINE` set, the
+  paint path drew the row's corrected baseline as a 1 px red line and each
+  glyph's raw (pre-correction) baseline as a 1 px green line spanning only that
+  script's glyphs; a green line on top of the red one means aligned, and ±1 px
+  is the accepted tolerance. Non-italic cells have a single section, so their
+  raw baseline equals the corrected one and only the red line is visible.
+- `every_section_of_a_line_shares_one_baseline()` (`crates/ui-egui/src/grid/tests.rs`)
+  lays out a two-section line and asserts that every glyph sits on one
+  baseline.
 - Vertical placement is ink-based (`cell_text_y()`, `wrapped_cell_text_y()`,
   `ink_insets()` in `crates/ui-egui/src/grid/cell_paint.rs`): top alignment
   starts the ink `2.0 * z` below the cell edge, center centers the ink, bottom

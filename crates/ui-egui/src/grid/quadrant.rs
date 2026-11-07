@@ -31,7 +31,7 @@ pub(super) fn layout_job_or_default(p: &egui::Painter, mut job: egui::text::Layo
         section.format.font_id = bound_font(section.format.font_id.clone());
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.layout_job(job.clone()))) {
-        Ok(galley) => galley,
+        Ok(galley) => shared_baseline(galley, &job),
         Err(_) => {
             log::warn!(
                 "cell text could not be laid out in {:?}; drawing it in the default family",
@@ -58,6 +58,49 @@ pub(super) fn layout_no_wrap_or_default(p: &egui::Painter, text: String, font: F
             p.layout_no_wrap(fallback, FontId::new(size, egui::FontFamily::Proportional), color)
         }
     }
+}
+
+/// epaint grows a line per *section* when a fallback face reaches above or below the font's own
+/// ascent and descent, and a section grown below the baseline then sits higher than its neighbour
+/// once the row is aligned. A cell splits its text into sections for per-script italics, so the
+/// scripts of one line end up on different baselines. Put every script run back on the baseline
+/// of the row's first glyph (#1231).
+fn shared_baseline(galley: std::sync::Arc<egui::Galley>, job: &egui::text::LayoutJob) -> std::sync::Arc<egui::Galley> {
+    let mut galley = galley;
+    if job.sections.len() >= 2 {
+        for placed in std::sync::Arc::make_mut(&mut galley).rows.iter_mut() {
+            let row = std::sync::Arc::make_mut(&mut placed.row);
+            let Some(reference) = row.glyphs.first().map(|g| g.pos.y) else { continue };
+            let deltas: Vec<f32> = row.glyphs.iter().map(|g| reference - g.pos.y).collect();
+            if deltas.iter().all(|d| *d == 0.0) {
+                continue;
+            }
+            // epaint tessellates a row during layout, and painting uses that mesh, so moving the
+            // glyph baseline alone would not move the pixels: shift the quads too (#1231).
+            let starts: Vec<usize> = row.glyphs.iter().map(|g| g.first_vertex as usize).collect();
+            let glyph_vertices = row.visuals.glyph_vertex_range.clone();
+            let vertex_count = row.visuals.mesh.vertices.len();
+            for (g, delta) in row.glyphs.iter_mut().zip(&deltas) {
+                if *delta != 0.0 {
+                    g.pos.y += *delta;
+                }
+            }
+            for (i, delta) in deltas.iter().enumerate() {
+                if *delta == 0.0 {
+                    continue;
+                }
+                let start = starts.get(i).copied().unwrap_or(vertex_count).max(glyph_vertices.start).min(vertex_count);
+                let end = starts.get(i + 1).copied().unwrap_or(vertex_count).min(glyph_vertices.end).min(vertex_count).max(start);
+                for vertex in &mut row.visuals.mesh.vertices[start..end] {
+                    vertex.pos.y += *delta;
+                }
+            }
+            let (low, high) = deltas.iter().fold((0.0f32, 0.0f32), |(lo, hi), d| (lo.min(*d), hi.max(*d)));
+            row.visuals.mesh_bounds.min.y += low;
+            row.visuals.mesh_bounds.max.y += high;
+        }
+    }
+    galley
 }
 
 pub(super) fn cell_job(text: String, font: FontId, color: Color32, wrap: f32, italic: bool) -> egui::text::LayoutJob {
