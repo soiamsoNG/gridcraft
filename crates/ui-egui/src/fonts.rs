@@ -369,7 +369,6 @@ thread_local! {
 /// Asks fontconfig (`fc-match`, part of the standard Linux font stack) for the best face for
 /// `pattern`. The answer is cached for the session: a match is a subprocess, and the same name is
 /// asked for every frame a re-bind is considered.
-#[cfg(target_os = "linux")]
 /// Splits the index `fc-match`/`fc-list` report into the face index (low 16 bits) and the named
 /// instance (high 16 bits, which fontconfig stores 1-based; `None` means the default instance).
 pub(crate) fn fc_index_parts(raw: u32) -> (u32, Option<u32>) {
@@ -396,6 +395,13 @@ pub(crate) fn apply_named_instance(fd: &mut egui::FontData, instance: u32) {
     fd.tweak.coords = coords;
 }
 
+/// On a host without fontconfig there is no answer to give; the chains fall back to file paths.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn fc_match(_pattern: &str) -> Option<(String, u32)> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn fc_match(pattern: &str) -> Option<(String, u32)> {
     if let Some(answer) = FC_MATCH_CACHE.with(|cache| cache.borrow().get(pattern).cloned()) {
         return answer;

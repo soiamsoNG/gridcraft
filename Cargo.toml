@@ -57,6 +57,8 @@ ratex-font = "=0.1.14"
 
 # ui
 egui = "0.37"
+# For the `color_fonts` feature: COLR/CBDT rasterisation for the system's colour emoji face.
+epaint = "0.37"
 egui_extras = { version = "0.37", default-features = false }
 eframe = { version = "0.37", default-features = false }
 egui_kittest = "0.37"

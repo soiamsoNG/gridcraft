@@ -18,6 +18,10 @@ gridcraft-chart = { workspace = true }
 # this feature. The UI draws ✕, ◀, ↘ and 📋 as text; without these faces the strict kittest
 # harness (and a host with no symbol font) renders them as tofu.
 egui = { workspace = true, features = ["default_fonts", "monochrome_emoji_fonts"] }
+# `color_fonts` rasterises COLR/CBDT glyphs, i.e. the system's colour emoji face (`sys-emoji`).
+# Without it a colour face draws nothing: its glyphs carry no outline. Off by default upstream,
+# because it adds a PNG decoder (`vello_cpu/png`, already in the lock file).
+epaint = { workspace = true, features = ["color_fonts"] }
 egui_extras = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

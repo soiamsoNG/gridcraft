@@ -183,7 +183,7 @@ pub(super) fn load_bold_script_faces(fonts: &mut FontDefinitions, wanted_bold: S
 }
 
 #[cfg(target_arch = "wasm32")]
-fn load_fallback(_fonts: &mut FontDefinitions, _han: HanOrder, _serif: bool, _wanted: ScriptSet, _known: bool) -> Vec<String> {
+pub(super) fn load_fallback(_fonts: &mut FontDefinitions, _han: HanOrder, _serif: bool, _wanted: ScriptSet, _known: bool) -> Vec<String> {
     Vec::new()
 }
 
@@ -224,7 +224,7 @@ pub(super) fn covers_arabic(bytes: &[u8], index: u32) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn load_bold_script_faces(_fonts: &mut FontDefinitions, _wanted_bold: ScriptSet, _serif: bool) -> Vec<String> {
+pub(super) fn load_bold_script_faces(_fonts: &mut FontDefinitions, _wanted_bold: ScriptSet, _serif: bool) -> Vec<String> {
     Vec::new()
 }
 

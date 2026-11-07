@@ -1923,6 +1923,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "log",
  "peniko",
+ "png",
  "skrifa",
  "smallvec",
  "vello_common",
@@ -2186,6 +2187,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "egui_kittest",
+ "epaint",
  "epaint_default_fonts",
  "gridcraft-chart",
  "gridcraft-engine",
@@ -5727,6 +5729,7 @@ dependencies = [
  "guillotiere",
  "log",
  "peniko",
+ "png",
  "smallvec",
  "thiserror 2.0.21",
 ]
@@ -5740,6 +5743,7 @@ dependencies = [
  "bytemuck",
  "glifo",
  "hashbrown 0.17.1",
+ "png",
  "vello_common",
 ]
 
