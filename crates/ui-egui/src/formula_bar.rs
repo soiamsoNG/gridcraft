@@ -516,8 +516,13 @@ pub struct EditorStyle {
 /// from the real job (formula references), metrics do not.
 pub(crate) fn editor_probe(ui: &egui::Ui, text: &str, style: &EditorStyle, wrap_width: f32) -> std::sync::Arc<egui::Galley> {
     let coverage = style.italic.then(|| crate::fonts::italic_coverage(&style.font.family)).flatten().flatten();
+    // An empty cell must be measured as one line: an empty job lays out zero rows, so `size().y`
+    // and the ink insets are both 0 and the bottom- or centre-anchored field would start at the
+    // cell's bottom edge (the caret then paints in the row below). One space is the line the cell
+    // will draw once a character is typed, and it has no ink, so it anchors like an empty line.
+    let sample = if text.is_empty() { " " } else { text };
     let mut job = egui::text::LayoutJob::default();
-    append_scripted(&mut job, text, &egui::TextFormat::simple(style.font.clone(), egui::Color32::BLACK), style.italic, coverage);
+    append_scripted(&mut job, sample, &egui::TextFormat::simple(style.font.clone(), egui::Color32::BLACK), style.italic, coverage);
     job.wrap.max_width = wrap_width;
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let galley = crate::grid::align_baseline(galley);

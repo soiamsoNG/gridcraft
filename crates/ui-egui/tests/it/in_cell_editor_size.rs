@@ -119,3 +119,30 @@ fn the_editor_text_follows_the_cells_vertical_alignment() {
     assert!(tall[0] < tall[1] && tall[1] < tall[2], "top < center < bottom in a tall row: {tall:?}");
     assert!(tall[2] - tall[0] > 100.0, "a tall row separates the three alignments: {tall:?}");
 }
+
+/// An empty cell has no text to measure, so the editor used to lay out zero rows and anchor its
+/// field at the cell's bottom edge — the caret then painted in the row below (#1231).
+#[test]
+fn an_empty_cell_edits_inside_its_own_row() {
+    for command in [Some("home.alignTop"), Some("home.alignMiddle"), None] {
+        for height in [20.0, 60.0, 200.0] {
+            let mut h = harness();
+            h.state_mut().session.execute("home.rowHeight", json!({"rows": "1:1", "height": height})).unwrap();
+            if let Some(c) = command {
+                h.state_mut().session.execute(c, json!({"range": "A1"})).unwrap();
+            }
+            h.run_steps(2);
+            h.state_mut().begin_edit(Some(String::new()), false);
+            h.run_steps(2);
+            let field = h.ctx.read_response(Id::unique("gridcraft.cell_editor")).expect("the in-cell editor is shown").rect;
+            let cell = cell_rect(&h, "A1");
+            let what = format!("{command:?} at {height} pt");
+            // The bug was a field whose top sat exactly on the cell's bottom edge (zero-row galley).
+            assert!(field.top() <= cell.bottom() - 1.0, "{what}: the field starts on or below the cell's bottom edge: field {field:?} cell {cell:?}");
+            // A row shorter than its line may let a one-line field overhang, but a tall one must not.
+            if height > 100.0 {
+                assert!(field.top() >= cell.top() - 0.01, "{what}: the field starts above a tall cell: field {field:?} cell {cell:?}");
+            }
+        }
+    }
+}

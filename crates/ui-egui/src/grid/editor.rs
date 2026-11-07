@@ -88,7 +88,11 @@ pub(super) fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, s
     let style = crate::formula_bar::EditorStyle { font: font.clone(), italic: st.font.italic };
     let wrap_width = if wrap { (erect.width() - 4.0).max(1.0) } else { f32::INFINITY };
     let probe = crate::formula_bar::editor_probe(ui, &ed.text, &style, wrap_width);
-    let ink = ink_insets(&probe);
+    // An empty cell has no ink to anchor by: the probe lays out one blank line (so its height is a
+    // real line), but a space still reports the ascender of the glyph box as its top. Anchoring by
+    // that would put the field above the cell's top edge; with no ink, the line box itself is the
+    // anchor.
+    let ink = if ed.text.is_empty() { Ink::default() } else { ink_insets(&probe) };
     let text_top = editor_text_top(rect, geo.z, ink, probe.size().y, st.align.v, wrap);
     // The tests read the ink gap back to check the text starts `2 z` below the cell's top edge.
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.ink"), ink.top));
