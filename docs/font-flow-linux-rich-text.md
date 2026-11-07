@@ -371,6 +371,7 @@ chain order; `covers` decides whether the face loads for a given `wanted` set:
 | `sys-myanmar` | Myanmar | — (Padauk has one design) |
 | `sys-tibetan` | Tibetan | — (Jomolhari has one design) |
 | `sys-yi` | Yi | — (Noto Sans Yi) |
+| `sys-emoji` | symbols (colour emoji) | — |
 | `sys-symbols` / `sys-symbols-2` | symbols | — |
 
 A script in `wanted` that none of them covers is bound by
@@ -381,6 +382,20 @@ skipped when `!known`, so an empty workbook does not load one face per installed
 script; a path already loaded is skipped, because one CJK collection serves
 several scripts; Latin is always skipped, because the interface and bound
 families cover it.
+
+`sys-emoji` comes **first**, before the CJK faces: Noto Sans CJK covers seventy
+`1Fxxx` code points of its own, in monochrome, so 😀 would otherwise be drawn
+by the CJK face before the colour emoji face is reached. Its candidates are
+`fc-match` answers for the generic `emoji` family (plus `Noto Color Emoji` as a
+fallback), not a vendor path: fontconfig ranks emoji fonts by that family
+(`45-generic.conf` aliases every colour face to it, `60-generic.conf` prefers the
+colour ones over monochrome Noto Emoji), so the distribution decides, and the
+host's fontconfig answers inside a Flatpak too. `★`, `✓` and `→` are not in a
+colour emoji face, so they keep falling through to `sys-symbols`.
+
+Colour glyphs need `epaint`'s `color_fonts` feature, which the UI turns on in
+`crates/ui-egui/Cargo.toml`. Without it a COLRv1 face draws nothing at all: its
+glyphs carry no outline to fill.
 
 Bold scripts take a parallel path: `load_bold_script_faces()` asks
 `font_for_script(script, serif, bold)` for a weight ≥ 600 face, then tries the
@@ -528,6 +543,8 @@ Consequences:
 | `try_load` checks parseability, not script coverage | An `fc-match` substitute may be chosen even if it lacks the script. |
 | `families()` rebuilds the list on every call | The ribbon calls it per frame; potentially wasteful. |
 | Missing bold face | A missing bold face still renders as regular. Only bound role families are judged: the built-in `cell-*`/`SERIF`/`MONO` chains are left upright. |
+| Colour emoji need `epaint/color_fonts` | The feature is on in `crates/ui-egui/Cargo.toml` and adds a PNG decoder. A target that drops the feature (a wasm build that opt out) draws a COLRv1 face as nothing, since those glyphs have no outline. |
+| `sys-emoji` loads with the first font set | The colour face is 5 MB and is loaded whenever any text is present, because it only knows the `Symbols` script. Gating it on a scan for emoji code points is open (see §13). |
 | Missing italic face | Slanted per script run by the painter (§3.10); the in-cell editor and the formula bar do not slant yet. |
 | No cache invalidation | Fonts installed while running are not picked up until restart. |
 | `ScriptSet` is full | All 16 bits are used (Latin … Ethiopic); a new script class needs the set widened to `u32` first (§13 question 15). |
@@ -1551,7 +1568,7 @@ committed fixtures.
 
 | Workbook | What it proves |
 |---|---|
-| `font-cases.xlsx` | 24 cases in five sheets (`Cases`, `Explanations`, `Countries`, `Matrix`, `Notes`): eight scripts in four styles, the standard names Times New Roman / Arial / Courier New in four roles, symbols and emoji, 22 pt text in an 18 px row. |
+| `font-cases.xlsx` | 24 cases in five sheets (`Cases`, `Explanations`, `Countries`, `Matrix`, `Notes`): eight scripts in four styles, the standard names Times New Roman / Arial / Courier New in four roles, symbols and emoji, 22 pt text in an 18 px row. `Cases` B15 (`★ ☆ ✓ 😀 🎉 →`) is the emoji check: ★ ☆ ✓ → stay monochrome on the baseline, 😀 🎉 are drawn by the colour face and share the same baseline. |
 | `混合输入.xlsx` | Four rows (regular / bold / italic / bold italic) of `Hello 中文 العربية ไทย हिन्दी বাংলা አማርኛ 日本語 한국어` at 18 pt: the bold rows drew tofu before the bold script chain and the named-instance walk were fixed. |
 | `lang20-countries.xlsx` | Twenty countries in twenty scripts, one of them right-to-left per row; the Bengali and Ethiopic rows were tofu until `classify()` learned those blocks. |
 | `top.xlsx` | `Hello` and `中文 한글 العربية` at 11 / 18 / 30 pt, top aligned, 60 px rows: every size starts 2 px below the edge. |
