@@ -1594,9 +1594,9 @@ Order is a property of the palette (`Line::order()`), not of the call sites: `pa
 only then draws. Baselines sit under the boxes and the shared baseline sits over the raw one, so a
 new line only needs an entry in the table.
 
-Scope is enforced in code, not only here: `Line::shows_in(scope)` and every `draw()` call name the
-path they run on (`Scope::Display` from `paint_cell()`, `Scope::Edit` from `paint_editor()`), so an
-edit-only line cannot leak into the sheet at rest. Display mode outlines only the active cell because
+Scope is enforced in code, not only here: `Line::shows_in(scope)` is checked in `paint_probes()`
+against the path that called it (`Scope::Display` from `paint_cell()`, `Scope::Edit` from
+`paint_editor()`), so an edit-only line cannot leak into the sheet at rest. Display mode outlines only the active cell because
 the other outlines would sit on grid lines and say nothing.
 
 Rules: baselines only use red/green, boxes only yellow/cyan/magenta, ink only purple; both edges of
@@ -1789,7 +1789,10 @@ Consequences for this document's plans:
   palette), `12a37fe8` (the editor's text and line box follow the cell),
   `f26fd5ec` (per-script synthetic italics while editing), `01e9ded1` (one
   shared baseline per line) and `c219f751` (input-method commits on the grid,
-  bold scripts off tofu). Earlier commits on the same line: `b09e796c` (`fix(ui): keep whole wrapped lines at the top of
+  bold scripts off tofu). On top of them `875cab8e` dash every probe with
+  coprime periods and sort them by `Line::order()`, so a raw baseline that
+  coincides with the shared one stays visible (a solid line on top used to hide
+  exactly the "should have moved, did not" case). Earlier commits on the same line: `b09e796c` (`fix(ui): keep whole wrapped lines at the top of
   an overflowing cell (#2752)`); before it `7f645682` (`fix(ui): start an app
   with no families bound by the previous font set (#1231)`), `0d831dab`
   (`pick_face` nearest weight), `91aa91c9` (subpixel binning off), `53455682`
