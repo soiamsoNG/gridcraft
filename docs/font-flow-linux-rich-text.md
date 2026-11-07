@@ -556,6 +556,27 @@ Consequences:
 | Tofu instead of a panic | A glyph nothing can draw is drawn as tofu (`MissingGlyphPolicy::Tofu`); the bookkeeping bug is logged, not fatal. |
 | No rich-text model | Per-character formatting is lost; XLSX runs are flattened. |
 
+#### Cost gate for an always-loaded face
+
+Several rows above are accepted costs rather than bugs, so the decision needs a
+number, not a feeling. The rule used for `sys-emoji` (§13 question 17), and to be
+reused for any future face loaded unconditionally:
+
+1. Measure the same build twice — once with the face, once without — three runs
+   each, on the slowest common case (a numeric or Latin-only workbook, where the
+   face is pure overhead). Record resident memory (`VmRSS`) after the second font
+   set settles and the time from process start to the first screenshot.
+2. **Accept the cost, do not gate**, when the difference is **below +10 MB
+   resident and below +30 ms to the first frame**; anything larger buys the
+   machinery instead: a code-point table, a request flag through
+   `font_definitions_*`, and one more term in the rebind condition.
+3. Record both numbers in this table either way, so the decision can be revisited
+   without re-running the experiment.
+
+The measurement harness is `/tmp/opencode/measure.py` (polls the control channel
+until the first `ui.screenshot` succeeds, then reads `/proc/<pid>/status`); it is
+a scratch tool, not part of the repository.
+
 ### 3.10 Painting and input paths
 
 Cell text:
