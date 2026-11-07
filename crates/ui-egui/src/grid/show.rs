@@ -458,6 +458,7 @@ fn paint_panes(input: PanesInput<'_>, cf: &mut CfCache) -> Vec<PaneQuad> {
             active_row,
             active: sel.active,
             compose,
+            editing: app.editor.as_ref().filter(|e| !e.from_formula_bar).map(|e| e.cell),
         });
         paint_selection(SelectionPaintInput { painter: &p, geo, sheet: sh, selection: sel, outline, tokens: t, app, rows: *rows, cols: *cols });
     }

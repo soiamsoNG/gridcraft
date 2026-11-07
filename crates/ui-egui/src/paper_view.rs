@@ -176,6 +176,7 @@ pub(crate) fn paint_pages(input: PagePaintInput<'_>, cf: &mut CfCache) -> Vec<gr
             active_row,
             active: sel.active,
             compose: None,
+            editing: None,
         });
         if !pg.is_data_page(i, j) {
             // "Click to add data" pages: faded until something is typed there.

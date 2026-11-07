@@ -146,3 +146,29 @@ fn an_empty_cell_edits_inside_its_own_row() {
         }
     }
 }
+
+/// While the in-cell editor is open the grid must not paint the cell's stored value: the editor
+/// only covers its own width, so a longer value's overflow into the empty cells on its right used
+/// to stay on screen as a ghost once characters were deleted (#1231).
+#[test]
+fn the_edited_cells_value_is_not_painted_under_the_editor() {
+    let painted = |h: &Harness, needle: &str| {
+        h.output().shapes.iter().any(|s| match &s.shape {
+            Shape::Text(t) => t.galley.job.text.contains(needle),
+            _ => false,
+        })
+    };
+    let mut h = harness();
+    h.state_mut().run("cell.set", json!({"cell": "A1", "input": "我们🈶笑脸，我们有😀"})).unwrap();
+    h.run_steps(2);
+    assert!(painted(&h, "笑脸"), "the value paints before editing");
+    h.state_mut().begin_edit(Some(String::new()), false);
+    h.run_steps(2);
+    assert!(h.state().editor.is_some(), "the in-cell editor is open");
+    assert!(!painted(&h, "笑脸"), "the stored value must not paint under the in-cell editor");
+    h.state_mut().cancel_edit();
+    h.run_steps(2);
+    h.state_mut().begin_edit(Some(String::new()), true);
+    h.run_steps(2);
+    assert!(painted(&h, "笑脸"), "editing from the formula bar keeps the cell's value on screen");
+}

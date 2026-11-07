@@ -637,6 +637,12 @@ Cell text:
   strong character decides) — numbers right, booleans and errors centered.
 - `theme::apply()` turns `subpixel_binning` off (epaint's own note says it makes
   text blurrier), which sharpens edges 1.5–2.5 % without changing advances.
+- A cell whose in-cell editor is open does not paint its stored value
+  (`paint_cell_decorations()` returns to the caller, `QuadrantPaint::editing`):
+  the value is unchanged until the commit, so painting it under the editor left
+  its overflow into the empty neighbours visible as a ghost once the editor
+  narrowed with deleted characters. Editing from the formula bar keeps the
+  stored value on screen, because no in-cell editor covers it.
 
 Input:
 

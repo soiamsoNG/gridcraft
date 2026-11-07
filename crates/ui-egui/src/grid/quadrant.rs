@@ -285,6 +285,9 @@ pub(crate) struct QuadrantPaint<'a> {
     pub(crate) active: CellRef,
     /// An input method's unfinished composition, painted in place of the cell's own text (#1231).
     pub(crate) compose: Option<(CellRef, &'a str)>,
+    /// The cell whose in-cell editor is open: its stored value must not paint under the editor,
+    /// or the value's overflow into empty neighbours shows as a ghost when the editor shrinks.
+    pub(crate) editing: Option<CellRef>,
 }
 
 /// Paint a worksheet quadrant, including backgrounds, borders, and text.
@@ -445,7 +448,9 @@ fn paint_cell_decorations(q: &QuadrantPaint<'_>, c: CellRef, rect: Rect, lk: &Lo
         paint_checkbox(p, rect, z, v == Value::Bool(true));
         return true;
     }
-    false
+    // The in-cell editor paints the value itself; a stored value painted underneath shows through
+    // as a ghost once the editor's width shrinks as characters are deleted (#1231).
+    q.editing == Some(c)
 }
 
 /// Most repeats of a fill character laid out in one cell.
