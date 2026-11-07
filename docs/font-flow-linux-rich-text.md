@@ -1585,9 +1585,10 @@ With a solid line on top, that run's green line would sit exactly under the red 
 | 1 | `InkBounds` | purple `(128,0,255)` | 13/17 | 30 | the row's ink width, drawn at the ink top and bottom | both |
 | 2 | `RawBaseline` | green `(0,255,0)` | 3/5 | 8 | one span per script run: that run's ink width | both |
 | 3 | `SharedBaseline` | red `(255,0,0)` | 2/3 | 5 | the row's ink: first glyph's `pos.x + uv_rect.offset.x` to last glyph's `+ uv_rect.size.x` | both |
-| 4 | `CellRect` | yellow `(255,235,0)` | 5/7 | 12 | the cell's full width, on its top and bottom edge; display mode outlines only the active cell | both |
-| 5 | `FieldRect` | cyan `(0,200,255)` | 7/11 | 18 | the rect handed to `TextEdit`, i.e. the cell inset by 2 px | edit only |
-| 6 | `RowBox` | magenta `(255,0,200)` | 11/13 | 24 | the field's width, drawn at `field.top + gh` | edit only |
+| 4 | `Misplaced` | orange `(255,120,0)` | 17/19 | 36 | one span per script run whose glyphs are still off the shared baseline, measured *after* the correction | both |
+| 5 | `CellRect` | yellow `(255,235,0)` | 5/7 | 12 | the cell's full width, on its top and bottom edge; display mode outlines only the active cell | both |
+| 6 | `FieldRect` | cyan `(0,200,255)` | 7/11 | 18 | the rect handed to `TextEdit`, i.e. the cell inset by 2 px | edit only |
+| 7 | `RowBox` | magenta `(255,0,200)` | 11/13 | 24 | the field's width, drawn at `field.top + gh` | edit only |
 
 Order is a property of the palette (`Line::order()`), not of the call sites: `paint_cell()` and
 `paint_editor()` push `(line, y, span)` into one vector, `paint_probes()` sorts it by that value and
@@ -1599,16 +1600,22 @@ against the path that called it (`Scope::Display` from `paint_cell()`, `Scope::E
 `paint_editor()`), so an edit-only line cannot leak into the sheet at rest. Display mode outlines only the active cell because
 the other outlines would sit on grid lines and say nothing.
 
-Rules: baselines only use red/green, boxes only yellow/cyan/magenta, ink only purple; both edges of
-a box use the same colour and dash. Green is drawn for **every** script run, moved or not, so the
-probe cannot hide a correction that silently did nothing. Reading a row:
+Rules: baselines only use red/green/orange, boxes only yellow/cyan/magenta, ink only purple; both
+edges of a box use the same colour and dash.
+
+Green is the run's baseline **before** the correction and red is the target, so a green line away
+from the red one is the correction working, and the distance between them is the size of the
+correction. Orange is the one line that reports a failure: it is drawn from the glyphs as they are
+**after** the correction, and it exists only when that measurement still misses the red line by more
+than 0.5 px. Reading a row:
 
 - only red, no green: the line was laid out in one section, so no correction ran and there is
   nothing to compare;
-- red and green **interleaved** on one `y`: that run is on the shared baseline and was not moved
-  (correct, and now visible as such);
-- a green line **apart** from the red one: `shared_baseline()` moved that run, and the gap is the
-  distance it was off. More than ±1 px left over is a bug.
+- green and red **interleaved** on one `y`: the run's offset was zero, so it did not move (the
+  leftmost run of a line is always one of these);
+- green **parallel** to red, `d` away: the run was moved by `d`; this is expected, not an error;
+- **orange anywhere**: the correction left that run off the baseline — a real bug. Orange is not a
+  reference line and must never appear in a healthy build.
 
 `shared_baseline()` records, per row, how far each glyph sat from that row's first glyph before it
 moved anything, keyed by the address of the galley it returns. Offsets rather than positions keep

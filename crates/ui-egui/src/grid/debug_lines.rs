@@ -33,6 +33,9 @@ pub(crate) enum Line {
     RowBox,
     /// The ink of a row, top and bottom.
     InkBounds,
+    /// A script run whose glyphs still sit off the shared baseline after the correction. It should
+    /// never be drawn: if it is, the correction did not do its job.
+    Misplaced,
 }
 
 impl Line {
@@ -44,6 +47,7 @@ impl Line {
             Self::FieldRect => Color32::from_rgb(0, 200, 255),
             Self::RowBox => Color32::from_rgb(255, 0, 200),
             Self::InkBounds => Color32::from_rgb(128, 0, 255),
+            Self::Misplaced => Color32::from_rgb(255, 120, 0),
         }
     }
 
@@ -59,6 +63,7 @@ impl Line {
             Self::FieldRect => (7.0, 11.0),
             Self::RowBox => (11.0, 13.0),
             Self::InkBounds => (13.0, 17.0),
+            Self::Misplaced => (17.0, 19.0),
         }
     }
 
@@ -69,9 +74,10 @@ impl Line {
             Self::InkBounds => 1,
             Self::RawBaseline => 2,
             Self::SharedBaseline => 3,
-            Self::CellRect => 4,
-            Self::FieldRect => 5,
-            Self::RowBox => 6,
+            Self::Misplaced => 4,
+            Self::CellRect => 5,
+            Self::FieldRect => 6,
+            Self::RowBox => 7,
         }
     }
 
@@ -79,13 +85,13 @@ impl Line {
     fn shows_in(self, scope: Scope) -> bool {
         match self {
             Self::FieldRect | Self::RowBox => scope == Scope::Edit,
-            Self::SharedBaseline | Self::RawBaseline | Self::CellRect | Self::InkBounds => true,
+            Self::SharedBaseline | Self::RawBaseline | Self::Misplaced | Self::CellRect | Self::InkBounds => true,
         }
     }
 
     fn group(self) -> Group {
         match self {
-            Self::SharedBaseline | Self::RawBaseline => Group::Baseline,
+            Self::SharedBaseline | Self::RawBaseline | Self::Misplaced => Group::Baseline,
             Self::CellRect | Self::FieldRect | Self::RowBox => Group::Boxes,
             Self::InkBounds => Group::Ink,
         }
@@ -253,6 +259,10 @@ fn collect_galley(probes: &mut Vec<Probe>, galley: &Arc<egui::Galley>, origin: P
                 let Some(span) = ink_span(&glyphs[start..end]) else { continue };
                 let offset = row_raw.get(start).copied().unwrap_or(0.0);
                 probes.push((Line::RawBaseline, y + shared + offset, (origin.x + span.0, origin.x + span.1)));
+                let now = glyphs[start].pos.y;
+                if (now - shared).abs() > 0.5 {
+                    probes.push((Line::Misplaced, y + now, (origin.x + span.0, origin.x + span.1)));
+                }
             }
         }
         probes.push((Line::SharedBaseline, y + shared, x));
