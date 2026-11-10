@@ -4,8 +4,8 @@ Status: design note and implementation map.
 
 - Repository: `storytold/gridcraft`
 - Branch: `port/ontario-037` (ported onto `origin/main` at `6a8eb4ff`; local only)
-- HEAD when this revision was written: `a4b2da99 chore(ui): draw the layout probes from one scoped palette (#1231)`
-- Last updated: 2026-11-07 (sections 3, 9, 10.5, 12 and 14 describe the port line)
+- HEAD when this revision was written: `03d40fce fix(ui): keep a synthetic italic inside the editor's field (#1231)`
+- Last updated: 2026-11-10 (sections 3, 9, 10.5, 12 and 14 describe the port line)
 - Related issue: `#1231`
 - Current PR: `#1972` points at `fix/linux-fontconfig`; this branch has no PR
 
@@ -113,7 +113,7 @@ Fonts remain external assets. GridCraft must not bundle fonts outside the
 
 ## 3. Current implementation
 
-This section describes the code on this branch at HEAD `a4b2da99`. It states what
+This section describes the code on this branch at HEAD `03d40fce`. It states what
 the code does now, not how it differs from another line: the comparison with
 `fix/linux-fontconfig-0121` is in §10.5 and §12. Functions and files are the
 anchors; line numbers are omitted on purpose because every phase moves them.
@@ -545,7 +545,7 @@ Consequences:
 | Missing bold face | A missing bold face still renders as regular. Only bound role families are judged: the built-in `cell-*`/`SERIF`/`MONO` chains are left upright. |
 | Colour emoji need `epaint/color_fonts` | The feature is on in `crates/ui-egui/Cargo.toml` and adds a PNG decoder. A target that drops the feature (a wasm build that opt out) draws a COLRv1 face as nothing, since those glyphs have no outline. |
 | `sys-emoji` loads with the first font set | The colour face is 5 MB and is loaded whenever any text is present, because it only knows the `Symbols` script. Measured on this host (three runs each, `--sample sales`): +5.2–5.5 MB resident and 0–7 ms to the first frame, so gating it on a scan for emoji code points is deliberately not done (§13 question 17). |
-| Missing italic face | Slanted per script run by the painter (§3.10); the in-cell editor and the formula bar do not slant yet. |
+| Missing italic face | Slanted per script run by the painter (§3.10); the in-cell editor slants too (`append_scripted()`), the formula bar does not (it edits a formula, not styled text). |
 | No cache invalidation | Fonts installed while running are not picked up until restart. |
 | `ScriptSet` is full | All 16 bits are used (Latin … Ethiopic); a new script class needs the set widened to `u32` first (§13 question 15). |
 | An empty workbook asks for everything | Until the first text is seen, `wanted_scripts()` returns `ScriptSet::all()`; an empty sheet therefore loads every installed fallback. |
@@ -1589,8 +1589,8 @@ CI without CJK:
 Current test result:
 
 ```text
-cargo +1.95.0 test -p gridcraft-ui-egui --lib      331 passed, 0 failed
-cargo +1.95.0 test -p gridcraft-ui-egui --test it 1063 passed, 0 failed
+cargo +1.95.0 test -p gridcraft-ui-egui --lib      364 passed, 0 failed
+cargo +1.95.0 test -p gridcraft-ui-egui --test it 1185 passed, 0 failed
 cargo +1.95.0 test -p gridcraft --bin gridcraft     38 passed, 0 failed
 ```
 
@@ -1860,7 +1860,7 @@ Consequences for this document's plans:
 ## 12. Current project status
 
 - Branch: `port/ontario-037`, a port of the fontconfig line onto `origin/main`
-  at `6a8eb4ff` (2026-11-07). 39 commits on top of that base; local only.
+  at `6a8eb4ff` (2026-11-07). 53 commits on top of that base; local only.
 - The 2026-11-07 work was regrouped so each commit is the final implementation
   of one idea rather than its last iteration: `a4b2da99` (the scoped probe
   palette), `12a37fe8` (the editor's text and line box follow the cell),
@@ -1869,7 +1869,16 @@ Consequences for this document's plans:
   bold scripts off tofu). On top of them `875cab8e` dash every probe with
   coprime periods and sort them by `Line::order()`, so a raw baseline that
   coincides with the shared one stays visible (a solid line on top used to hide
-  exactly the "should have moved, did not" case). Earlier commits on the same line: `b09e796c` (`fix(ui): keep whole wrapped lines at the top of
+  exactly the "should have moved, did not" case). `3eff0595` adds the orange
+  `Misplaced` line, measured after the correction, so a run the correction left
+  off the baseline shows up instead of being inferred; `f2d9f2c3` guards the
+  quads and the palette with tests; `c7a5ca5a` opens the probes from
+  `--debug-lines`. `1f985b2c` turns on `epaint/color_fonts` and `6e427da1`
+  gives the emoji family its own face (`sys-emoji` first, +5.2 MB and <10 ms, no
+  gate), `b765ab19` stops painting a cell's value under its open editor, and
+  `03d40fce` pads the editor's galley by the synthetic italic's overhang so the
+  last letter is drawn past the caret instead of being cut. Earlier commits on
+  the same line: `b09e796c` (`fix(ui): keep whole wrapped lines at the top of
   an overflowing cell (#2752)`); before it `7f645682` (`fix(ui): start an app
   with no families bound by the previous font set (#1231)`), `0d831dab`
   (`pick_face` nearest weight), `91aa91c9` (subpixel binning off), `53455682`
@@ -1878,6 +1887,12 @@ Consequences for this document's plans:
   `c4548f52` (cell layout survives a missing family), `fc0404e6` (grid-owned
   input method), `927f62bf` (native Wayland backend). This note is edited on top
   of them, so its own hash is not quoted.
+- Behaviour added since the 2026-11-07 regroup: colour emoji render from
+  `sys-emoji` in the first font set (cost measured, deliberately ungated); the
+  layout probes are opened by `--debug-lines=baseline,boxes,ink|all`; a
+  synthetic italic keeps its sheared top inside the editor's field, including at
+  the caret (`pad_for_shear()`, and the one-line probe is measured unwrapped, so
+  a wrapped probe cannot place the field as if the text were several lines tall).
 - Earlier lines, kept for reference:
   - `fix/linux-fontconfig` — the 0.11.1 line behind PR `#1972`;
   - `fix/linux-fontconfig-0121` — the same work rebased onto `v0.12.1`
