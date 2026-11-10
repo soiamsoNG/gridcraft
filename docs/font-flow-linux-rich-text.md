@@ -411,6 +411,8 @@ above the same family's static bold file: `Noto Sans:weight=bold` resolves to
 Each script function asks fontconfig first on Linux (`sans-serif:lang=…`,
 `serif:lang=…`, Arabic's serif companion is Noto Naskh Arabic), then appends the
 hard-coded paths in `LINUX_CJK_FALLBACK_DIRS` and the platform-specific paths.
+That is one `fc-match` per pattern, never one per character; a glyph no face in
+the chain has falls through to the next face and finally to tofu.
 
 `load_fallback()` loads at most one file per key and records loaded paths within
 one call. A face whose `covers` does not intersect `wanted` is skipped before any
@@ -1973,9 +1975,11 @@ Current app behavior:
   booleans and errors centered. An explicit cell reading order (#947) beats the
   text's own direction, and a right-to-left sheet keeps General-aligned text on
   the side the sheet starts from.
-- The face fontconfig prefers for Arabic (`fc-match ':lang=ar'`, checked to
-  cover Arabic letters) leads `arabic()`'s candidates, so a Vazirmatn the user
-  chose draws Arabic wherever a fallback is needed (#229, #931).
+- Arabic uses the same script fallbacks as every other script: fontconfig's
+  `sans-serif:lang=ar` choice leads `arabic()`'s candidates, so a Vazirmatn the
+  user chose draws Arabic wherever a fallback is needed (#229), with the Noto
+  paths behind it. There is no per-character coverage gate — a face's glyphs are
+  judged by epaint's chain walk, which is what every other script relies on.
 - Text edges are not sub-pixel binned, which sharpens them 1.5–2.5 %.
 - An input method works for a single click on a cell: while the grid holds the
   keyboard it publishes its own `IMEOutput`, the preedit is drawn in the cell
