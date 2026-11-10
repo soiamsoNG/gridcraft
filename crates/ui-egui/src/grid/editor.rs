@@ -18,6 +18,17 @@ pub(super) fn editor_width(text_w: f32, cell_w: f32, size: f32) -> f32 {
     if text_w + 14.0 <= cell_w { cell_w } else { text_w + editor_slack(size) }
 }
 
+/// How far a synthetic italic pushes a glyph past its advance: `TextFormat::italics` moves the top
+/// two vertices of every glyph right by a quarter of that glyph's ink height
+/// (`crates/epaint/src/text/text_layout.rs`, `tessellate_glyphs`). Advances are unchanged, so the
+/// galley's width stops at the bottom edge of the last glyph and the sheared top overhangs it —
+/// text fields and wrapped layouts have to leave that much room on the right or the last letter is
+/// cut by a vertical edge. Square scripts (Han, Hangul) have the tallest ink boxes and overhang the
+/// most, which is why the clip shows there first.
+pub(super) fn italic_overhang(galley: &egui::Galley) -> f32 {
+    super::quadrant::shear_overhang(galley)
+}
+
 /// Top of the in-cell editor's line box: the cell's own text, put where the cell's vertical
 /// alignment puts it, so entering and leaving the edit never moves the text.
 pub(super) fn editor_text_top(rect: Rect, z: f32, ink: Ink, galley_h: f32, valign: VAlign, wrap: bool) -> f32 {
@@ -45,16 +56,26 @@ pub(super) fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, s
     // Wrap Text: the editor keeps the column's width and wraps, growing down as Excel's does.
     // Otherwise it widens to the text's one-line width.
     let wrap = st.align.wrap;
+    // Synthetic italics shear the top of each glyph a quarter of its ink height to the right,
+    // without widening the advance: leave that much room at the right of the text, or the last
+    // letter is cut by the field's vertical edge (Hangul and Han overhang the most).
+    let style = crate::formula_bar::EditorStyle { font: font.clone(), italic: st.font.italic };
+    let field_width = (rect.width() - 4.0).max(1.0);
+    // A one-line editor must be measured unwrapped: wrapping the probe would give it the height of
+    // several lines and the field would be placed as if the text were that tall.
+    let probe_width = if wrap { field_width } else { f32::INFINITY };
+    let probe = crate::formula_bar::editor_probe(ui, &ed.text, &style, probe_width);
+    let overhang = if st.font.italic { italic_overhang(&probe) } else { 0.0 };
     let (w, h) = if wrap {
         // The field wraps at the width it is given (the editor's less its 2 px inset a side): its
         // frame is `Frame::NONE`, so no text margin is taken off.
-        let wrapped = ui.painter().layout(ed.text.clone(), font.clone(), Color32::BLACK, (rect.width() - 4.0).max(1.0));
+        let wrapped = ui.painter().layout(ed.text.clone(), font.clone(), Color32::BLACK, (field_width - overhang).max(1.0));
         (rect.width(), (wrapped.size().y.max(size * 1.3 * shown) + 4.0).max(rect.height()))
     } else {
         let text_w = ui.painter().layout_no_wrap(ed.text.clone(), font.clone(), Color32::BLACK).size().x;
         // Excel keeps the cell's height for one line and only grows for extra lines.
         let h = if lines > 1.0 { (size * 1.3 * lines + 4.0).max(rect.height()) } else { rect.height() };
-        (editor_width(text_w, rect.width(), size).min(geo.cells.right() - rect.left()), h)
+        (editor_width(text_w + overhang, rect.width(), size).min(geo.cells.right() - rect.left()), h)
     };
     // Grows to the left on a right-to-left sheet.
     let erect = geo.mirror_rect(Rect::from_min_size(rect.min, vec2(w, h)));
@@ -85,9 +106,6 @@ pub(super) fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, s
     // The editor's text sits exactly where the cell's text sits: `TextEdit` puts its galley at the
     // top of the rect it is given, so the field starts at the line box top that `cell_text_y()`
     // returns for the cell's own vertical alignment.
-    let style = crate::formula_bar::EditorStyle { font: font.clone(), italic: st.font.italic };
-    let wrap_width = if wrap { (erect.width() - 4.0).max(1.0) } else { f32::INFINITY };
-    let probe = crate::formula_bar::editor_probe(ui, &ed.text, &style, wrap_width);
     // An empty cell has no ink to anchor by: the probe lays out one blank line (so its height is a
     // real line), but a space still reports the ascender of the glyph box as its top. Anchoring by
     // that would put the field above the cell's top edge; with no ink, the line box itself is the
@@ -98,6 +116,10 @@ pub(super) fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, s
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.ink"), ink.top));
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.height"), probe.size().y));
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.z"), geo.z));
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.overhang"), overhang));
+    // The width the text field is given: the field less its insets.
+    let room = (erect.width() - 4.0).max(1.0);
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.room"), room));
     let field = Rect::from_min_max(pos2(erect.left() + 2.0, text_top), pos2(erect.right() - 2.0, (erect.bottom() - 1.0).max(text_top + size)));
     if super::debug_lines::any() {
         // Debug lines follow the palette in docs/font-flow-linux-rich-text.md (§9).
@@ -109,7 +131,7 @@ pub(super) fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, s
     // The theme's caret is meant for the UI chrome and vanishes on some fills (and, in the dark
     // theme, on the white paper): pick black or white against the fill, like Excel.
     child.visuals_mut().text_cursor.stroke.color = ink_on(fill);
-    crate::formula_bar::editor_widget(app, &mut child, id, &style, wrap, erect.width() - 4.0, erect.height() - 2.0);
+    crate::formula_bar::editor_widget(app, &mut child, id, &style, wrap, room, erect.height() - 2.0);
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("gridcraft.cell_editor.rect"), erect));
 }
 

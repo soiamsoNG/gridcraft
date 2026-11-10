@@ -1,4 +1,43 @@
-use super::{Ink, cell_text_y, wrapped_cell_text_y};
+use super::quadrant::shear_overhang;
+use super::{Ink, cell_text_y, pad_for_shear, wrapped_cell_text_y};
+
+#[test]
+fn the_italic_shear_is_measured_from_the_tallest_glyph() {
+    use super::editor::italic_overhang;
+    // `TextFormat::italics` moves a glyph's top vertices right by a quarter of its ink height and
+    // leaves the advance alone, so a text field has to reserve that much room past the text or the
+    // last letter is cut by its right edge. The measure must come from the glyph boxes, not from a
+    // constant: square scripts (Hangul, Han) have the tallest boxes (#1231).
+    let _g = crate::fonts::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::fonts::set_bound(Vec::new());
+    let ctx = egui::Context::default();
+    ctx.set_fonts(crate::theme::pinned_font_definitions());
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let format = |italics: bool| egui::TextFormat {
+            font_id: egui::FontId::proportional(19.2),
+            color: egui::Color32::BLACK,
+            italics,
+            ..Default::default()
+        };
+        let mut job = egui::text::LayoutJob::default();
+        job.append("Hello 中文", 0.0, format(true));
+        let galley = painter.layout_job(job.clone());
+        let tallest = galley.rows.iter().flat_map(|row| row.glyphs.iter()).map(|glyph| glyph.uv_rect.size[1]).fold(0.0f32, f32::max);
+        assert!(tallest > 0.0, "the line has ink to shear");
+        assert!(
+            (italic_overhang(&galley) - tallest * 0.25).abs() < 1e-3,
+            "the shear is a quarter of the tallest ink box: {} vs {}",
+            italic_overhang(&galley),
+            tallest * 0.25
+        );
+        // A line with no ink reserves nothing: nothing would overhang.
+        let mut empty = egui::text::LayoutJob::default();
+        empty.append(" ", 0.0, format(true));
+        assert_eq!(italic_overhang(&painter.layout_job(empty)), 0.0);
+    });
+    out.textures_delta.clear();
+}
 
 #[test]
 fn editor_matches_the_cell_while_the_text_fits() {
@@ -750,4 +789,25 @@ fn an_emoji_in_one_section_lands_on_the_text_baseline() {
         }
     });
     out.textures_delta.clear();
+}
+
+#[test]
+fn the_shear_pad_widens_the_galley_box_and_leaves_the_glyphs() {
+    let ctx = egui::Context::default();
+    ctx.set_fonts(crate::theme::pinned_font_definitions());
+    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut job = egui::text::LayoutJob::default();
+        let mut format = egui::TextFormat::simple(egui::FontId::new(18.0, egui::FontFamily::Proportional), egui::Color32::BLACK);
+        format.italics = true;
+        job.append("한국어", 0.0, format);
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        assert!(shear_overhang(&galley) > 0.0, "an italic line shears its glyphs");
+        let before: Vec<f32> = galley.rows.iter().flat_map(|row| row.glyphs.iter().map(|g| g.pos.x)).collect();
+        let width = galley.rect.width();
+        let padded = pad_for_shear(galley);
+        assert!((padded.rect.width() - width - shear_overhang(&padded)).abs() < 0.01);
+        let after: Vec<f32> = padded.rows.iter().flat_map(|row| row.glyphs.iter().map(|g| g.pos.x)).collect();
+        assert_eq!(before, after, "the pad moves no glyph");
+    });
+    output.textures_delta.clear();
 }

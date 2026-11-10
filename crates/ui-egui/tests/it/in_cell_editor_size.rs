@@ -172,3 +172,51 @@ fn the_edited_cells_value_is_not_painted_under_the_editor() {
     h.run_steps(2);
     assert!(painted(&h, "笑脸"), "editing from the formula bar keeps the cell's value on screen");
 }
+
+/// `TextFormat::italics` shears the top of each glyph a quarter of its ink height to the right but
+/// leaves the advance alone, so the last letter of an italic line sticks out past the text's width.
+/// The editor has to keep that room free on the right, or the sheared top is cut by a vertical edge
+/// — most visible with Hangul, whose ink boxes are the tallest (#1231).
+#[test]
+fn the_editor_leaves_room_for_the_italic_shear() {
+    let mut h = harness();
+    h.state_mut().session.execute("cell.set", json!({"cell": "A1", "input": "한국어 Hello"})).unwrap();
+    h.run_steps(2);
+    h.state_mut().begin_edit(Some("한국어 Hello".into()), false);
+    h.run_steps(2);
+    let painted = editor_rect(&h, cell_rect(&h, "A1"));
+    let overhang: f32 = h.ctx.data(|d| d.get_temp(Id::unique("gridcraft.cell_editor.overhang"))).expect("the editor measured its shear");
+    let room: f32 = h.ctx.data(|d| d.get_temp(Id::unique("gridcraft.cell_editor.room"))).expect("the editor kept room for it");
+    assert_eq!(overhang, 0.0, "upright text does not shear");
+    assert!((room - (painted.width() - 4.0)).abs() < 0.51, "upright text uses the whole field: room {room}, field {painted:?}");
+
+    h.state_mut().session.execute("home.italic", json!({"range": "A1", "on": true})).unwrap();
+    h.run_steps(2);
+    h.state_mut().begin_edit(Some("한국어 Hello".into()), false);
+    h.run_steps(2);
+    let painted = editor_rect(&h, cell_rect(&h, "A1"));
+    let overhang: f32 = h.ctx.data(|d| d.get_temp(Id::unique("gridcraft.cell_editor.overhang"))).expect("the editor measured its shear");
+    let room: f32 = h.ctx.data(|d| d.get_temp(Id::unique("gridcraft.cell_editor.room"))).expect("the editor kept room for it");
+    assert!(overhang > 0.5, "an italic line shears its glyphs: {overhang}");
+    assert!((room - (painted.width() - 4.0)).abs() < 0.51, "the field keeps its own width: room {room}, field {painted:?}");
+    // The sheared tops are drawn past the last advance; the field itself is the cell plus, once
+    // the text overflows, the slack and the overhang the caller asked for.
+    assert!(painted.width() >= cell_rect(&h, "A1").width() - 0.51, "the field is at least the cell: {:?}", painted);
+}
+
+#[test]
+fn a_long_one_line_text_keeps_the_editor_one_line_tall() {
+    let mut h = harness();
+    let long = "日本語 한국어 긴문장 that keeps going past the cell";
+    h.state_mut().session.execute("cell.set", json!({"cell": "A1", "input": long})).unwrap();
+    h.run_steps(2);
+    h.state_mut().begin_edit(Some(long.into()), false);
+    h.run_steps(2);
+    let cell = cell_rect(&h, "A1");
+    let field = editor_rect(&h, cell);
+    let line: f32 = h.ctx.data(|d| d.get_temp(Id::unique("gridcraft.cell_editor.height"))).expect("the editor measured its line");
+    // The probe must be laid out unwrapped: a wrapped probe reports several lines, and the field
+    // would then be positioned as if the text were that tall.
+    assert!(line < field.height() * 1.5 + 0.51, "one line of text: line {line}, field {:?}", field);
+    assert!(field.top() >= cell.top() - 0.51, "the field starts inside the cell: {:?} vs {:?}", field, cell);
+}

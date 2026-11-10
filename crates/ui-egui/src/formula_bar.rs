@@ -589,7 +589,10 @@ pub fn editor_widget(
         job.wrap.max_width = if multiline { wrap_width } else { f32::INFINITY };
         let galley = ui.fonts_mut(|f| f.layout_job(job));
         let galley = crate::grid::align_baseline(galley);
-        crate::grid::normalize_row_boxes(galley, line_box)
+        let galley = crate::grid::normalize_row_boxes(galley, line_box);
+        // The text field clips to the galley's own box, so a synthetic italic's sheared tops need
+        // that box to reach past the last advance.
+        if italic { crate::grid::pad_for_shear(galley) } else { galley }
     };
     let chars_before = ed.text.chars().count();
     // A dialog opened over the edit (Paste Name) takes the keyboard until it closes, and the

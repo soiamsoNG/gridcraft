@@ -120,6 +120,38 @@ pub(crate) fn align_baseline(galley: std::sync::Arc<egui::Galley>) -> std::sync:
     galley
 }
 
+/// How far a synthetic italic pushes a glyph past its advance. `TextFormat::italics` moves the top
+/// two vertices of every glyph right by a quarter of that glyph's ink height (epaint's
+/// `tessellate_glyphs`); advances are unchanged, so a galley's box stops at the bottom edge of the
+/// last glyph and the sheared top overhangs it. Square scripts (Han, Hangul) have the tallest ink
+/// boxes and overhang the most, so a text field's right edge cuts them first.
+pub(crate) fn shear_overhang(galley: &egui::Galley) -> f32 {
+    let mut widest = 0.0f32;
+    for row in &galley.rows {
+        for glyph in &row.glyphs {
+            let height = glyph.uv_rect.size[1];
+            if height > 0.0 {
+                widest = widest.max(height * 0.25);
+            }
+        }
+    }
+    widest
+}
+
+/// Widen the galley's box by the shear overhang without moving any glyph. egui's `TextEdit` clips
+/// a laid-out galley to its own box (`builder.rs`: the clip is the inner rect, only expanded
+/// vertically), so the box has to include the sheared tops or the last letter is cut by a
+/// vertical edge at the caret.
+pub(crate) fn pad_for_shear(galley: std::sync::Arc<egui::Galley>) -> std::sync::Arc<egui::Galley> {
+    let pad = shear_overhang(&galley);
+    if pad <= 0.0 {
+        return galley;
+    }
+    let mut galley = galley;
+    std::sync::Arc::make_mut(&mut galley).rect.max.x += pad;
+    galley
+}
+
 /// The caret and the selection are drawn from each row's box, and a fallback face put on the
 /// baseline (#1231) inflates that box far beyond the text: the caret then starts well above the ink
 /// (and, in the cell editor, above the cell itself). Move the glyphs (and their tessellated quads)

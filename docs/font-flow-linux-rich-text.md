@@ -620,6 +620,17 @@ Cell text:
   The editor takes its line box top from the same `cell_text_y()`/`wrapped_cell_text_y()` the cell
   paints with, for the cell's own vertical alignment, so entering or leaving the edit does not move
   the text (`the_editor_text_follows_the_cells_vertical_alignment`).
+  Synthetic italics shear the top of a glyph a quarter of its ink height to the
+  right without widening the advance, and egui clips a text field to its own
+  galley box (only vertically expanded). The layouter therefore pads the
+  galley's right edge by that overhang (`pad_for_shear()`), and the field is
+  sized from the text plus the overhang, so the last letter — tall Hangul and
+  Han ink boxes overhang the most — is drawn past the caret instead of being cut
+  (`the_editor_leaves_room_for_the_italic_shear`,
+  `the_shear_pad_widens_the_galley_box_and_leaves_the_glyphs`). A one-line
+  editor measures its probe unwrapped: a wrapped probe reports several lines and
+  the field would be placed as if the text were that tall
+  (`a_long_one_line_text_keeps_the_editor_one_line_tall`).
   The caret and selection come from `TextEdit`'s row boxes, which the baseline fallback inflates:
   `trim_row_boxes()` trims each row's box to the cell font's own line height while the glyphs keep
   their positions (`the_caret_covers_the_text_line_and_not_the_fallback_box`).
