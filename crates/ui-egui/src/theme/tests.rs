@@ -290,30 +290,14 @@ fn fallback_covers_its_script() {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 #[test]
-/// fontconfig's Arabic face, when it has Arabic letters, leads the Arabic fallbacks (#229). A UI
-/// or cell face with Arabic of its own sits ahead of every fallback and still draws Arabic first.
-fn the_fontconfig_arabic_choice_leads_the_arabic_fallbacks() {
-    assert_eq!(
-        parse_fc_match("/home/u/.local/share/fonts/Vazirmatn-Regular.ttf\n0\n"),
-        Some(("/home/u/.local/share/fonts/Vazirmatn-Regular.ttf".into(), 0))
-    );
-    assert_eq!(
-        parse_fc_match("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc\n2\n"),
-        Some(("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc".into(), 2))
-    );
-    assert_eq!(parse_fc_match("/usr/share/fonts/a.ttf"), Some(("/usr/share/fonts/a.ttf".into(), 0)));
-    assert_eq!(
-        parse_fc_match("/usr/share/fonts/vazirmatn/Vazirmatn[wght].ttf\n262145\n"),
-        Some(("/usr/share/fonts/vazirmatn/Vazirmatn[wght].ttf".into(), 1)),
-        "a named instance's bits are not part of the face index"
-    );
-    assert_eq!(parse_fc_match(""), None);
-    assert!(!covers_arabic(epaint_default_fonts::UBUNTU_LIGHT, 0), "a Latin-only face is not an Arabic choice");
-    if let Some(preferred) = fontconfig_arabic() {
-        assert_eq!(arabic().first(), Some(&preferred), "the fontconfig choice must lead the Arabic candidates");
-    }
+/// Arabic uses the shared script fallbacks: fontconfig's `sans-serif:lang=ar` choice first, then
+/// the known Noto paths — the same shape as every other script, with no coverage gate (#229).
+fn arabic_uses_the_shared_script_fallbacks() {
+    let faces = arabic();
+    assert_eq!(faces.first(), fc_match_candidates(&["sans-serif:lang=ar"]).first(), "the fontconfig choice leads");
+    assert!(faces.iter().any(|(path, _)| path.ends_with("NotoSansArabic-Regular.ttf")), "the known Noto path follows");
 }
 
 #[test]

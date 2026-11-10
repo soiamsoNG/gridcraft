@@ -23,11 +23,11 @@ use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, Visua
 mod font_fallback;
 mod font_setup;
 
+#[cfg(all(test, target_os = "linux"))]
+use font_fallback::fc_match_candidates;
 pub use font_fallback::symbol_face_installed;
 #[cfg(test)]
 use font_fallback::{arabic, cjk_han_japanese, cjk_han_simplified, cjk_hangul, fallback_faces, hebrew, lao, symbols_more, thai};
-#[cfg(all(test, unix, not(target_os = "macos")))]
-use font_fallback::{covers_arabic, fontconfig_arabic, parse_fc_match};
 use font_setup::pick;
 pub use font_setup::{
     CELL, CELL_BOLD, CELL_BOLD_ITALIC, CELL_ITALIC, CraftFont, HanOrder, MATH, MATH_BOLD, MATH_ITALIC, MONO, SERIF, UI, UI_BOLD, available_text,

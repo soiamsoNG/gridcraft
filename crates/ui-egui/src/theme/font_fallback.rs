@@ -11,7 +11,7 @@ use crate::script::{ScriptClass, ScriptSet};
 
 /// Every face `fc-match` answers for the given patterns, in order.
 #[cfg(target_os = "linux")]
-fn fc_match_candidates(patterns: &[&str]) -> Vec<(String, u32)> {
+pub(super) fn fc_match_candidates(patterns: &[&str]) -> Vec<(String, u32)> {
     let mut candidates = Vec::new();
     for pattern in patterns {
         if let Some(font) = crate::fonts::fc_match(pattern)
@@ -221,42 +221,6 @@ pub(super) fn load_bold_script_faces(fonts: &mut FontDefinitions, wanted_bold: S
 #[cfg(target_arch = "wasm32")]
 pub(super) fn load_fallback(_fonts: &mut FontDefinitions, _han: HanOrder, _serif: bool, _wanted: ScriptSet, _known: bool) -> Vec<String> {
     Vec::new()
-}
-
-/// The face fontconfig prefers for Arabic, such as a Vazirmatn the user set as their Arabic font
-/// (#229), kept only when it has Arabic letters. Asked once per process.
-#[cfg(all(unix, not(target_os = "macos")))]
-pub(super) fn fontconfig_arabic() -> Option<(String, u32)> {
-    static PREFERRED: std::sync::OnceLock<Option<(String, u32)>> = std::sync::OnceLock::new();
-    PREFERRED
-        .get_or_init(|| {
-            let out = std::process::Command::new("fc-match").args(["--format=%{file}\n%{index}\n", ":lang=ar"]).output().ok()?;
-            let (file, index) = parse_fc_match(&String::from_utf8_lossy(&out.stdout)).filter(|_| out.status.success())?;
-            let bytes = crate::fonts::read_font(std::path::Path::new(&file))?;
-            covers_arabic(&bytes, index).then_some((file, index))
-        })
-        .clone()
-}
-
-#[cfg(all(not(target_arch = "wasm32"), not(all(unix, not(target_os = "macos")))))]
-pub(super) fn fontconfig_arabic() -> Option<(String, u32)> {
-    None
-}
-
-/// The file and face index from `fc-match --format='%{file}\n%{index}\n'`. fontconfig packs a
-/// variable font's named instance into the upper 16 bits of the index; only the face index is kept.
-#[cfg(all(unix, not(target_os = "macos")))]
-pub(super) fn parse_fc_match(out: &str) -> Option<(String, u32)> {
-    let mut lines = out.lines().map(str::trim);
-    let file = lines.next().filter(|file| !file.is_empty())?;
-    let index = lines.next().and_then(|index| index.parse::<u32>().ok()).map_or(0, |packed| packed & 0xFFFF);
-    Some((file.to_owned(), index))
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-pub(super) fn covers_arabic(bytes: &[u8], index: u32) -> bool {
-    use skrifa::MetadataProvider;
-    skrifa::FontRef::from_index(bytes, index).is_ok_and(|font| "العربية".chars().all(|ch| font.charmap().map(ch).is_some()))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -584,16 +548,12 @@ fn khmer_serif() -> Vec<(String, u32)> {
     script_serif("km", &["NotoSerifKhmer-Regular.ttf", "NotoSerifKhmer[wght].ttf"])
 }
 
-/// Arabic faces. The serif companion is Naskh (the traditional book design), not a Latin serif.
+/// Arabic faces. fontconfig's `sans-serif:lang=ar` choice, such as a Vazirmatn the user set as
+/// their Arabic font (#229), is the first candidate, as it is for every other script; the serif
+/// companion is Naskh (the traditional book design), not a Latin serif.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn arabic() -> Vec<(String, u32)> {
-    let mut v: Vec<(String, u32)> = Vec::new();
-    // The face fontconfig prefers for Arabic, such as a Vazirmatn the user set as their Arabic
-    // font (#229), leads the script faces when it actually has Arabic letters.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    v.extend(fontconfig_arabic());
-    v.extend(script_face("ar", &["NotoSansArabic-Regular.ttf", "NotoSansArabic[wdth,wght].ttf"]));
-    v
+    script_face("ar", &["NotoSansArabic-Regular.ttf", "NotoSansArabic[wdth,wght].ttf"])
 }
 
 #[cfg(not(target_arch = "wasm32"))]
