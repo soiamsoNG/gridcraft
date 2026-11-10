@@ -25,9 +25,7 @@ mod font_setup;
 
 pub use font_fallback::symbol_face_installed;
 #[cfg(test)]
-use font_fallback::{
-    arabic, cjk_han_japanese, cjk_han_simplified, cjk_hangul, fallback_faces, hebrew, lao, symbols_more, thai,
-};
+use font_fallback::{arabic, cjk_han_japanese, cjk_han_simplified, cjk_hangul, fallback_faces, hebrew, lao, symbols_more, thai};
 #[cfg(all(test, unix, not(target_os = "macos")))]
 use font_fallback::{covers_arabic, fontconfig_arabic, parse_fc_match};
 use font_setup::pick;
@@ -38,7 +36,7 @@ pub use font_setup::{
     symbol_fallback, ui_bold, ui_font,
 };
 #[cfg(test)]
-use font_setup::{candidates, craft_font_faces, font_definitions_impl, try_load};
+use font_setup::{candidates, craft_font_faces, try_load};
 #[cfg(test)]
 pub(crate) use font_setup::{drop_unparseable_fonts, font_parses};
 

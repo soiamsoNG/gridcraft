@@ -598,7 +598,7 @@ fn paint_cell(q: &QuadrantPaint<'_>, painted: &(CellRef, Rect, Look, Option<CfLo
         let mut job = cell_job(text.clone(), font.clone(), color, wrap_w, italic);
         job.direction = direction;
         job.halign_min_is_start = false;
-        job.halign = match halign {
+        job.halign = match painted_halign(halign, geo.rtl) {
             HAlign::Center | HAlign::CenterAcross => egui::Align::Center,
             HAlign::Right => egui::Align::RIGHT,
             _ => egui::Align::LEFT,

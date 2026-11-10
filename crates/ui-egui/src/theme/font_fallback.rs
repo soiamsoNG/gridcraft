@@ -530,7 +530,13 @@ fn script_face(lang: &str, files: &[&str]) -> Vec<(String, u32)> {
         let pattern = format!("sans-serif:lang={lang}");
         v.extend(fc_match_candidates(&[pattern.as_str()]));
     }
-    for d in ["/usr/share/fonts/google-noto-vf", "/usr/share/fonts/truetype/noto", "/usr/share/fonts/opentype/noto", "/usr/share/fonts"] {
+    for d in [
+        "/usr/share/fonts/google-noto-vf",
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/opentype/noto",
+        "/usr/share/fonts/chromeos/noto", // ChromeOS's Linux container (#1762)
+        "/usr/share/fonts",
+    ] {
         for file in files {
             v.push((format!("{d}/{file}"), 0));
         }
@@ -548,7 +554,13 @@ fn script_serif(lang: &str, files: &[&str]) -> Vec<(String, u32)> {
         let pattern = format!("serif:lang={lang}");
         v.extend(fc_match_candidates(&[pattern.as_str()]));
     }
-    for d in ["/usr/share/fonts/google-noto-vf", "/usr/share/fonts/truetype/noto", "/usr/share/fonts/opentype/noto", "/usr/share/fonts"] {
+    for d in [
+        "/usr/share/fonts/google-noto-vf",
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/opentype/noto",
+        "/usr/share/fonts/chromeos/noto", // ChromeOS's Linux container (#1762)
+        "/usr/share/fonts",
+    ] {
         for file in files {
             v.push((format!("{d}/{file}"), 0));
         }
@@ -574,7 +586,7 @@ fn khmer_serif() -> Vec<(String, u32)> {
 
 /// Arabic faces. The serif companion is Naskh (the traditional book design), not a Latin serif.
 #[cfg(not(target_arch = "wasm32"))]
-fn arabic() -> Vec<(String, u32)> {
+pub(super) fn arabic() -> Vec<(String, u32)> {
     let mut v: Vec<(String, u32)> = Vec::new();
     // The face fontconfig prefers for Arabic, such as a Vazirmatn the user set as their Arabic
     // font (#229), leads the script faces when it actually has Arabic letters.
@@ -667,7 +679,6 @@ fn cjk_hangul_serif() -> Vec<(String, u32)> {
     }
     v
 }
-
 
 /// Symbol faces behind the UI font. Interface fonts such as Noto Sans and Cantarell (and egui's
 /// built-in Ubuntu) lack arrows, check marks, geometric shapes and keyboard symbols (▾ ✓ ✕ ▲ ↳ ⇧),

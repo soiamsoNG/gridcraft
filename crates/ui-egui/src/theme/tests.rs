@@ -1,6 +1,15 @@
 use super::*;
 use crate::i18n::Language;
 
+/// Whether any face in `chain` has a glyph for `ch`.
+fn chain_covers(fonts: &FontDefinitions, chain: &[String], ch: char) -> bool {
+    use skrifa::MetadataProvider;
+    chain
+        .iter()
+        .filter_map(|key| fonts.font_data.get(key))
+        .any(|data| skrifa::FontRef::from_index((*data.font).as_ref(), data.index).is_ok_and(|font| font.charmap().map(ch).is_some()))
+}
+
 #[test]
 /// Loaded script-fallback faces end each role chain just before the craft fonts, in the language's order.
 fn fallback_faces_are_appended_to_every_family() {
