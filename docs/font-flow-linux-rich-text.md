@@ -3,8 +3,9 @@
 Status: design note and implementation map.
 
 - Repository: `storytold/gridcraft`
-- Branch: `port/ontario-037` (ported onto `origin/main` at `6a8eb4ff`; local only)
-- HEAD when this revision was written: `03d40fce fix(ui): keep a synthetic italic inside the editor's field (#1231)`
+- Branch: `port/ontario-037` (rebased onto `origin/main` at `e9addf52`; local only)
+- HEAD when this revision was written: the tip of the port line (this note's own commit is not quoted)
+- Baselines after the rebase: `--lib` 372, `--test it` 1191, `arabic_bidi` 7, `arabic_editing` 5, `gridcraft --bin` 38, all passing
 - Last updated: 2026-11-10 (sections 3, 9, 10.5, 12 and 14 describe the port line)
 - Related issue: `#1231`
 - Current PR: `#1972` points at `fix/linux-fontconfig`; this branch has no PR
@@ -552,7 +553,7 @@ Consequences:
 | Latin never asks the catalog | The interface and bound families cover Latin, so `load_catalog_fallback()` skips it. |
 | A rebuilt set keeps the old faces | `merge_fonts()` keeps the new set a superset, so faces carried for one workbook stay resident until restart. |
 | Bold scripts need a bold face from the host | `sys-script-<script>-bold` comes from the catalog (weight ≥ 600); a host without one keeps the regular face. The Flatpak installs no CJK font, so this is entirely the host's call. |
-| No per-cell reading order | Excel's `<alignment readingOrder="1|2">` is neither read nor written; only the sheet-wide `rightToLeft` mirrors the grid. |
+| Reading order is not rich-text aware | A cell's `readingOrder` sets one base direction for its whole text (#947); a paragraph that mixes directions per character still follows the first strong character. |
 | Tofu instead of a panic | A glyph nothing can draw is drawn as tofu (`MissingGlyphPolicy::Tofu`); the bookkeeping bug is logged, not fatal. |
 | No rich-text model | Per-character formatting is lost; XLSX runs are flattened. |
 
@@ -1859,8 +1860,15 @@ Consequences for this document's plans:
 
 ## 12. Current project status
 
-- Branch: `port/ontario-037`, a port of the fontconfig line onto `origin/main`
-  at `6a8eb4ff` (2026-11-07). 53 commits on top of that base; local only.
+- Branch: `port/ontario-037`, the fontconfig line rebased onto `origin/main` at
+  `e9addf52` (2026-11-09): 54 commits on top of that base, which brings Arabic
+  bidi layout and per-cell reading order (#947) and main's Arabic fallback work
+  (#931). Conflicts were resolved in favour of this line's catalog and script
+  faces: main's `read_font()` bounded read now backs every scan, its fontconfig
+  Arabic choice leads `arabic()`'s candidates instead of loading as a second
+  preferred face, and `general_halign()` takes the resolved direction
+  (`direction == Rtl && !sheet_rtl`) so an explicit reading order wins while
+  `Context` still falls back to the first strong character. Local only.
 - The 2026-11-07 work was regrouped so each commit is the final implementation
   of one idea rather than its last iteration: `a4b2da99` (the scoped probe
   palette), `12a37fe8` (the editor's text and line box follow the cell),
@@ -1899,8 +1907,8 @@ Consequences for this document's plans:
     (`ac8da7d4..v0.12.1` is 166 release commits; a tag cannot be a PR base);
   - backups `backup/linux-fontconfig-0.13`, `backup/main-1231-font`,
     `backup/port-ontario-037-20261103`.
-- Remote: `fork/port/ontario-037` still points at the pre-rebase `778c265a`;
-  syncing it needs a force-push.
+- Remote: `fork/port/ontario-037` still points at the pre-rebase `44cb50c7`
+  (`3fad50a7` before it); syncing it needs a force-push.
 - PR: none for this line. `#1972` points at `fix/linux-fontconfig`, base `main`,
   open, `CONFLICTING`.
 - egui: pinned `0.37.0` plus one commit (`storytold/egui` @ `6d518fc7`), see
@@ -1962,7 +1970,12 @@ Current app behavior:
   below the edge, bottom keeps a quarter of the trailing descent under it, and a
   wrapped line taller than its row shows only whole lines.
 - Right-to-left text right-aligns under General alignment; numbers stay right,
-  booleans and errors centered.
+  booleans and errors centered. An explicit cell reading order (#947) beats the
+  text's own direction, and a right-to-left sheet keeps General-aligned text on
+  the side the sheet starts from.
+- The face fontconfig prefers for Arabic (`fc-match ':lang=ar'`, checked to
+  cover Arabic letters) leads `arabic()`'s candidates, so a Vazirmatn the user
+  chose draws Arabic wherever a fallback is needed (#229, #931).
 - Text edges are not sub-pixel binned, which sharpens them 1.5–2.5 %.
 - An input method works for a single click on a cell: while the grid holds the
   keyboard it publishes its own `IMEOutput`, the preedit is drawn in the cell
@@ -2026,7 +2039,10 @@ Current app behavior:
     has no class? Decided: only when needed. The widening is contained and
     `every_class_but_common_has_its_own_bit` fails as soon as the last bit would
     collide, so it cannot be forgotten.
-16. Should a cell's `readingOrder` be honoured before rich text lands? Excel's
+16. ~~Should a cell's `readingOrder` be honoured before rich text lands?~~ Decided:
+    #947 implements it (`Alignment::reading_order`, XLSX read/write,
+    `text_direction::cell_direction()` for `LayoutJob::direction`, and
+    `general_halign()` preferring it). Kept for the record: Excel's
     `<alignment readingOrder="1|2">` forces a paragraph's base direction (`1`
     left to right, `2` right to left) regardless of its first character, and an
     absent value inherits the sheet direction. GridCraft has neither field nor
@@ -2064,6 +2080,7 @@ Current app behavior:
 | `crates/ui-egui/src/fonts.rs` | Discovery, metadata scan, `Face`, binding, bound registry. |
 | `crates/ui-egui/src/catalog.rs` | `FontCatalog`: name and script index, `font_for_script()`. |
 | `crates/ui-egui/src/script.rs` | `ScriptClass`, `classify()`, `split_runs()`, `ScriptSet`, `is_rtl()`. |
+| `crates/ui-egui/src/text_direction.rs` | `cell_direction()`: a cell's `readingOrder` first, its first strong character for `Context`. |
 | `crates/ui-egui/src/theme.rs` | Visuals, `theme::apply()` (subpixel binning off). |
 | `crates/ui-egui/src/theme/font_setup.rs` | Role chains, fontconfig role patterns, `FontDefinitions`, `merge_fonts()`. |
 | `crates/ui-egui/src/theme/font_fallback.rs` | Fallback face table, script gating, catalog and bold script faces. |
@@ -2094,6 +2111,7 @@ cargo +1.95.0 check -p gridcraft-ui-egui
 # Tests
 cargo +1.95.0 test -p gridcraft-ui-egui --lib      # unit tests
 cargo +1.95.0 test -p gridcraft-ui-egui --test it  # integration tests
+cargo +1.95.0 test -p gridcraft-ui-egui --test arabic_bidi --test arabic_editing
 cargo +1.95.0 test -p gridcraft --bin gridcraft    # app-level tests
 
 # Clippy
